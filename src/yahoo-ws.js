@@ -137,8 +137,8 @@ function decodePricingData(buffer) {
           break;
         }
 
-        const r = readString(buf, offset);
-        tick.id = r.value;
+        const r = readVarint(buf, offset);
+        tick.time = Math.floor(r.value / 2) ^ -(r.value % 2);
         offset = r.offset;
         break;
       }
