@@ -4,7 +4,7 @@ import { z } from "zod";
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 
-import YahooWS from "./src/yahoo-ws.js";
+import { YahooWS } from "./src/yahoo-ws.js";
 
 /*
 ============================================================
