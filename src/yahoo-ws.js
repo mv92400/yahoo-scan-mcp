@@ -59,17 +59,6 @@ function readFloat(buffer, offset) {
   };
 }
 
-function readDouble(buffer, offset) {
-  if (offset + 8 > buffer.length) {
-    throw new Error("Unexpected end of protobuf double");
-  }
-
-  return {
-    value: buffer.readDoubleLE(offset),
-    offset: offset + 8
-  };
-}
-
 function readString(buffer, offset) {
   const lengthResult = readVarint(buffer, offset);
 
@@ -92,16 +81,17 @@ function skipField(buffer, offset, wireType) {
   switch (wireType) {
 
     // varint
-    case 0: {
+    case 0:
       return readVarint(buffer, offset).offset;
-    }
 
     // 64-bit
     case 1: {
       const next = offset + 8;
 
       if (next > buffer.length) {
-        throw new Error("Unexpected end of protobuf 64-bit field");
+        throw new Error(
+          "Unexpected end of protobuf 64-bit field"
+        );
       }
 
       return next;
@@ -127,7 +117,9 @@ function skipField(buffer, offset, wireType) {
       const next = offset + 4;
 
       if (next > buffer.length) {
-        throw new Error("Unexpected end of protobuf 32-bit field");
+        throw new Error(
+          "Unexpected end of protobuf 32-bit field"
+        );
       }
 
       return next;
@@ -142,38 +134,6 @@ function skipField(buffer, offset, wireType) {
 
 // ------------------------------------------------------------
 // YAHOO PRICINGDATA DECODER
-// ------------------------------------------------------------
-//
-// Yahoo PricingData schema:
-//
-// 1  id
-// 2  price
-// 3  time
-// 4  currency
-// 5  exchange
-// 6  quote_type
-// 7  market_hours
-// 8  change_percent
-// 9  day_volume
-// 10 day_high
-// 11 day_low
-// 12 change
-// 13 short_name
-// 14 expire_date
-// 15 open_price
-// 16 previous_close
-// 17 strike_price
-// 18 underlying_symbol
-// 19 open_interest
-// 20 options_type
-// 21 mini_option
-// 22 last_size
-// 23 bid
-// 24 bid_size
-// 25 ask
-// 26 ask_size
-// 27 price_hint
-//
 // ------------------------------------------------------------
 
 function decodePricingData(buffer) {
@@ -199,10 +159,7 @@ function decodePricingData(buffer) {
 
     switch (fieldNumber) {
 
-      // ------------------------------------------------------
       // id
-      // ------------------------------------------------------
-
       case 1: {
         if (wireType !== 2) {
           offset = skipField(buffer, offset, wireType);
@@ -216,10 +173,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // price
-      // ------------------------------------------------------
-
       case 2: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -233,10 +187,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
-      // time - sint64
-      // ------------------------------------------------------
-
+      // time
       case 3: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -245,6 +196,7 @@ function decodePricingData(buffer) {
 
         const value = readVarint(buffer, offset);
 
+        // Yahoo fournit ici un timestamp Unix en millisecondes.
         result.time = uint64ToNumber(
           zigzagDecode(value.value)
         );
@@ -253,10 +205,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // currency
-      // ------------------------------------------------------
-
       case 4: {
         if (wireType !== 2) {
           offset = skipField(buffer, offset, wireType);
@@ -270,10 +219,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // exchange
-      // ------------------------------------------------------
-
       case 5: {
         if (wireType !== 2) {
           offset = skipField(buffer, offset, wireType);
@@ -287,10 +233,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // quote_type
-      // ------------------------------------------------------
-
       case 6: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -306,10 +249,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // market_hours
-      // ------------------------------------------------------
-
       case 7: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -325,10 +265,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // change_percent
-      // ------------------------------------------------------
-
       case 8: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -342,10 +279,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // day_volume
-      // ------------------------------------------------------
-
       case 9: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -361,10 +295,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // day_high
-      // ------------------------------------------------------
-
       case 10: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -378,10 +309,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // day_low
-      // ------------------------------------------------------
-
       case 11: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -395,10 +323,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // change
-      // ------------------------------------------------------
-
       case 12: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -412,10 +337,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // short_name
-      // ------------------------------------------------------
-
       case 13: {
         if (wireType !== 2) {
           offset = skipField(buffer, offset, wireType);
@@ -429,10 +351,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // expire_date
-      // ------------------------------------------------------
-
       case 14: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -448,10 +367,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // open_price
-      // ------------------------------------------------------
-
       case 15: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -465,10 +381,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // previous_close
-      // ------------------------------------------------------
-
       case 16: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -482,10 +395,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // strike_price
-      // ------------------------------------------------------
-
       case 17: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -499,10 +409,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // underlying_symbol
-      // ------------------------------------------------------
-
       case 18: {
         if (wireType !== 2) {
           offset = skipField(buffer, offset, wireType);
@@ -516,10 +423,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // open_interest
-      // ------------------------------------------------------
-
       case 19: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -535,10 +439,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // options_type
-      // ------------------------------------------------------
-
       case 20: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -554,10 +455,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // mini_option
-      // ------------------------------------------------------
-
       case 21: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -573,10 +471,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // last_size
-      // ------------------------------------------------------
-
       case 22: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -592,10 +487,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // bid
-      // ------------------------------------------------------
-
       case 23: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -609,10 +501,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // bid_size
-      // ------------------------------------------------------
-
       case 24: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -628,10 +517,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // ask
-      // ------------------------------------------------------
-
       case 25: {
         if (wireType !== 5) {
           offset = skipField(buffer, offset, wireType);
@@ -645,10 +531,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // ask_size
-      // ------------------------------------------------------
-
       case 26: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -664,10 +547,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
       // price_hint
-      // ------------------------------------------------------
-
       case 27: {
         if (wireType !== 0) {
           offset = skipField(buffer, offset, wireType);
@@ -683,10 +563,7 @@ function decodePricingData(buffer) {
         break;
       }
 
-      // ------------------------------------------------------
-      // Unknown field
-      // ------------------------------------------------------
-
+      // unknown field
       default: {
         offset = skipField(
           buffer,
@@ -703,7 +580,7 @@ function decodePricingData(buffer) {
 }
 
 // ------------------------------------------------------------
-// BASE64 + JSON DECODER
+// YAHOO MESSAGE DECODER
 // ------------------------------------------------------------
 
 function decodeYahooMessage(data) {
@@ -722,9 +599,14 @@ function decodeYahooMessage(data) {
   }
 
   const protobufBuffer =
-    Buffer.from(json.message, "base64");
+    Buffer.from(
+      json.message,
+      "base64"
+    );
 
-  return decodePricingData(protobufBuffer);
+  return decodePricingData(
+    protobufBuffer
+  );
 }
 
 // ------------------------------------------------------------
@@ -736,6 +618,7 @@ export class YahooWS {
   constructor({ log = console.error } = {}) {
 
     this.log = log;
+
     this.ws = null;
 
     this.connected = false;
@@ -746,16 +629,15 @@ export class YahooWS {
     this.messages = 0;
     this.ticks = 0;
     this.decodeErrors = 0;
+    this.errors = 0;
 
     this.connectedAt = null;
     this.firstMessageAt = null;
 
     this.lastMessages = [];
 
-    // Dernier tick valide par ticker
     this.latest = new Map();
 
-    // Petit historique récent global
     this.recentTicks = [];
 
     this.heartbeat = null;
@@ -778,25 +660,27 @@ export class YahooWS {
 
       this.ws = ws;
 
-      const timeout = setTimeout(() => {
+      const timeout =
+        setTimeout(() => {
 
-        try {
-          ws.close();
-        } catch {}
+          try {
+            ws.close();
+          } catch {}
 
-        reject(
-          new Error(
-            "Yahoo WebSocket connection timeout"
-          )
-        );
+          reject(
+            new Error(
+              "Yahoo WebSocket connection timeout"
+            )
+          );
 
-      }, 15000);
+        }, 15000);
 
       ws.on("open", () => {
 
         clearTimeout(timeout);
 
         this.connected = true;
+
         this.connectedAt = Date.now();
 
         this.log(
@@ -822,7 +706,8 @@ export class YahooWS {
           receivedAt:
             new Date().toISOString(),
 
-          bytes: data.length
+          bytes:
+            data.length
         });
 
         if (this.lastMessages.length > 10) {
@@ -833,10 +718,6 @@ export class YahooWS {
 
           const tick =
             decodeYahooMessage(data);
-
-          // Validation minimale :
-          // un vrai tick doit au minimum avoir
-          // un ticker et un prix numérique.
 
           if (
             !tick.id ||
@@ -851,18 +732,20 @@ export class YahooWS {
           const normalized = {
 
             symbol:
-              String(tick.id).toUpperCase(),
+              String(tick.id)
+                .toUpperCase(),
 
             price:
               tick.price,
 
+            // Yahoo time est déjà en millisecondes.
             time:
               tick.time ?? null,
 
             timestamp:
               tick.time
                 ? new Date(
-                    Number(tick.time) * 1000
+                    Number(tick.time)
                   ).toISOString()
                 : null,
 
@@ -922,7 +805,7 @@ export class YahooWS {
           };
 
           // --------------------------------------------------
-          // STORE LAST TICK PER SYMBOL
+          // LAST TICK PER SYMBOL
           // --------------------------------------------------
 
           this.latest.set(
@@ -934,14 +817,16 @@ export class YahooWS {
           // RECENT TICKS
           // --------------------------------------------------
 
-          this.recentTicks.push(normalized);
+          this.recentTicks.push(
+            normalized
+          );
 
           if (this.recentTicks.length > 50) {
             this.recentTicks.shift();
           }
 
           // --------------------------------------------------
-          // REAL DECODED TICK COUNT
+          // VALID DECODED TICK
           // --------------------------------------------------
 
           this.ticks++;
@@ -1048,50 +933,49 @@ export class YahooWS {
   // ----------------------------------------------------------
   // HEARTBEAT
   // ----------------------------------------------------------
-  //
-  // yfinance renvoie périodiquement l'abonnement.
-  // Cela permet de maintenir le flux vivant.
-  // ----------------------------------------------------------
 
   startHeartbeat() {
 
     this.stopHeartbeat();
 
-    this.heartbeat = setInterval(() => {
+    this.heartbeat =
+      setInterval(() => {
 
-      if (
-        !this.ws ||
-        !this.connected ||
-        !this.subscribed ||
-        !this.symbols.length
-      ) {
-        return;
-      }
+        if (
+          !this.ws ||
+          !this.connected ||
+          !this.subscribed ||
+          !this.symbols.length
+        ) {
+          return;
+        }
 
-      try {
+        try {
 
-        this.ws.send(
-          JSON.stringify({
-            subscribe: this.symbols
-          })
-        );
+          this.ws.send(
+            JSON.stringify({
+              subscribe: this.symbols
+            })
+          );
 
-      } catch (err) {
+        } catch (err) {
 
-        this.log(
-          "[yahoo-ws] heartbeat error:",
-          err?.message || String(err)
-        );
-      }
+          this.log(
+            "[yahoo-ws] heartbeat error:",
+            err?.message || String(err)
+          );
+        }
 
-    }, 15000);
+      }, 15000);
   }
 
   stopHeartbeat() {
 
     if (this.heartbeat) {
 
-      clearInterval(this.heartbeat);
+      clearInterval(
+        this.heartbeat
+      );
 
       this.heartbeat = null;
     }
@@ -1120,61 +1004,4 @@ export class YahooWS {
       messages:
         this.messages,
 
-      ticks:
-        this.ticks,
-
-      decode_errors:
-        this.decodeErrors,
-
-      errors:
-        this.errors,
-
-      connected_at:
-        this.connectedAt
-          ? new Date(
-              this.connectedAt
-            ).toISOString()
-          : null,
-
-      first_message_at:
-        this.firstMessageAt
-          ? new Date(
-              this.firstMessageAt
-            ).toISOString()
-          : null,
-
-      latest:
-        Object.fromEntries(
-          this.latest
-        ),
-
-      recent_ticks:
-        this.recentTicks.slice(-10),
-
-      last_messages:
-        this.lastMessages
-    };
-  }
-
-  // ----------------------------------------------------------
-  // CLOSE
-  // ----------------------------------------------------------
-
-  close() {
-
-    this.stopHeartbeat();
-
-    if (!this.ws) {
-      return;
-    }
-
-    try {
-      this.ws.close();
-    } catch {}
-
-    this.ws = null;
-
-    this.connected = false;
-    this.subscribed = false;
-  }
-}
+      
