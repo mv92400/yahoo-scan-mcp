@@ -1,701 +1,403 @@
 import WebSocket from "ws";
 
-const YAHOO_WS_URL =
-  "wss://streamer.finance.yahoo.com/?version=2";
+const YAHOO_WS_URL = "wss://streamer.finance.yahoo.com/?version=2";
 
-// ------------------------------------------------------------
-// PROTOBUF HELPERS
-// ------------------------------------------------------------
+function readVarint(buf, offset) {
+  let result = 0;
+  let shift = 0;
 
-function readVarint(buffer, offset) {
-  let value = 0n;
-  let shift = 0n;
-  let pos = offset;
+  while (offset < buf.length) {
+    const byte = buf[offset++];
+    result += (byte & 0x7f) * 2 ** shift;
 
-  while (pos < buffer.length) {
-    const byte = buffer[pos++];
-
-    value |= BigInt(byte & 0x7f) << shift;
-
-    if ((byte & 0x80) === 0) {
-      return {
-        value,
-        offset: pos
-      };
+    if (!(byte & 0x80)) {
+      return { value: result, offset };
     }
 
-    shift += 7n;
+    shift += 7;
 
-    if (shift > 70n) {
-      throw new Error("Invalid protobuf varint");
+    if (shift > 63) {
+      throw new Error("varint too long");
     }
   }
 
-  throw new Error("Unexpected end of protobuf varint");
+  throw new Error("unexpected end of varint");
 }
 
-function zigzagDecode(value) {
-  return (value >> 1n) ^ -(value & 1n);
+function zigzagDecode(n) {
+  return Math.floor(n / 2) ^ -(n % 2);
 }
 
-function uint64ToNumber(value) {
-  const number = Number(value);
-
-  if (!Number.isSafeInteger(number)) {
-    return Number(value);
-  }
-
-  return number;
+function uint64ToNumber(n) {
+  return typeof n === "bigint" ? Number(n) : Number(n);
 }
 
-function readFloat(buffer, offset) {
-  if (offset + 4 > buffer.length) {
-    throw new Error("Unexpected end of protobuf float");
+function readFloat(buf, offset) {
+  if (offset + 4 > buf.length) {
+    throw new Error("unexpected end of float");
   }
 
   return {
-    value: buffer.readFloatLE(offset),
+    value: buf.readFloatLE(offset),
     offset: offset + 4
   };
 }
 
-function readString(buffer, offset) {
-  const lengthResult = readVarint(buffer, offset);
-
-  const length = uint64ToNumber(lengthResult.value);
-
-  const start = lengthResult.offset;
-  const end = start + length;
-
-  if (end > buffer.length) {
-    throw new Error("Unexpected end of protobuf string");
+function readString(buf, offset, length) {
+  if (offset + length > buf.length) {
+    throw new Error("unexpected end of string");
   }
 
   return {
-    value: buffer.toString("utf8", start, end),
-    offset: end
+    value: buf.subarray(offset, offset + length).toString("utf8"),
+    offset: offset + length
   };
 }
 
-function skipField(buffer, offset, wireType) {
+function skipField(buf, offset, wireType) {
   switch (wireType) {
-
-    // varint
-    case 0:
-      return readVarint(buffer, offset).offset;
-
-    // 64-bit
-    case 1: {
-      const next = offset + 8;
-
-      if (next > buffer.length) {
-        throw new Error(
-          "Unexpected end of protobuf 64-bit field"
-        );
-      }
-
-      return next;
+    case 0: {
+      const r = readVarint(buf, offset);
+      return r.offset;
     }
 
-    // length-delimited
+    case 1:
+      return offset + 8;
+
     case 2: {
-      const lengthResult = readVarint(buffer, offset);
-      const length = uint64ToNumber(lengthResult.value);
-      const next = lengthResult.offset + length;
-
-      if (next > buffer.length) {
-        throw new Error(
-          "Unexpected end of protobuf length-delimited field"
-        );
-      }
-
-      return next;
+      const r = readVarint(buf, offset);
+      return r.offset + r.value;
     }
 
-    // 32-bit
-    case 5: {
-      const next = offset + 4;
-
-      if (next > buffer.length) {
-        throw new Error(
-          "Unexpected end of protobuf 32-bit field"
-        );
-      }
-
-      return next;
-    }
+    case 5:
+      return offset + 4;
 
     default:
-      throw new Error(
-        `Unsupported protobuf wire type: ${wireType}`
-      );
+      throw new Error(`unsupported wire type ${wireType}`);
   }
 }
 
-// ------------------------------------------------------------
-// YAHOO PRICINGDATA DECODER
-// ------------------------------------------------------------
-
 function decodePricingData(buffer) {
+  const buf = Buffer.from(buffer);
 
-  if (!Buffer.isBuffer(buffer)) {
-    buffer = Buffer.from(buffer);
-  }
+  const tick = {
+    id: null,
+    price: null,
+    time: null,
+    currency: null,
+    exchange: null,
+    quoteType: null,
+    marketHours: null,
+    changePercent: null,
+    dayVolume: null,
+    dayHigh: null,
+    dayLow: null,
+    change: null,
+    shortName: null,
+    expireDate: null,
+    openPrice: null,
+    previousClose: null,
+    strikePrice: null,
+    underlyingSymbol: null,
+    openInterest: null,
+    optionsType: null,
+    miniOption: null,
+    lastSize: null,
+    bid: null,
+    bidSize: null,
+    ask: null,
+    askSize: null,
+    priceHint: null
+  };
 
   let offset = 0;
 
-  const result = {};
+  while (offset < buf.length) {
+    const key = readVarint(buf, offset);
+    offset = key.offset;
 
-  while (offset < buffer.length) {
-
-    const tagResult = readVarint(buffer, offset);
-
-    const tag = uint64ToNumber(tagResult.value);
-
-    offset = tagResult.offset;
-
-    const fieldNumber = tag >>> 3;
-    const wireType = tag & 7;
+    const fieldNumber = Math.floor(key.value / 8);
+    const wireType = key.value % 8;
 
     switch (fieldNumber) {
-
-      // id
       case 1: {
-        if (wireType !== 2) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readString(buffer, offset);
-
-        result.id = value.value;
-        offset = value.offset;
+        const r = readString(buf, offset, readVarint(buf, offset).value);
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.id = s.value;
+        offset = s.offset;
         break;
       }
 
-      // price
       case 2: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.price = value.value;
-        offset = value.offset;
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.price = Number(s.value);
+        offset = s.offset;
         break;
       }
 
-      // time
       case 3: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        // Yahoo fournit ici un timestamp Unix en millisecondes.
-        result.time = uint64ToNumber(
-          zigzagDecode(value.value)
-        );
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.time = uint64ToNumber(zigzagDecode(r.value));
+        offset = r.offset;
         break;
       }
 
-      // currency
       case 4: {
-        if (wireType !== 2) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readString(buffer, offset);
-
-        result.currency = value.value;
-        offset = value.offset;
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.currency = s.value;
+        offset = s.offset;
         break;
       }
 
-      // exchange
       case 5: {
-        if (wireType !== 2) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readString(buffer, offset);
-
-        result.exchange = value.value;
-        offset = value.offset;
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.exchange = s.value;
+        offset = s.offset;
         break;
       }
 
-      // quote_type
       case 6: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.quote_type =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.quoteType = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // market_hours
       case 7: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.market_hours =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.marketHours = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // change_percent
       case 8: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.change_percent = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.changePercent = r.value;
+        offset = r.offset;
         break;
       }
 
-      // day_volume
       case 9: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.day_volume =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.dayVolume = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // day_high
       case 10: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.day_high = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.dayHigh = r.value;
+        offset = r.offset;
         break;
       }
 
-      // day_low
       case 11: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.day_low = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.dayLow = r.value;
+        offset = r.offset;
         break;
       }
 
-      // change
       case 12: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.change = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.change = r.value;
+        offset = r.offset;
         break;
       }
 
-      // short_name
       case 13: {
-        if (wireType !== 2) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readString(buffer, offset);
-
-        result.short_name = value.value;
-        offset = value.offset;
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.shortName = s.value;
+        offset = s.offset;
         break;
       }
 
-      // expire_date
       case 14: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.expire_date =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.expireDate = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // open_price
       case 15: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.open_price = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.openPrice = r.value;
+        offset = r.offset;
         break;
       }
 
-      // previous_close
       case 16: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.previous_close = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.previousClose = r.value;
+        offset = r.offset;
         break;
       }
 
-      // strike_price
       case 17: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.strike_price = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.strikePrice = r.value;
+        offset = r.offset;
         break;
       }
 
-      // underlying_symbol
       case 18: {
-        if (wireType !== 2) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readString(buffer, offset);
-
-        result.underlying_symbol = value.value;
-        offset = value.offset;
+        const len = readVarint(buf, offset);
+        const s = readString(buf, len.offset, len.value);
+        tick.underlyingSymbol = s.value;
+        offset = s.offset;
         break;
       }
 
-      // open_interest
       case 19: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.open_interest =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.openInterest = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // options_type
       case 20: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.options_type =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.optionsType = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // mini_option
       case 21: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.mini_option =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.miniOption = Boolean(r.value);
+        offset = r.offset;
         break;
       }
 
-      // last_size
       case 22: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.last_size =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.lastSize = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // bid
       case 23: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.bid = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.bid = r.value;
+        offset = r.offset;
         break;
       }
 
-      // bid_size
       case 24: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.bid_size =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.bidSize = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // ask
       case 25: {
-        if (wireType !== 5) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readFloat(buffer, offset);
-
-        result.ask = value.value;
-        offset = value.offset;
+        const r = readFloat(buf, offset);
+        tick.ask = r.value;
+        offset = r.offset;
         break;
       }
 
-      // ask_size
       case 26: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.ask_size =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.askSize = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // price_hint
       case 27: {
-        if (wireType !== 0) {
-          offset = skipField(buffer, offset, wireType);
-          break;
-        }
-
-        const value = readVarint(buffer, offset);
-
-        result.price_hint =
-          uint64ToNumber(value.value);
-
-        offset = value.offset;
+        const r = readVarint(buf, offset);
+        tick.priceHint = uint64ToNumber(r.value);
+        offset = r.offset;
         break;
       }
 
-      // unknown field
-      default: {
-        offset = skipField(
-          buffer,
-          offset,
-          wireType
-        );
-
-        break;
-      }
+      default:
+        offset = skipField(buf, offset, wireType);
     }
   }
 
-  return result;
+  return tick;
 }
-
-// ------------------------------------------------------------
-// YAHOO MESSAGE DECODER
-// ------------------------------------------------------------
 
 function decodeYahooMessage(data) {
+  const outer = JSON.parse(data.toString());
 
-  const raw =
-    Buffer.isBuffer(data)
-      ? data.toString("utf8")
-      : String(data);
-
-  const json = JSON.parse(raw);
-
-  if (!json.message) {
-    throw new Error(
-      "Yahoo message does not contain 'message'"
-    );
+  if (!outer.message) {
+    return null;
   }
 
-  const protobufBuffer =
-    Buffer.from(
-      json.message,
-      "base64"
-    );
+  const payload = Buffer.from(outer.message, "base64");
 
-  return decodePricingData(
-    protobufBuffer
-  );
+  return decodePricingData(payload);
 }
 
-// ------------------------------------------------------------
-// YAHOO WEBSOCKET
-// ------------------------------------------------------------
-
 export class YahooWS {
-
   constructor({ log = console.error } = {}) {
-
     this.log = log;
-
     this.ws = null;
 
     this.connected = false;
     this.subscribed = false;
 
     this.symbols = [];
-
     this.messages = 0;
     this.ticks = 0;
-    this.decodeErrors = 0;
     this.errors = 0;
+    this.decodeErrors = 0;
 
     this.connectedAt = null;
     this.firstMessageAt = null;
 
     this.lastMessages = [];
-
-    this.latest = new Map();
-
     this.recentTicks = [];
+    this.latest = new Map();
 
     this.heartbeat = null;
   }
 
-  // ----------------------------------------------------------
-  // CONNECT
-  // ----------------------------------------------------------
-
   async connect() {
-
-    if (this.connected && this.ws) {
-      return;
-    }
+    if (this.connected && this.ws) return;
 
     await new Promise((resolve, reject) => {
-
-      const ws =
-        new WebSocket(YAHOO_WS_URL);
+      const ws = new WebSocket(YAHOO_WS_URL);
 
       this.ws = ws;
 
-      const timeout =
-        setTimeout(() => {
+      const timeout = setTimeout(() => {
+        try {
+          ws.close();
+        } catch {}
 
-          try {
-            ws.close();
-          } catch {}
-
-          reject(
-            new Error(
-              "Yahoo WebSocket connection timeout"
-            )
-          );
-
-        }, 15000);
+        reject(new Error("Yahoo WebSocket connection timeout"));
+      }, 15000);
 
       ws.on("open", () => {
-
         clearTimeout(timeout);
 
         this.connected = true;
-
         this.connectedAt = Date.now();
 
-        this.log(
-          "[yahoo-ws] connected"
-        );
+        this.log("[yahoo-ws] connected");
+
+        this.heartbeat = setInterval(() => {
+          if (this.connected && this.ws && this.symbols.length) {
+            try {
+              this.ws.send(JSON.stringify({
+                subscribe: this.symbols
+              }));
+            } catch {}
+          }
+        }, 15000);
 
         resolve();
       });
 
-      // ------------------------------------------------------
-      // MESSAGE
-      // ------------------------------------------------------
-
       ws.on("message", (data) => {
-
         this.messages++;
 
         if (!this.firstMessageAt) {
@@ -703,11 +405,8 @@ export class YahooWS {
         }
 
         this.lastMessages.push({
-          receivedAt:
-            new Date().toISOString(),
-
-          bytes:
-            data.length
+          receivedAt: new Date().toISOString(),
+          bytes: data.length
         });
 
         if (this.lastMessages.length > 10) {
@@ -715,124 +414,62 @@ export class YahooWS {
         }
 
         try {
+          const tick = decodeYahooMessage(data);
 
-          const tick =
-            decodeYahooMessage(data);
-
-          if (
-            !tick.id ||
-            typeof tick.price !== "number" ||
-            !Number.isFinite(tick.price)
-          ) {
-            throw new Error(
-              "Decoded Yahoo message is missing id or valid price"
-            );
+          if (!tick || !tick.id || tick.price == null) {
+            return;
           }
 
           const normalized = {
+            symbol: tick.id,
+            price: tick.price,
 
-            symbol:
-              String(tick.id)
-                .toUpperCase(),
+            time: tick.time,
 
-            price:
-              tick.price,
-
-            // Yahoo time est déjà en millisecondes.
-            time:
-              tick.time ?? null,
-
+            // Yahoo time is already milliseconds since epoch.
             timestamp:
-              tick.time
-                ? new Date(
-                    Number(tick.time)
-                  ).toISOString()
+              tick.time != null
+                ? new Date(Number(tick.time)).toISOString()
                 : null,
 
-            currency:
-              tick.currency ?? null,
+            currency: tick.currency,
+            exchange: tick.exchange,
+            quote_type: tick.quoteType,
+            market_hours: tick.marketHours,
 
-            exchange:
-              tick.exchange ?? null,
+            change: tick.change,
+            change_percent: tick.changePercent,
 
-            quote_type:
-              tick.quote_type ?? null,
+            day_volume: tick.dayVolume,
+            day_high: tick.dayHigh,
+            day_low: tick.dayLow,
 
-            market_hours:
-              tick.market_hours ?? null,
+            open_price: tick.openPrice,
+            previous_close: tick.previousClose,
 
-            change:
-              tick.change ?? null,
+            last_size: tick.lastSize,
 
-            change_percent:
-              tick.change_percent ?? null,
+            bid: tick.bid,
+            bid_size: tick.bidSize,
 
-            day_volume:
-              tick.day_volume ?? null,
+            ask: tick.ask,
+            ask_size: tick.askSize,
 
-            day_high:
-              tick.day_high ?? null,
+            price_hint: tick.priceHint,
 
-            day_low:
-              tick.day_low ?? null,
-
-            open_price:
-              tick.open_price ?? null,
-
-            previous_close:
-              tick.previous_close ?? null,
-
-            last_size:
-              tick.last_size ?? null,
-
-            bid:
-              tick.bid ?? null,
-
-            bid_size:
-              tick.bid_size ?? null,
-
-            ask:
-              tick.ask ?? null,
-
-            ask_size:
-              tick.ask_size ?? null,
-
-            price_hint:
-              tick.price_hint ?? null,
-
-            received_at:
-              new Date().toISOString()
+            received_at: new Date().toISOString()
           };
 
-          // --------------------------------------------------
-          // LAST TICK PER SYMBOL
-          // --------------------------------------------------
+          this.latest.set(normalized.symbol, normalized);
 
-          this.latest.set(
-            normalized.symbol,
-            normalized
-          );
+          this.recentTicks.push(normalized);
 
-          // --------------------------------------------------
-          // RECENT TICKS
-          // --------------------------------------------------
-
-          this.recentTicks.push(
-            normalized
-          );
-
-          if (this.recentTicks.length > 50) {
+          if (this.recentTicks.length > 20) {
             this.recentTicks.shift();
           }
 
-          // --------------------------------------------------
-          // VALID DECODED TICK
-          // --------------------------------------------------
-
           this.ticks++;
-
         } catch (err) {
-
           this.decodeErrors++;
 
           this.log(
@@ -842,73 +479,46 @@ export class YahooWS {
         }
       });
 
-      // ------------------------------------------------------
-      // ERROR
-      // ------------------------------------------------------
-
       ws.on("error", (err) => {
-
         this.errors++;
 
-        this.log(
-          "[yahoo-ws] error:",
-          err.message
-        );
+        this.log("[yahoo-ws] error:", err.message);
 
         if (!this.connected) {
-
           clearTimeout(timeout);
-
           reject(err);
         }
       });
 
-      // ------------------------------------------------------
-      // CLOSE
-      // ------------------------------------------------------
-
       ws.on("close", () => {
-
         this.connected = false;
         this.subscribed = false;
 
-        this.stopHeartbeat();
+        if (this.heartbeat) {
+          clearInterval(this.heartbeat);
+          this.heartbeat = null;
+        }
 
-        this.log(
-          "[yahoo-ws] closed"
-        );
+        this.log("[yahoo-ws] closed");
       });
     });
   }
 
-  // ----------------------------------------------------------
-  // SUBSCRIBE
-  // ----------------------------------------------------------
-
   subscribe(symbols) {
-
     if (!this.ws || !this.connected) {
-      throw new Error(
-        "Yahoo WebSocket is not connected"
-      );
+      throw new Error("Yahoo WebSocket is not connected");
     }
 
     const list = [
       ...new Set(
         symbols
-          .map(s =>
-            String(s)
-              .trim()
-              .toUpperCase()
-          )
+          .map(s => String(s).trim().toUpperCase())
           .filter(Boolean)
       )
     ];
 
     if (!list.length) {
-      throw new Error(
-        "No symbols supplied"
-      );
+      throw new Error("No symbols supplied");
     }
 
     this.symbols = list;
@@ -921,8 +531,6 @@ export class YahooWS {
 
     this.subscribed = true;
 
-    this.startHeartbeat();
-
     this.log(
       `[yahoo-ws] subscribed to ${list.length} symbols`
     );
@@ -930,78 +538,51 @@ export class YahooWS {
     return list.length;
   }
 
-  // ----------------------------------------------------------
-  // HEARTBEAT
-  // ----------------------------------------------------------
+  status() {
+    return {
+      connected: this.connected,
+      subscribed: this.subscribed,
 
-  startHeartbeat() {
+      symbols: this.symbols.length,
+      subscribed_symbols: this.symbols,
 
-    this.stopHeartbeat();
+      messages: this.messages,
+      ticks: this.ticks,
 
-    this.heartbeat =
-      setInterval(() => {
+      errors: this.errors,
+      decode_errors: this.decodeErrors,
 
-        if (
-          !this.ws ||
-          !this.connected ||
-          !this.subscribed ||
-          !this.symbols.length
-        ) {
-          return;
-        }
+      connected_at: this.connectedAt
+        ? new Date(this.connectedAt).toISOString()
+        : null,
 
-        try {
+      first_message_at: this.firstMessageAt
+        ? new Date(this.firstMessageAt).toISOString()
+        : null,
 
-          this.ws.send(
-            JSON.stringify({
-              subscribe: this.symbols
-            })
-          );
+      latest: Object.fromEntries(this.latest),
 
-        } catch (err) {
+      recent_ticks: this.recentTicks,
 
-          this.log(
-            "[yahoo-ws] heartbeat error:",
-            err?.message || String(err)
-          );
-        }
-
-      }, 15000);
+      last_messages: this.lastMessages
+    };
   }
 
-  stopHeartbeat() {
-
+  close() {
     if (this.heartbeat) {
-
-      clearInterval(
-        this.heartbeat
-      );
-
+      clearInterval(this.heartbeat);
       this.heartbeat = null;
     }
+
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+    }
+
+    this.ws = null;
+
+    this.connected = false;
+    this.subscribed = false;
   }
-
-  // ----------------------------------------------------------
-  // STATUS
-  // ----------------------------------------------------------
-
-  status() {
-
-    return {
-
-      connected:
-        this.connected,
-
-      subscribed:
-        this.subscribed,
-
-      symbols:
-        this.symbols.length,
-
-      subscribed_symbols:
-        this.symbols,
-
-      messages:
-        this.messages,
-
-      
+}
