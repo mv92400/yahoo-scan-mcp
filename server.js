@@ -1,142 +1,391 @@
-#!/usr/bin/env node
-
-import http from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { YahooWS } from "./src/yahoo-ws.js";
+import http from "node:http";
+import { readFile } from "node:fs/promises";
 
-const PORT = Number(process.env.PORT || 8080);
+import YahooWS from "./src/yahoo-ws.js";
 
-function log(...args) {
-  console.error("[yahoo-scan-mcp]", ...args);
-}
+/*
+============================================================
+CONFIG
+============================================================
+*/
 
-function json(res, status, body) {
-  const data = JSON.stringify(body);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(data),
-    "Cache-Control": "no-store"
-  });
-  res.end(data);
-}
+const PORT =
+  Number(process.env.PORT || 8080);
 
-const yahoo = new YahooWS({ log });
+const APP_VERSION = "1.2.0";
 
-const scanState = {
-  asof: null,
-  symbols_requested: 0,
-  s0: [],
-  s1: [],
-  lots: [],
-  errors: [],
-  elapsed_ms: 0
+const UNIVERSE_FILE =
+  new URL("./universe_s0.txt", import.meta.url);
+
+const log = (...args) => {
+  console.error(
+    "[yahoo-scan-mcp]",
+    ...args
+  );
 };
 
+/*
+============================================================
+GENERIC HELPERS
+============================================================
+*/
+
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(
+    resolve => setTimeout(resolve, ms)
+  );
 }
 
-function chunk(list, size) {
+function chunk(array, size) {
   const out = [];
-  for (let i = 0; i < list.length; i += size) {
-    out.push(list.slice(i, i + size));
+
+  for (
+    let i = 0;
+    i < array.length;
+    i += size
+  ) {
+    out.push(
+      array.slice(i, i + size)
+    );
   }
+
   return out;
 }
 
-function nyParts(unixSeconds) {
-  const d = new Date(Number(unixSeconds) * 1000);
+function cleanNumber(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
 
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  }).formatToParts(d);
+  const n = Number(value);
 
-  const m = Object.fromEntries(parts.map(p => [p.type, p.value]));
-
-  return {
-    date: `${m.year}-${m.month}-${m.day}`,
-    hour: Number(m.hour),
-    minute: Number(m.minute),
-    second: Number(m.second),
-    hm: `${m.hour}:${m.minute}`
-  };
+  return Number.isFinite(n)
+    ? n
+    : null;
 }
 
-function cleanNumber(v) {
-  return Number.isFinite(Number(v)) ? Number(v) : null;
+function normalizeSymbols(symbols) {
+  return [
+    ...new Set(
+      (symbols || [])
+        .map(s =>
+          String(s)
+            .trim()
+            .toUpperCase()
+        )
+        .filter(s =>
+          /^[A-Z0-9._$=-]{1,20}$/.test(s) &&
+          s !== "SYMBOL"
+        )
+    )
+  ];
 }
 
-function isNasdaqExchange(exchange) {
-  return new Set([
-    "NMS",
-    "NGM",
-    "NCM",
-    "NAS"
-  ]).has(String(exchange || "").toUpperCase());
+/*
+============================================================
+LOCAL UNIVERSE
+============================================================
+*/
+
+let universeCache = null;
+let universeLoadedAt = null;
+
+async function loadUniverse() {
+  if (
+    Array.isArray(universeCache) &&
+    universeCache.length
+  ) {
+    return universeCache;
+  }
+
+  const raw =
+    await readFile(
+      UNIVERSE_FILE,
+      "utf8"
+    );
+
+  const symbols =
+    normalizeSymbols(
+      raw
+        .split(/\r?\n/)
+        .map(line => {
+          const cleaned =
+            line.trim();
+
+          if (
+            !cleaned ||
+            cleaned.startsWith("#")
+          ) {
+            return "";
+          }
+
+          /*
+          Supports:
+
+          GRAB
+          GRAB,3.07
+          GRAB;3.07
+          GRAB 3.07
+          */
+          return cleaned
+            .split(/[;,\s]+/)[0];
+        })
+    );
+
+  if (!symbols.length) {
+    throw new Error(
+      "Universe file is empty: universe_s0.txt"
+    );
+  }
+
+  universeCache = symbols;
+
+  universeLoadedAt =
+    new Date().toISOString();
+
+  return universeCache;
 }
+
+/*
+============================================================
+SCAN STATE
+============================================================
+*/
+
+const scanState = {
+  ok: true,
+
+  version:
+    APP_VERSION,
+
+  stage:
+    "idle",
+
+  asof:
+    null,
+
+  elapsed_ms:
+    0,
+
+  symbols_requested:
+    0,
+
+  source:
+    null,
+
+  s0: [],
+
+  s1: [],
+
+  lots: [],
+
+  errors: [],
+
+  universe_loaded_at:
+    null
+};
 
 /*
 ============================================================
 YAHOO SPARK
 ============================================================
+
+Important:
+Yahoo Spark returns:
+
+spark.result[]
+  -> response[]
+      -> timestamp
+      -> meta
+      -> indicators
+          -> quote[]
+          -> close
+============================================================
 */
 
-async function yahooSpark(symbols, range = "10d", interval = "5m") {
+async function yahooSpark(
+  symbols,
+  range = "5d",
+  interval = "5m"
+) {
   const results = [];
-  const batches = chunk(symbols, 100);
+
+  /*
+  Yahoo has shown HTTP 400 with larger batches.
+  Keep batches deliberately small.
+  */
+  const batches =
+    chunk(symbols, 20);
 
   for (const batch of batches) {
     const url =
       "https://query1.finance.yahoo.com/v7/finance/spark" +
-      `?symbols=${encodeURIComponent(batch.join(","))}` +
-      `&range=${encodeURIComponent(range)}` +
-      `&interval=${encodeURIComponent(interval)}` +
-      "&indicators=quote,close";
+      `?symbols=${encodeURIComponent(
+        batch.join(",")
+      )}` +
+      `&range=${encodeURIComponent(
+        range
+      )}` +
+      `&interval=${encodeURIComponent(
+        interval
+      )}` +
+      "&indicators=quote,close" +
+      "&includeTimestamps=true" +
+      "&includePrePost=false";
 
     let success = false;
+
     let lastError = null;
 
-    for (let attempt = 1; attempt <= 3 && !success; attempt++) {
+    for (
+      let attempt = 1;
+      attempt <= 3 &&
+      !success;
+      attempt++
+    ) {
       try {
-        const response = await fetch(url, {
-          headers: {
-            "User-Agent": "Mozilla/5.0"
-          },
-          signal: AbortSignal.timeout(20000)
-        });
+        const response =
+          await fetch(
+            url,
+            {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0"
+              },
 
+              signal:
+                AbortSignal.timeout(
+                  20000
+                )
+            }
+          );
+
+        /*
+        If Yahoo rejects a batch, retrying
+        the same oversized batch is pointless.
+        */
         if (!response.ok) {
-          throw new Error(`Yahoo HTTP ${response.status}`);
+          throw new Error(
+            `Yahoo HTTP ${response.status}`
+          );
         }
 
-        const body = await response.json();
-        const rows = body?.spark?.result || [];
+        const body =
+          await response.json();
 
-        results.push(...rows);
+        const apiError =
+          body?.spark?.error;
+
+        if (apiError) {
+          throw new Error(
+            apiError.description ||
+            apiError.message ||
+            "Yahoo Spark error"
+          );
+        }
+
+        const rows =
+          body?.spark?.result || [];
+
+        /*
+        CRITICAL:
+        Spark result rows contain response[0].
+        */
+        for (const item of rows) {
+          const responseRow =
+            item?.response?.[0] ??
+            item;
+
+          if (
+            !responseRow ||
+            !Array.isArray(
+              responseRow.timestamp
+            ) ||
+            !responseRow.timestamp.length
+          ) {
+            results.push({
+              _invalid:
+                true,
+
+              _symbol:
+                item?.symbol ||
+                responseRow?.meta?.symbol ||
+                null,
+
+              _message:
+                "Yahoo Spark returned no intraday response"
+            });
+
+            continue;
+          }
+
+          const meta =
+            responseRow.meta || {};
+
+          if (
+            !meta.symbol &&
+            item?.symbol
+          ) {
+            meta.symbol =
+              item.symbol;
+          }
+
+          responseRow.meta =
+            meta;
+
+          results.push(
+            responseRow
+          );
+        }
+
+        /*
+        A successful HTTP response with zero rows
+        is still recorded, so it cannot silently
+        become a false S0=0.
+        */
+        if (!rows.length) {
+          results.push({
+            _invalid:
+              true,
+
+            _batch:
+              batch,
+
+            _message:
+              "Yahoo Spark returned zero result rows"
+          });
+        }
+
         success = true;
       } catch (err) {
         lastError = err;
 
         if (attempt < 3) {
-          await sleep(500 * attempt);
+          await sleep(
+            500 * attempt
+          );
         }
       }
     }
 
     if (!success) {
       results.push({
-        _error: true,
-        _batch: batch,
-        _message: lastError?.message || String(lastError)
+        _error:
+          true,
+
+        _batch:
+          batch,
+
+        _message:
+          lastError?.message ||
+          String(lastError)
       });
     }
 
@@ -152,364 +401,502 @@ S1 METRICS
 ============================================================
 */
 
-function calculateS1(result) {
-  const meta = result?.meta || {};
-  const timestamps = result?.timestamp || [];
-  const quote = result?.indicators?.quote?.[0] || {};
+function extractBars(row) {
+  const timestamps =
+    row?.timestamp || [];
 
-  if (!timestamps.length) {
-    return null;
-  }
+  const quote =
+    row?.indicators
+      ?.quote?.[0] || {};
 
-  const rows = [];
+  const closes =
+    row?.indicators
+      ?.quote?.[0]
+      ?.close || [];
 
-  for (let i = 0; i < timestamps.length; i++) {
-    const ts = timestamps[i];
-    const p = nyParts(ts);
+  const opens =
+    row?.indicators
+      ?.quote?.[0]
+      ?.open || [];
 
-    const close = cleanNumber(quote.close?.[i]);
+  const highs =
+    row?.indicators
+      ?.quote?.[0]
+      ?.high || [];
 
-    if (close == null) {
+  const lows =
+    row?.indicators
+      ?.quote?.[0]
+      ?.low || [];
+
+  const volumes =
+    row?.indicators
+      ?.quote?.[0]
+      ?.volume || [];
+
+  const bars = [];
+
+  for (
+    let i = 0;
+    i < timestamps.length;
+    i++
+  ) {
+    const close =
+      cleanNumber(
+        closes[i]
+      );
+
+    const volume =
+      cleanNumber(
+        volumes[i]
+      );
+
+    if (
+      close === null ||
+      volume === null
+    ) {
       continue;
     }
 
-    rows.push({
-      ts,
-      date: p.date,
-      hour: p.hour,
-      minute: p.minute,
-      open: cleanNumber(quote.open?.[i]),
-      high: cleanNumber(quote.high?.[i]),
-      low: cleanNumber(quote.low?.[i]),
+    bars.push({
+      timestamp:
+        timestamps[i],
+
+      open:
+        cleanNumber(
+          opens[i]
+        ),
+
+      high:
+        cleanNumber(
+          highs[i]
+        ),
+
+      low:
+        cleanNumber(
+          lows[i]
+        ),
+
       close,
-      volume: cleanNumber(quote.volume?.[i]) || 0
+
+      volume
     });
   }
 
-  if (!rows.length) {
+  return bars;
+}
+
+function sessionKey(timestamp) {
+  return new Date(
+    timestamp * 1000
+  ).toISOString()
+    .slice(0, 10);
+}
+
+function calculateVWAP(bars) {
+  let pv = 0;
+  let volume = 0;
+
+  for (const bar of bars) {
+    const typical =
+      (
+        (bar.high ??
+          bar.close) +
+        (bar.low ??
+          bar.close) +
+        bar.close
+      ) / 3;
+
+    pv +=
+      typical *
+      bar.volume;
+
+    volume +=
+      bar.volume;
+  }
+
+  if (!volume) {
     return null;
   }
 
-  const now = Date.now();
-  const today = nyParts(now / 1000).date;
+  return pv / volume;
+}
 
-  const todayRows = rows
-    .filter(r =>
-      r.date === today &&
-      r.hour >= 9 &&
-      r.hour <= 16
-    )
-    .sort((a, b) => a.ts - b.ts);
+function calculateS1(
+  row
+) {
+  const symbol =
+    String(
+      row?.meta?.symbol ||
+      row?.symbol ||
+      ""
+    ).toUpperCase();
 
-  if (!todayRows.length) {
-    return null;
+  const bars =
+    extractBars(row);
+
+  if (bars.length < 4) {
+    return {
+      ok: false,
+
+      symbol,
+
+      reason:
+        "Not enough 5m bars"
+    };
   }
 
   /*
-  ----------------------------------------------------------
-  COMPLETED 5-MINUTE BARS
-  ----------------------------------------------------------
+  Only completed bars.
+  Yahoo may return the current incomplete
+  5-minute bar.
   */
+  const completed =
+    bars.slice(
+      0,
+      Math.max(
+        0,
+        bars.length - 1
+      )
+    );
 
-  const latest = todayRows[todayRows.length - 1];
+  if (
+    completed.length < 4
+  ) {
+    return {
+      ok: false,
 
-  const completed = todayRows.filter(r =>
-    r.ts < latest.ts
-  );
+      symbol,
 
-  if (!completed.length) {
-    return null;
+      reason:
+        "Not enough completed 5m bars"
+    };
   }
 
+  const current =
+    completed[
+      completed.length - 1
+    ];
+
+  const previous =
+    completed[
+      completed.length - 2
+    ];
+
+  const previous2 =
+    completed[
+      completed.length - 3
+    ];
+
+  const last3 =
+    completed.slice(-3);
+
+  const vol15 =
+    last3.reduce(
+      (sum, bar) =>
+        sum + bar.volume,
+      0
+    );
+
+  const preceding =
+    completed.slice(
+      0,
+      -3
+    );
+
   /*
-  ----------------------------------------------------------
-  VOL15M
-  ----------------------------------------------------------
+  Historical same-time-of-day baseline.
+
+  We use the previous sessions in the
+  5-day Yahoo window.
   */
+  const currentDate =
+    sessionKey(
+      current.timestamp
+    );
 
-  const trailing15 = completed.slice(-3);
+  const sameTimeVolumes =
+    preceding
+      .filter(bar =>
+        sessionKey(
+          bar.timestamp
+        ) !== currentDate
+      )
+      .filter(bar => {
+        const d =
+          new Date(
+            bar.timestamp * 1000
+          );
 
-  const vol15m = trailing15.reduce(
-    (sum, r) => sum + (r.volume || 0),
-    0
-  );
+        const c =
+          new Date(
+            current.timestamp * 1000
+          );
 
-  /*
-  ----------------------------------------------------------
-  VOL5M
-  ----------------------------------------------------------
-  */
+        return (
+          d.getUTCHours() ===
+            c.getUTCHours() &&
+          d.getUTCMinutes() ===
+            c.getUTCMinutes()
+        );
+      })
+      .map(
+        bar =>
+          bar.volume
+      );
 
-  const last5 = completed.at(-1);
-
-  const vol5m = last5?.volume || 0;
-
-  /*
-  ----------------------------------------------------------
-  ACCEL5M
-  ----------------------------------------------------------
-  */
-
-  const previous5 = completed.slice(-7, -1);
-
-  const previous5Average =
-    previous5.length > 0
-      ? previous5.reduce(
-          (sum, r) => sum + r.volume,
+  const baseline =
+    sameTimeVolumes.length
+      ? sameTimeVolumes.reduce(
+          (a, b) =>
+            a + b,
           0
-        ) / previous5.length
+        ) /
+        sameTimeVolumes.length
+      : null;
+
+  const rvol15 =
+    baseline &&
+    baseline > 0
+      ? vol15 / baseline
+      : null;
+
+  const accelBase =
+    completed
+      .slice(
+        Math.max(
+          0,
+          completed.length - 6
+        ),
+        -3
+      );
+
+  const accelMean =
+    accelBase.length
+      ? accelBase.reduce(
+          (sum, bar) =>
+            sum + bar.volume,
+          0
+        ) /
+        accelBase.length
       : null;
 
   const accel5m =
-    previous5Average &&
-    previous5Average > 0
-      ? vol5m / previous5Average
+    accelMean &&
+    accelMean > 0
+      ? current.volume /
+        accelMean
       : null;
-
-  /*
-  ----------------------------------------------------------
-  VWAP + HOD
-  ----------------------------------------------------------
-  */
-
-  let priceVolume = 0;
-  let totalVolume = 0;
-  let hod = -Infinity;
-
-  for (const r of completed) {
-    const typical =
-      Number.isFinite(r.high) &&
-      Number.isFinite(r.low)
-        ? (r.high + r.low + r.close) / 3
-        : r.close;
-
-    const volume = r.volume || 0;
-
-    priceVolume += typical * volume;
-    totalVolume += volume;
-
-    if (Number.isFinite(r.high)) {
-      hod = Math.max(hod, r.high);
-    }
-  }
 
   const vwap =
-    totalVolume > 0
-      ? priceVolume / totalVolume
-      : null;
-
-  const price = latest.close;
-
-  const vwapPct =
-    vwap &&
-    vwap > 0
-      ? price / vwap - 1
-      : null;
-
-  const hodDistance =
-    Number.isFinite(hod) &&
-    hod > 0
-      ? price / hod - 1
-      : null;
-
-  /*
-  ----------------------------------------------------------
-  PREVIOUS SESSIONS
-  ----------------------------------------------------------
-  */
-
-  const byDate = new Map();
-
-  for (const r of rows) {
-    if (!byDate.has(r.date)) {
-      byDate.set(r.date, []);
-    }
-
-    byDate.get(r.date).push(r);
-  }
-
-  const dates = [...byDate.keys()].sort((a, b) =>
-    a < b ? 1 : a > b ? -1 : 0
-  );
-
-  const previousDate =
-    dates.find(d => d < today) || null;
-
-  const previous2Date =
-    dates.find(d => d < (previousDate || today)) || null;
-
-  const previousClose =
-    previousDate &&
-    byDate.get(previousDate)?.length
-      ? byDate.get(previousDate).at(-1).close
-      : cleanNumber(meta.previousClose);
-
-  const previous2Close =
-    previous2Date &&
-    byDate.get(previous2Date)?.length
-      ? byDate.get(previous2Date).at(-1).close
-      : null;
-
-  const j1Pct =
-    previousClose &&
-    previousClose > 0
-      ? price / previousClose - 1
-      : null;
-
-  const j2Pct =
-    previous2Close &&
-    previous2Close > 0
-      ? previousClose / previous2Close - 1
-      : null;
-
-  /*
-  ----------------------------------------------------------
-  RVOL15M
-  ----------------------------------------------------------
-  */
-
-  const targetMinutes = trailing15.map(
-    r => r.hour * 60 + r.minute
-  );
-
-  const historical15mVolumes = [];
-
-  for (const date of dates) {
-    if (date >= today) {
-      continue;
-    }
-
-    const dayRows = byDate.get(date) || [];
-
-    const matching = dayRows.filter(r =>
-      targetMinutes.includes(r.hour * 60 + r.minute)
+    calculateVWAP(
+      completed
     );
 
-    if (matching.length >= 2) {
-      const volume = matching
-        .slice(-3)
-        .reduce(
-          (sum, r) => sum + r.volume,
-          0
-        );
+  const currentPrice =
+    current.close;
 
-      historical15mVolumes.push(volume);
-    }
-  }
-
-  const baseline15m =
-    historical15mVolumes.length
-      ? historical15mVolumes.reduce(
-          (sum, v) => sum + v,
-          0
-        ) / historical15mVolumes.length
+  const j1 =
+    previous.close &&
+    previous.close > 0
+      ? currentPrice /
+        previous.close
       : null;
 
-  const rvol15m =
-    baseline15m &&
-    baseline15m > 0
-      ? vol15m / baseline15m
+  const j2 =
+    previous2.close &&
+    previous2.close > 0
+      ? previous.close /
+        previous2.close
       : null;
 
-  /*
-  ----------------------------------------------------------
-  LAST 5M SHARE
-  ----------------------------------------------------------
-  */
+  const hod =
+    Math.max(
+      ...completed.map(
+        bar =>
+          bar.high ??
+          bar.close
+      )
+    );
 
-  const last5Share =
-    vol15m > 0
-      ? vol5m / vol15m
+  const hodDistance =
+    hod &&
+    hod > 0
+      ? currentPrice /
+          hod -
+        1
       : null;
 
-  /*
-  ----------------------------------------------------------
-  SIMPLE RANK SCORE
-  ----------------------------------------------------------
-  */
-
-  let score = 0;
-
-  if (rvol15m != null) {
-    score += Math.max(0, rvol15m - 1) * 3;
-  }
-
-  if (accel5m != null) {
-    score += Math.max(0, accel5m - 1) * 2;
-  }
-
-  if (vwapPct != null) {
-    score += Math.max(-0.01, vwapPct) * 50;
-  }
-
-  if (hodDistance != null) {
-    score += Math.max(-0.20, hodDistance) * -1;
-  }
+  const priceVsVWAP =
+    vwap &&
+    vwap > 0
+      ? currentPrice /
+          vwap -
+        1
+      : null;
 
   return {
-    symbol: meta.symbol || null,
-    exchange: meta.exchange || null,
-    quoteType: meta.quoteType || null,
+    ok: true,
 
-    price,
+    symbol,
 
-    day_volume:
-      cleanNumber(meta.regularMarketVolume) ||
-      todayRows.reduce(
-        (sum, r) => sum + r.volume,
-        0
-      ),
+    price:
+      currentPrice,
 
-    change_pct:
-      cleanNumber(meta.regularMarketChangePercent) ??
-      j1Pct,
+    timestamp:
+      current.timestamp,
 
-    vol15m,
-    baseline15m,
-    rvol15m,
+    vol15m:
+      vol15,
 
-    vol5m,
-    accel5m,
+    rvol15m:
+      rvol15,
 
-    vwap,
-    vwap_pct: vwapPct,
+    accel5m:
+      accel5m,
 
-    hod,
-    hod_distance: hodDistance,
+    vwap:
+      vwap,
 
-    j1_pct: j1Pct,
-    j2_pct: j2Pct,
+    price_vs_vwap:
+      priceVsVWAP,
 
-    last5_share_15m: last5Share,
+    j1:
+      j1,
 
-    bars_today: todayRows.length,
+    j2:
+      j2,
 
-    data_timestamp:
-      new Date(latest.ts * 1000).toISOString(),
+    hod:
+      hod,
 
-    score
+    hod_distance:
+      hodDistance,
+
+    bars:
+      completed.length
   };
 }
 
 /*
 ============================================================
-LOT FORMATION
+S0 FILTER
 ============================================================
 */
 
-function createLots(items, size = 20) {
-  const lots = [];
+function isOrdinaryStock(
+  row
+) {
+  const meta =
+    row?.meta || {};
 
-  for (let i = 0; i < items.length; i += size) {
-    lots.push({
-      lot: lots.length + 1,
-      symbols: items
-        .slice(i, i + size)
-        .map(x => x.symbol)
-    });
+  const quoteType =
+    String(
+      meta.quoteType ??
+      meta.instrumentType ??
+      ""
+    ).toUpperCase();
+
+  const exchange =
+    String(
+      meta.exchange ??
+      meta.exchangeName ??
+      ""
+    ).toUpperCase();
+
+  /*
+  If Yahoo explicitly tells us it is not equity,
+  reject it.
+  */
+  if (
+    quoteType &&
+    quoteType !== "EQUITY"
+  ) {
+    return false;
   }
 
-  return lots;
+  /*
+  Explicitly reject ETFs/funds.
+  */
+  const shortName =
+    String(
+      meta.shortName ||
+      meta.longName ||
+      ""
+    ).toUpperCase();
+
+  if (
+    shortName.includes("ETF") ||
+    shortName.includes("FUND")
+  ) {
+    return false;
+  }
+
+  /*
+  If exchange information is available,
+  require NASDAQ/NYSE/AMEX-type US equity venues.
+  */
+  if (
+    exchange &&
+    ![
+      "NMS",
+      "NGM",
+      "NCM",
+      "NAS",
+      "NASDAQ",
+      "NYSE",
+      "NYQ",
+      "ASE",
+      "AMEX",
+      "BATS"
+    ].includes(exchange)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function getCurrentPrice(
+  row
+) {
+  const meta =
+    row?.meta || {};
+
+  return (
+    cleanNumber(
+      meta.regularMarketPrice
+    ) ??
+    cleanNumber(
+      meta.postMarketPrice
+    )
+  );
+}
+
+/*
+============================================================
+WS TEST LOCK
+============================================================
+*/
+
+let wsTestQueue =
+  Promise.resolve();
+
+function withWsTestLock(
+  task
+) {
+  const run =
+    wsTestQueue.then(
+      task,
+      task
+    );
+
+  wsTestQueue =
+    run.catch(
+      () => {}
+    );
+
+  return run;
 }
 
 /*
@@ -518,468 +905,813 @@ MCP SERVER
 ============================================================
 */
 
-function buildServer() {
-  const server = new McpServer({
-    name: "yahoo-scan-mcp",
-    version: "1.1.0"
+const server =
+  new McpServer({
+    name:
+      "yahoo-scan-mcp",
+
+    version:
+      APP_VERSION
   });
 
-  /*
-  ----------------------------------------------------------
-  PING
-  ----------------------------------------------------------
-  */
+/*
+============================================================
+PING
+============================================================
+*/
 
-  server.tool(
-    "ping",
-    "Health check.",
-    {},
-    async () => ({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
+server.tool(
+  "ping",
+
+  "Health check",
+
+  {},
+
+  async () => ({
+    content: [{
+      type:
+        "text",
+
+      text:
+        JSON.stringify({
           ok: true,
-          service: "yahoo-scan-mcp",
-          version: "1.1.0",
-          timestamp: new Date().toISOString()
-        })
-      }]
-    })
-  );
 
-  /*
-  ----------------------------------------------------------
-  STATUS
-  ----------------------------------------------------------
-  */
+          service:
+            "yahoo-scan-mcp",
 
-  server.tool(
-    "get_status",
-    "Returns scanner and Yahoo WebSocket status.",
-    {},
-    async () => ({
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          ok: true,
-          service: "yahoo-scan-mcp",
-          stage: "live_scan",
-
-          yahoo_websocket: yahoo.status(),
-
-          scan_state: {
-            asof: scanState.asof,
-            symbols_requested:
-              scanState.symbols_requested,
-            s0_count:
-              scanState.s0.length,
-            s1_count:
-              scanState.s1.length,
-            lots:
-              scanState.lots.length,
-            errors:
-              scanState.errors.length,
-            elapsed_ms:
-              scanState.elapsed_ms
-          },
+          version:
+            APP_VERSION,
 
           timestamp:
-            new Date().toISOString()
+            new Date()
+              .toISOString()
         }, null, 2)
-      }]
-    })
-  );
+    }]
+  })
+);
 
-  /*
-  ----------------------------------------------------------
-  YAHOO WEBSOCKET TEST
-  ----------------------------------------------------------
-  */
+/*
+============================================================
+GET STATUS
+============================================================
+*/
 
-  server.tool(
-    "yahoo_ws_test",
-    "Tests Yahoo live WebSocket data.",
-    {
-      symbols:
-        z.array(z.string()).optional(),
+server.tool(
+  "get_status",
 
-      seconds:
-        z.number()
-          .int()
-          .min(5)
-          .max(120)
-          .optional()
-    },
+  "Return current Yahoo WebSocket and scanner state",
 
-    async ({ symbols, seconds }) => {
-      const list =
-        symbols?.length
-          ? symbols
-          : [
-              "AAPL",
-              "MSFT",
-              "NVDA",
-              "AMD",
-              "INTC"
-            ];
+  {},
 
-      const duration =
-        seconds ?? 15;
+  async () => ({
+    content: [{
+      type:
+        "text",
 
-      const started = Date.now();
+      text:
+        JSON.stringify({
+          ok: true,
 
-      try {
-        await yahoo.connect();
+          version:
+            APP_VERSION,
 
-        const subscribed =
-          yahoo.subscribe(list);
+          scanner:
+            scanState,
 
-        await new Promise(resolve =>
-          setTimeout(
-            resolve,
-            duration * 1000
-          )
-        );
+          yahoo:
+            yahoo.status()
+        }, null, 2)
+    }]
+  })
+);
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
+/*
+============================================================
+GET UNIVERSE
+============================================================
+*/
+
+server.tool(
+  "get_universe",
+
+  "Return the locally materialized filtered ticker universe",
+
+  {
+    limit:
+      z.number()
+        .int()
+        .min(1)
+        .max(2500)
+        .optional()
+  },
+
+  async ({
+    limit
+  }) => {
+    try {
+      const symbols =
+        await loadUniverse();
+
+      const out =
+        limit
+          ? symbols.slice(
+              0,
+              limit
+            )
+          : symbols;
+
+      return {
+        content: [{
+          type:
+            "text",
+
+          text:
+            JSON.stringify({
               ok: true,
-              requested_symbols: list,
-              requested_count: list.length,
-              subscribed_count: subscribed,
-              duration_seconds: duration,
-              elapsed_ms:
-                Date.now() - started,
-              yahoo:
-                yahoo.status()
+
+              source:
+                "universe_s0.txt",
+
+              count:
+                symbols.length,
+
+              returned:
+                out.length,
+
+              loaded_at:
+                universeLoadedAt,
+
+              symbols:
+                out
             }, null, 2)
-          }]
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type:
+            "text",
+
+          text:
+            JSON.stringify({
               ok: false,
+
               error:
                 err?.message ||
-                String(err),
-              yahoo:
-                yahoo.status()
+                String(err)
             }, null, 2)
-          }]
-        };
-      }
+        }]
+      };
     }
-  );
+  }
+);
 
-  /*
-  ==========================================================
-  S0 + S1
-  ==========================================================
-  */
+/*
+============================================================
+YAHOO WS TEST
+============================================================
+*/
 
-  server.tool(
-    "yahoo_s0_s1_scan",
-    "Builds S0 and S1 from Yahoo 5-minute intraday data.",
-    {
-      symbols:
-        z.array(z.string())
-          .min(1)
-          .max(2500),
+server.tool(
+  "yahoo_ws_test",
 
-      s1_limit:
-        z.number()
-          .int()
-          .min(10)
-          .max(200)
-          .optional()
-    },
+  "Test Yahoo Finance live WebSocket",
 
-    async ({ symbols, s1_limit }) => {
-      const started = Date.now();
+  {
+    symbols:
+      z.array(
+        z.string()
+      )
+      .min(1)
+      .max(2500)
+      .optional(),
 
-      const list = [
-        ...new Set(
-          symbols
-            .map(s =>
-              String(s)
-                .trim()
-                .toUpperCase()
-            )
-            .filter(Boolean)
-        )
-      ];
+    seconds:
+      z.number()
+        .int()
+        .min(5)
+        .max(120)
+        .optional()
+  },
+
+  async ({
+    symbols,
+    seconds
+  }) =>
+    withWsTestLock(
+      async () => {
+
+        const list =
+          normalizeSymbols(
+            symbols?.length
+              ? symbols
+              : [
+                  "AAPL",
+                  "MSFT",
+                  "NVDA",
+                  "AMD",
+                  "INTC"
+                ]
+          );
+
+        const duration =
+          seconds ?? 15;
+
+        const started =
+          Date.now();
+
+        let testYahoo =
+          null;
+
+        try {
+          /*
+          IMPORTANT:
+          Do NOT reuse the global YahooWS
+          instance for diagnostic tests.
+          This prevents old symbols from
+          contaminating the new test.
+          */
+          testYahoo =
+            new YahooWS({
+              log
+            });
+
+          await testYahoo.connect();
+
+          const subscribed =
+            testYahoo.subscribe(
+              list
+            );
+
+          await new Promise(
+            resolve =>
+              setTimeout(
+                resolve,
+                duration *
+                  1000
+              )
+          );
+
+          const status =
+            testYahoo.status();
+
+          const requestedSet =
+            new Set(list);
+
+          status.latest =
+            Object.fromEntries(
+              Object.entries(
+                status.latest ||
+                {}
+              ).filter(
+                ([symbol]) =>
+                  requestedSet.has(
+                    symbol
+                  )
+              )
+            );
+
+          status.recent_ticks =
+            (
+              status.recent_ticks ||
+              []
+            ).filter(
+              tick =>
+                requestedSet.has(
+                  tick.symbol
+                )
+            );
+
+          return {
+            content: [{
+              type:
+                "text",
+
+              text:
+                JSON.stringify({
+                  ok: true,
+
+                  requested_symbols:
+                    list,
+
+                  requested_count:
+                    list.length,
+
+                  subscribed_count:
+                    subscribed,
+
+                  duration_seconds:
+                    duration,
+
+                  elapsed_ms:
+                    Date.now() -
+                    started,
+
+                  yahoo:
+                    status
+                }, null, 2)
+            }]
+          };
+
+        } catch (err) {
+
+          return {
+            content: [{
+              type:
+                "text",
+
+              text:
+                JSON.stringify({
+                  ok: false,
+
+                  error:
+                    err?.message ||
+                    String(err),
+
+                  yahoo:
+                    testYahoo
+                      ? testYahoo.status()
+                      : null
+                }, null, 2)
+            }]
+          };
+
+        } finally {
+
+          try {
+            testYahoo?.close();
+          } catch {}
+        }
+      }
+    )
+);
+
+/*
+============================================================
+S0 / S1 SCAN
+============================================================
+*/
+
+server.tool(
+  "yahoo_s0_s1_scan",
+
+  "Build S0/S1 from Yahoo 5-minute intraday data",
+
+  {
+    symbols:
+      z.array(
+        z.string()
+      )
+      .min(1)
+      .max(2500)
+      .optional(),
+
+    s1_limit:
+      z.number()
+        .int()
+        .min(10)
+        .max(200)
+        .optional()
+  },
+
+  async ({
+    symbols,
+    s1_limit
+  }) => {
+
+    const started =
+      Date.now();
+
+    try {
+
+      const supplied =
+        symbols?.length
+          ? symbols
+          : await loadUniverse();
+
+      const list =
+        normalizeSymbols(
+          supplied
+        );
+
+      if (!list.length) {
+        throw new Error(
+          "No valid symbols supplied"
+        );
+      }
+
+      /*
+      Reset state completely.
+      */
+      scanState.stage =
+        "S0_S1";
+
+      scanState.asof =
+        null;
+
+      scanState.elapsed_ms =
+        0;
 
       scanState.symbols_requested =
         list.length;
 
-      scanState.errors = [];
+      scanState.source =
+        symbols?.length
+          ? "request"
+          : "universe_s0.txt";
+
+      scanState.s0 =
+        [];
+
+      scanState.s1 =
+        [];
+
+      scanState.lots =
+        [];
+
+      scanState.errors =
+        [];
 
       /*
       --------------------------------------------------------
-      FETCH
+      YAHOO DATA
       --------------------------------------------------------
       */
 
-      const intraday =
+      const rows =
         await yahooSpark(
           list,
-          "10d",
+          "5d",
           "5m"
         );
 
       /*
       --------------------------------------------------------
-      S0
+      PROCESS
       --------------------------------------------------------
       */
 
-      const valid = [];
+      for (const row of rows) {
 
-      for (const row of intraday) {
         if (row?._error) {
           scanState.errors.push({
-            type: "spark_batch",
-            message: row._message,
-            symbols: row._batch
+            type:
+              "yahoo",
+
+            batch:
+              row._batch,
+
+            message:
+              row._message
           });
 
           continue;
         }
 
-        const meta =
-          row?.meta;
+        if (row?._invalid) {
+          scanState.errors.push({
+            type:
+              "invalid",
 
-        const price =
-          cleanNumber(
-            meta?.regularMarketPrice
-          );
+            symbol:
+              row._symbol,
 
-        if (!meta || price == null) {
+            message:
+              row._message
+          });
+
           continue;
         }
 
-        const quoteType =
+        const symbol =
           String(
-            meta.quoteType || ""
+            row?.meta?.symbol ||
+            row?.symbol ||
+            ""
           ).toUpperCase();
 
-        const exchange =
-          String(
-            meta.exchange || ""
-          ).toUpperCase();
+        if (!symbol) {
+          scanState.errors.push({
+            type:
+              "missing_symbol",
 
-        const isEquity =
-          quoteType === "EQUITY";
+            message:
+              "Yahoo response has no symbol"
+          });
 
-        const isNasdaq =
-          isNasdaqExchange(exchange);
+          continue;
+        }
 
-        const under5 =
-          price > 0 &&
-          price < 5;
+        const price =
+          getCurrentPrice(
+            row
+          );
 
         /*
         S0:
-        ordinary equity
-        NASDAQ
-        price < $5
+        ordinary stock,
+        live price < $5.
         */
+        if (
+          price === null ||
+          price >= 5 ||
+          price <= 0
+        ) {
+          continue;
+        }
 
         if (
-          isEquity &&
-          isNasdaq &&
-          under5
+          !isOrdinaryStock(
+            row
+          )
         ) {
-          valid.push(row);
+          continue;
         }
-      }
 
-      const s0 =
-        valid
-          .map(row => {
-            const meta =
-              row.meta || {};
+        const s0Item = {
+          symbol,
 
-            return {
-              symbol:
-                meta.symbol,
+          price,
 
-              price:
-                cleanNumber(
-                  meta.regularMarketPrice
-                ),
+          exchange:
+            row?.meta
+              ?.exchange ||
+            row?.meta
+              ?.exchangeName ||
+            null,
 
-              exchange:
-                meta.exchange || null,
+          quote_type:
+            row?.meta
+              ?.quoteType ||
+            row?.meta
+              ?.instrumentType ||
+            null
+        };
 
-              quoteType:
-                meta.quoteType || null,
+        scanState.s0.push(
+          s0Item
+        );
 
-              name:
-                meta.longName ||
-                meta.shortName ||
-                null
-            };
-          })
-          .sort(
-            (a, b) =>
-              a.symbol.localeCompare(
-                b.symbol
-              )
+        /*
+        S1 metrics.
+        */
+        const metrics =
+          calculateS1(
+            row
           );
 
-      /*
-      --------------------------------------------------------
-      S1
-      --------------------------------------------------------
-      */
-
-      const s1raw = [];
-
-      for (const row of valid) {
-        try {
-          const metric =
-            calculateS1(row);
-
-          if (metric) {
-            s1raw.push(metric);
-          }
-        } catch (err) {
+        if (
+          metrics.ok
+        ) {
+          scanState.s1.push(
+            metrics
+          );
+        } else {
           scanState.errors.push({
-            symbol:
-              row?.meta?.symbol ||
-              null,
+            type:
+              "s1",
 
-            type: "metric",
+            symbol,
 
             message:
-              err?.message ||
-              String(err)
+              metrics.reason
           });
         }
       }
 
       /*
       --------------------------------------------------------
-      PRIMARY RANKING
-      --------------------------------------------------------
-      RVOL15M
-      then Accel5M
-      then VWAP
+      RANKING
       --------------------------------------------------------
       */
 
-      const s1 =
-        s1raw
-          .filter(x =>
-            x.price != null &&
-            x.vol15m > 0 &&
-            x.rvol15m != null
-          )
-          .sort((a, b) => {
+      const ranked =
+        scanState.s1
+          .slice()
+          .sort(
+            (a, b) => {
 
-            const rvolA =
-              a.rvol15m ??
-              -Infinity;
+              const ar =
+                a.rvol15m ??
+                -Infinity;
 
-            const rvolB =
-              b.rvol15m ??
-              -Infinity;
+              const br =
+                b.rvol15m ??
+                -Infinity;
 
-            if (
-              rvolB !== rvolA
-            ) {
+              if (
+                br !== ar
+              ) {
+                return (
+                  br - ar
+                );
+              }
+
+              const aa =
+                a.accel5m ??
+                -Infinity;
+
+              const ba =
+                b.accel5m ??
+                -Infinity;
+
+              if (
+                ba !== aa
+              ) {
+                return (
+                  ba - aa
+                );
+              }
+
+              const av =
+                a.price_vs_vwap ??
+                -Infinity;
+
+              const bv =
+                b.price_vs_vwap ??
+                -Infinity;
+
               return (
-                rvolB -
-                rvolA
+                bv - av
               );
             }
-
-            const accelA =
-              a.accel5m ??
-              -Infinity;
-
-            const accelB =
-              b.accel5m ??
-              -Infinity;
-
-            if (
-              accelB !== accelA
-            ) {
-              return (
-                accelB -
-                accelA
-              );
-            }
-
-            return (
-              (b.vwap_pct ??
-                -Infinity) -
-              (a.vwap_pct ??
-                -Infinity)
-            );
-          });
+          );
 
       const limit =
-        s1_limit ?? 60;
+        s1_limit ??
+        50;
 
-      const finalS1 =
-        s1.slice(
+      scanState.s1 =
+        ranked.slice(
           0,
           limit
         );
 
       /*
       --------------------------------------------------------
-      LOTS OF 20
+      LOTS
       --------------------------------------------------------
       */
 
-      const lots =
-        createLots(
-          finalS1,
+      scanState.lots =
+        chunk(
+          scanState.s1,
           20
         );
 
-      /*
-      --------------------------------------------------------
-      SAVE STATE
-      --------------------------------------------------------
-      */
-
       scanState.asof =
-        new Date().toISOString();
-
-      scanState.s0 =
-        s0;
-
-      scanState.s1 =
-        finalS1;
-
-      scanState.lots =
-        lots;
+        new Date()
+          .toISOString();
 
       scanState.elapsed_ms =
         Date.now() -
         started;
 
-      /*
-      --------------------------------------------------------
-      RESULT
-      --------------------------------------------------------
-      */
+      scanState.universe_loaded_at =
+        universeLoadedAt;
+
+      scanState.stage =
+        "S0_S1";
 
       return {
         content: [{
-          type: "text",
-          text: JSON.stringify({
+          type:
+            "text",
+
+          text:
+            JSON.stringify({
+              ok: true,
+
+              stage:
+                "S0_S1",
+
+              version:
+                APP_VERSION,
+
+              asof:
+                scanState.asof,
+
+              elapsed_ms:
+                scanState.elapsed_ms,
+
+              universe_requested:
+                list.length,
+
+              s0_count:
+                scanState.s0.length,
+
+              s0:
+                scanState.s0,
+
+              s1_count:
+                scanState.s1.length,
+
+              s1:
+                scanState.s1,
+
+              lots_count:
+                scanState.lots.length,
+
+              lots:
+                scanState.lots,
+
+              errors_count:
+                scanState.errors.length,
+
+              errors:
+                scanState.errors
+            }, null, 2)
+        }]
+      };
+
+    } catch (err) {
+
+      scanState.stage =
+        "error";
+
+      scanState.elapsed_ms =
+        Date.now() -
+        started;
+
+      scanState.errors =
+        [{
+          type:
+            "fatal",
+
+          message:
+            err?.message ||
+            String(err)
+        }];
+
+      return {
+        content: [{
+          type:
+            "text",
+
+          text:
+            JSON.stringify({
+              ok: false,
+
+              version:
+                APP_VERSION,
+
+              stage:
+                "S0_S1",
+
+              elapsed_ms:
+                scanState.elapsed_ms,
+
+              errors:
+                scanState.errors
+            }, null, 2)
+        }]
+      };
+    }
+  }
+);
+
+/*
+============================================================
+GET SCAN STATE
+============================================================
+*/
+
+server.tool(
+  "get_scan_state",
+
+  "Return latest S0/S1 scan state",
+
+  {
+    s1_limit:
+      z.number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+  },
+
+  async ({
+    s1_limit
+  }) => {
+
+    const limit =
+      s1_limit ??
+      scanState.s1.length;
+
+    return {
+      content: [{
+        type:
+          "text",
+
+        text:
+          JSON.stringify({
             ok: true,
 
-            stage: "S0_S1",
+            version:
+              APP_VERSION,
+
+            stage:
+              scanState.stage,
 
             asof:
               scanState.asof,
@@ -987,101 +1719,11 @@ function buildServer() {
             elapsed_ms:
               scanState.elapsed_ms,
 
-            universe_requested:
-              list.length,
-
-            s0_count:
-              s0.length,
-
-            s0,
-
-            s1_count:
-              finalS1.length,
-
-            s1:
-              finalS1,
-
-            lots_count:
-              lots.length,
-
-            lots,
-
-            errors_count:
-              scanState.errors.length,
-
-            errors:
-              scanState.errors,
-
-            methodology: {
-              S0:
-                "NASDAQ EQUITY, live price < $5",
-
-              S1:
-                "5-minute intraday data",
-
-              Vol15M:
-                "last 3 completed 5m bars",
-
-              RVOL15M:
-                "15m volume versus historical same-time 15m baseline",
-
-              Accel5M:
-                "last completed 5m volume versus preceding 5m average",
-
-              VWAP:
-                "session VWAP",
-
-              J1:
-                "current price versus previous close",
-
-              J2:
-                "previous close versus previous-2 close",
-
-              ranking:
-                "RVOL15M > Accel5M > VWAP",
-
-              lots:
-                "20 symbols per lot"
-            }
-          }, null, 2)
-        }]
-      };
-    }
-  );
-
-  /*
-  ==========================================================
-  GET LAST SCAN
-  ==========================================================
-  */
-
-  server.tool(
-    "get_scan_state",
-    "Returns the latest S0/S1 state.",
-    {
-      s1_limit:
-        z.number()
-          .int()
-          .min(1)
-          .max(200)
-          .optional()
-    },
-
-    async ({ s1_limit }) => {
-      const limit =
-        s1_limit ?? 60;
-
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            ok: true,
-
-            asof:
-              scanState.asof,
-
             symbols_requested:
               scanState.symbols_requested,
+
+            source:
+              scanState.source,
 
             s0_count:
               scanState.s0.length,
@@ -1091,8 +1733,8 @@ function buildServer() {
 
             s1_count:
               Math.min(
-                limit,
-                scanState.s1.length
+                scanState.s1.length,
+                limit
               ),
 
             s1:
@@ -1111,244 +1753,109 @@ function buildServer() {
               scanState.errors.length,
 
             errors:
-              scanState.errors,
-
-            elapsed_ms:
-              scanState.elapsed_ms
+              scanState.errors
           }, null, 2)
-        }]
-      };
-    }
-  );
-
-  return server;
-}
-
-/*
-============================================================
-HTTP
-============================================================
-*/
-
-async function readBody(req) {
-  const chunks = [];
-  let size = 0;
-
-  for await (const chunk of req) {
-    chunks.push(chunk);
-
-    size += chunk.length;
-
-    if (size > 4 * 1024 * 1024) {
-      throw new Error(
-        "Request body too large"
-      );
-    }
-  }
-
-  if (!chunks.length) {
-    return undefined;
-  }
-
-  return JSON.parse(
-    Buffer.concat(chunks)
-      .toString("utf8")
-  );
-}
-
-const httpServer =
-  http.createServer(
-    async (req, res) => {
-
-      try {
-
-        /*
-        ------------------------------------------------------
-        HEALTH
-        ------------------------------------------------------
-        */
-
-        if (
-          req.method === "GET" &&
-          req.url === "/health"
-        ) {
-          return json(
-            res,
-            200,
-            {
-              ok: true,
-              service:
-                "yahoo-scan-mcp",
-              timestamp:
-                new Date().toISOString()
-            }
-          );
-        }
-
-        /*
-        ------------------------------------------------------
-        MCP
-        ------------------------------------------------------
-        */
-
-        if (
-          req.url === "/mcp"
-        ) {
-
-          if (
-            ![
-              "POST",
-              "GET",
-              "DELETE"
-            ].includes(req.method)
-          ) {
-            res.writeHead(
-              405,
-              {
-                Allow:
-                  "GET, POST, DELETE"
-              }
-            );
-
-            return res.end();
-          }
-
-          const mcpServer =
-            buildServer();
-
-          const transport =
-            new StreamableHTTPServerTransport({
-              sessionIdGenerator:
-                undefined
-            });
-
-          res.on(
-            "close",
-            () => {
-              transport
-                .close()
-                .catch(() => {});
-
-              mcpServer
-                .close()
-                .catch(() => {});
-            }
-          );
-
-          await mcpServer.connect(
-            transport
-          );
-
-          let body;
-
-          if (
-            req.method === "POST"
-          ) {
-            body =
-              await readBody(req);
-          }
-
-          await transport.handleRequest(
-            req,
-            res,
-            body
-          );
-
-          return;
-        }
-
-        /*
-        ------------------------------------------------------
-        ROOT
-        ------------------------------------------------------
-        */
-
-        if (
-          req.method === "GET" &&
-          req.url === "/"
-        ) {
-          return json(
-            res,
-            200,
-            {
-              ok: true,
-              service:
-                "yahoo-scan-mcp",
-              version:
-                "1.1.0",
-              authentication:
-                "none",
-              endpoints: {
-                health:
-                  "/health",
-                mcp:
-                  "/mcp"
-              }
-            }
-          );
-        }
-
-        return json(
-          res,
-          404,
-          {
-            error:
-              "Not found"
-          }
-        );
-
-      } catch (err) {
-
-        log(
-          "HTTP error:",
-          err
-        );
-
-        if (
-          !res.headersSent
-        ) {
-          return json(
-            res,
-            500,
-            {
-              error:
-                err?.message ||
-                String(err)
-            }
-          );
-        }
-
-        res.end();
-      }
-    }
-  );
-
-httpServer.on(
-  "error",
-  err => {
-    log(
-      "HTTP server error:",
-      err
-    );
-
-    process.exit(1);
+      }]
+    };
   }
 );
 
-httpServer.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
+/*
+============================================================
+HTTP HEALTH SERVER
+============================================================
+*/
+
+const httpServer =
+  http.createServer(
+    (req, res) => {
+
+      if (
+        req.url ===
+          "/health" ||
+        req.url ===
+          "/"
+      ) {
+
+        res.writeHead(
+          200,
+          {
+            "Content-Type":
+              "application/json"
+          }
+        );
+
+        res.end(
+          JSON.stringify({
+            ok: true,
+
+            service:
+              "yahoo-scan-mcp",
+
+            version:
+              APP_VERSION
+          })
+        );
+
+        return;
+      }
+
+      res.writeHead(
+        404,
+        {
+          "Content-Type":
+            "application/json"
+        }
+      );
+
+      res.end(
+        JSON.stringify({
+          ok: false,
+
+          error:
+            "Not found"
+        })
+      );
+    }
+  );
+
+/*
+============================================================
+START
+============================================================
+*/
+
+async function main() {
+
+  httpServer.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+      log(
+        `HTTP server listening on ${PORT}`
+      );
+    }
+  );
+
+  const transport =
+    new StdioServerTransport();
+
+  await server.connect(
+    transport
+  );
+
+  log(
+    `MCP server started v${APP_VERSION}`
+  );
+}
+
+main().catch(
+  error => {
     log(
-      `Listening on 0.0.0.0:${PORT}`
+      "Fatal error:",
+      error
     );
 
-    log(
-      "Health: /health"
-    );
-
-    log(
-      "MCP: /mcp"
-    );
+    process.exit(1);
   }
 );
