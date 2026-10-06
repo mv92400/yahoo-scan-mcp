@@ -47,14 +47,17 @@ function readLengthDelimited(buf, offset) {
   const len = readVarint(buf, offset);
 
   const length = Number(len.value);
-  const end = len.offset + length;
 
   if (!Number.isSafeInteger(length)) {
     throw new Error("invalid length-delimited size");
   }
 
+  const end = len.offset + length;
+
   if (end > buf.length) {
-    throw new Error("unexpected end of length-delimited field");
+    throw new Error(
+      "unexpected end of length-delimited field"
+    );
   }
 
   return {
@@ -74,32 +77,30 @@ function readString(buf, offset) {
 
 function skipField(buf, offset, wireType) {
   switch (wireType) {
-    case 0: {
+    case 0:
       return readVarint(buf, offset).offset;
-    }
 
-    case 1: {
+    case 1:
       if (offset + 8 > buf.length) {
         throw new Error("unexpected end of fixed64");
       }
 
       return offset + 8;
-    }
 
-    case 2: {
+    case 2:
       return readLengthDelimited(buf, offset).offset;
-    }
 
-    case 5: {
+    case 5:
       if (offset + 4 > buf.length) {
         throw new Error("unexpected end of fixed32");
       }
 
       return offset + 4;
-    }
 
     default:
-      throw new Error(`unsupported wire type ${wireType}`);
+      throw new Error(
+        `unsupported wire type ${wireType}`
+      );
   }
 }
 
@@ -149,15 +150,6 @@ function decodePricingData(buffer) {
     const fieldNumber = Math.floor(key.value / 8);
     const wireType = key.value % 8;
 
-    /*
-     * Protobuf valid wire types:
-     * 0 = varint
-     * 1 = fixed64
-     * 2 = length-delimited
-     * 5 = fixed32
-     *
-     * 3/4 are deprecated group types.
-     */
     if (
       wireType !== 0 &&
       wireType !== 1 &&
@@ -176,7 +168,11 @@ function decodePricingData(buffer) {
 
       case 1: {
         if (wireType !== 2) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -194,7 +190,11 @@ function decodePricingData(buffer) {
 
       case 2: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -208,17 +208,28 @@ function decodePricingData(buffer) {
 
       /* =========================
          3 - time
+         ZigZag encoded
          ========================= */
 
       case 3: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
         const r = readVarint(buf, offset);
 
-        tick.time = Number(r.value);
+        const n = Number(r.value);
+
+        tick.time =
+          n % 2 === 0
+            ? n / 2
+            : -(n + 1) / 2;
+
         offset = r.offset;
 
         break;
@@ -230,7 +241,11 @@ function decodePricingData(buffer) {
 
       case 4: {
         if (wireType !== 2) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -248,7 +263,11 @@ function decodePricingData(buffer) {
 
       case 5: {
         if (wireType !== 2) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -266,7 +285,11 @@ function decodePricingData(buffer) {
 
       case 6: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -284,7 +307,11 @@ function decodePricingData(buffer) {
 
       case 7: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -302,7 +329,11 @@ function decodePricingData(buffer) {
 
       case 8: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -320,7 +351,11 @@ function decodePricingData(buffer) {
 
       case 9: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -338,7 +373,11 @@ function decodePricingData(buffer) {
 
       case 10: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -356,7 +395,11 @@ function decodePricingData(buffer) {
 
       case 11: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -374,7 +417,11 @@ function decodePricingData(buffer) {
 
       case 12: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -392,7 +439,11 @@ function decodePricingData(buffer) {
 
       case 13: {
         if (wireType !== 2) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -410,7 +461,11 @@ function decodePricingData(buffer) {
 
       case 14: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -428,7 +483,11 @@ function decodePricingData(buffer) {
 
       case 15: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -446,7 +505,11 @@ function decodePricingData(buffer) {
 
       case 16: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -464,7 +527,11 @@ function decodePricingData(buffer) {
 
       case 17: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -482,7 +549,11 @@ function decodePricingData(buffer) {
 
       case 18: {
         if (wireType !== 2) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -500,7 +571,11 @@ function decodePricingData(buffer) {
 
       case 19: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -518,7 +593,11 @@ function decodePricingData(buffer) {
 
       case 20: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -536,7 +615,11 @@ function decodePricingData(buffer) {
 
       case 21: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -554,7 +637,11 @@ function decodePricingData(buffer) {
 
       case 22: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -572,7 +659,11 @@ function decodePricingData(buffer) {
 
       case 23: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -590,7 +681,11 @@ function decodePricingData(buffer) {
 
       case 24: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -608,7 +703,11 @@ function decodePricingData(buffer) {
 
       case 25: {
         if (wireType !== 5) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -626,7 +725,11 @@ function decodePricingData(buffer) {
 
       case 26: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -644,7 +747,11 @@ function decodePricingData(buffer) {
 
       case 27: {
         if (wireType !== 0) {
-          offset = skipField(buf, offset, wireType);
+          offset = skipField(
+            buf,
+            offset,
+            wireType
+          );
           break;
         }
 
@@ -661,7 +768,12 @@ function decodePricingData(buffer) {
          ========================= */
 
       default: {
-        offset = skipField(buf, offset, wireType);
+        offset = skipField(
+          buf,
+          offset,
+          wireType
+        );
+
         break;
       }
     }
@@ -675,7 +787,9 @@ function decodePricingData(buffer) {
    ========================= */
 
 function decodeYahooMessage(data) {
-  const outer = JSON.parse(data.toString());
+  const outer = JSON.parse(
+    data.toString()
+  );
 
   if (!outer.message) {
     return null;
@@ -722,207 +836,263 @@ export class YahooWS {
   }
 
   async connect() {
-    if (this.connected && this.ws) {
+    if (
+      this.connected &&
+      this.ws
+    ) {
       return;
     }
 
-    await new Promise((resolve, reject) => {
-      const ws = new WebSocket(YAHOO_WS_URL);
-
-      this.ws = ws;
-
-      const timeout = setTimeout(() => {
-        try {
-          ws.close();
-        } catch {}
-
-        reject(
-          new Error(
-            "Yahoo WebSocket connection timeout"
-          )
-        );
-      }, 15000);
-
-      ws.on("open", () => {
-        clearTimeout(timeout);
-
-        this.connected = true;
-        this.connectedAt = Date.now();
-
-        this.log(
-          "[yahoo-ws] connected"
+    await new Promise(
+      (resolve, reject) => {
+        const ws = new WebSocket(
+          YAHOO_WS_URL
         );
 
-        this.heartbeat = setInterval(() => {
-          if (
-            this.connected &&
-            this.ws &&
-            this.symbols.length
-          ) {
+        this.ws = ws;
+
+        const timeout = setTimeout(
+          () => {
             try {
-              this.ws.send(
-                JSON.stringify({
-                  subscribe: this.symbols
-                })
-              );
+              ws.close();
             } catch {}
-          }
-        }, 15000);
 
-        resolve();
-      });
-
-      ws.on("message", (data) => {
-        this.messages++;
-
-        if (!this.firstMessageAt) {
-          this.firstMessageAt = Date.now();
-        }
-
-        this.lastMessages.push({
-          receivedAt:
-            new Date().toISOString(),
-
-          bytes: data.length
-        });
-
-        if (this.lastMessages.length > 10) {
-          this.lastMessages.shift();
-        }
-
-        try {
-          const tick = decodeYahooMessage(data);
-
-          if (
-            !tick ||
-            !tick.id ||
-            tick.price == null ||
-            !Number.isFinite(tick.price)
-          ) {
-            return;
-          }
-
-          let timestamp = null;
-
-          if (
-            tick.time != null &&
-            Number.isFinite(Number(tick.time))
-          ) {
-            const d = new Date(
-              Number(tick.time)
+            reject(
+              new Error(
+                "Yahoo WebSocket connection timeout"
+              )
             );
+          },
+          15000
+        );
 
-            if (!Number.isNaN(d.getTime())) {
-              timestamp = d.toISOString();
-            }
-          }
+        ws.on("open", () => {
+          clearTimeout(timeout);
 
-          const normalized = {
-            symbol: tick.id,
-
-            price: tick.price,
-
-            time: tick.time,
-
-            timestamp,
-
-            currency: tick.currency,
-
-            exchange: tick.exchange,
-
-            quote_type: tick.quoteType,
-
-            market_hours: tick.marketHours,
-
-            change: tick.change,
-
-            change_percent:
-              tick.changePercent,
-
-            day_volume: tick.dayVolume,
-
-            day_high: tick.dayHigh,
-
-            day_low: tick.dayLow,
-
-            open_price: tick.openPrice,
-
-            previous_close:
-              tick.previousClose,
-
-            last_size: tick.lastSize,
-
-            bid: tick.bid,
-
-            bid_size: tick.bidSize,
-
-            ask: tick.ask,
-
-            ask_size: tick.askSize,
-
-            price_hint: tick.priceHint,
-
-            received_at:
-              new Date().toISOString()
-          };
-
-          this.latest.set(
-            normalized.symbol,
-            normalized
-          );
-
-          this.recentTicks.push(
-            normalized
-          );
-
-          if (this.recentTicks.length > 20) {
-            this.recentTicks.shift();
-          }
-
-          this.ticks++;
-        } catch (err) {
-          this.decodeErrors++;
+          this.connected = true;
+          this.connectedAt =
+            Date.now();
 
           this.log(
-            "[yahoo-ws] decode error:",
-            err?.message ||
-              String(err)
-          );
-        }
-      });
-
-      ws.on("error", (err) => {
-        this.errors++;
-
-        this.log(
-          "[yahoo-ws] error:",
-          err?.message ||
-            String(err)
-        );
-
-        if (!this.connected) {
-          clearTimeout(timeout);
-          reject(err);
-        }
-      });
-
-      ws.on("close", () => {
-        this.connected = false;
-        this.subscribed = false;
-
-        if (this.heartbeat) {
-          clearInterval(
-            this.heartbeat
+            "[yahoo-ws] connected"
           );
 
-          this.heartbeat = null;
-        }
+          this.heartbeat =
+            setInterval(() => {
+              if (
+                this.connected &&
+                this.ws &&
+                this.symbols.length
+              ) {
+                try {
+                  this.ws.send(
+                    JSON.stringify({
+                      subscribe:
+                        this.symbols
+                    })
+                  );
+                } catch {}
+              }
+            }, 15000);
 
-        this.log(
-          "[yahoo-ws] closed"
+          resolve();
+        });
+
+        ws.on(
+          "message",
+          (data) => {
+            this.messages++;
+
+            if (
+              !this.firstMessageAt
+            ) {
+              this.firstMessageAt =
+                Date.now();
+            }
+
+            this.lastMessages.push({
+              receivedAt:
+                new Date().toISOString(),
+
+              bytes: data.length
+            });
+
+            if (
+              this.lastMessages.length >
+              10
+            ) {
+              this.lastMessages.shift();
+            }
+
+            try {
+              const tick =
+                decodeYahooMessage(
+                  data
+                );
+
+              if (
+                !tick ||
+                !tick.id ||
+                tick.price == null ||
+                !Number.isFinite(
+                  tick.price
+                )
+              ) {
+                return;
+              }
+
+              let timestamp = null;
+
+              if (
+                tick.time != null &&
+                Number.isFinite(
+                  Number(tick.time)
+                )
+              ) {
+                const d = new Date(
+                  Number(tick.time)
+                );
+
+                if (
+                  !Number.isNaN(
+                    d.getTime()
+                  )
+                ) {
+                  timestamp =
+                    d.toISOString();
+                }
+              }
+
+              const normalized = {
+                symbol: tick.id,
+
+                price: tick.price,
+
+                time: tick.time,
+
+                timestamp,
+
+                currency:
+                  tick.currency,
+
+                exchange:
+                  tick.exchange,
+
+                quote_type:
+                  tick.quoteType,
+
+                market_hours:
+                  tick.marketHours,
+
+                change:
+                  tick.change,
+
+                change_percent:
+                  tick.changePercent,
+
+                day_volume:
+                  tick.dayVolume,
+
+                day_high:
+                  tick.dayHigh,
+
+                day_low:
+                  tick.dayLow,
+
+                open_price:
+                  tick.openPrice,
+
+                previous_close:
+                  tick.previousClose,
+
+                last_size:
+                  tick.lastSize,
+
+                bid: tick.bid,
+
+                bid_size:
+                  tick.bidSize,
+
+                ask: tick.ask,
+
+                ask_size:
+                  tick.askSize,
+
+                price_hint:
+                  tick.priceHint,
+
+                received_at:
+                  new Date().toISOString()
+              };
+
+              this.latest.set(
+                normalized.symbol,
+                normalized
+              );
+
+              this.recentTicks.push(
+                normalized
+              );
+
+              if (
+                this.recentTicks.length >
+                20
+              ) {
+                this.recentTicks.shift();
+              }
+
+              this.ticks++;
+            } catch (err) {
+              this.decodeErrors++;
+
+              this.log(
+                "[yahoo-ws] decode error:",
+                err?.message ||
+                  String(err)
+              );
+            }
+          }
         );
-      });
-    });
+
+        ws.on(
+          "error",
+          (err) => {
+            this.errors++;
+
+            this.log(
+              "[yahoo-ws] error:",
+              err?.message ||
+                String(err)
+            );
+
+            if (!this.connected) {
+              clearTimeout(timeout);
+              reject(err);
+            }
+          }
+        );
+
+        ws.on(
+          "close",
+          () => {
+            this.connected = false;
+            this.subscribed = false;
+
+            if (this.heartbeat) {
+              clearInterval(
+                this.heartbeat
+              );
+
+              this.heartbeat = null;
+            }
+
+            this.log(
+              "[yahoo-ws] closed"
+            );
+          }
+        );
+      }
+    );
   }
 
   subscribe(symbols) {
@@ -972,20 +1142,26 @@ export class YahooWS {
 
   status() {
     return {
-      connected: this.connected,
+      connected:
+        this.connected,
 
-      subscribed: this.subscribed,
+      subscribed:
+        this.subscribed,
 
-      symbols: this.symbols.length,
+      symbols:
+        this.symbols.length,
 
       subscribed_symbols:
         this.symbols,
 
-      messages: this.messages,
+      messages:
+        this.messages,
 
-      ticks: this.ticks,
+      ticks:
+        this.ticks,
 
-      errors: this.errors,
+      errors:
+        this.errors,
 
       decode_errors:
         this.decodeErrors,
@@ -1037,4 +1213,4 @@ export class YahooWS {
     this.connected = false;
     this.subscribed = false;
   }
-  }
+}
