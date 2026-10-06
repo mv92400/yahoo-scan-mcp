@@ -8,6 +8,7 @@ function readVarint(buf, offset) {
 
   while (offset < buf.length) {
     const byte = buf[offset++];
+
     result += (byte & 0x7f) * 2 ** shift;
 
     if (!(byte & 0x80)) {
@@ -24,14 +25,6 @@ function readVarint(buf, offset) {
   throw new Error("unexpected end of varint");
 }
 
-function zigzagDecode(n) {
-  return Math.floor(n / 2) ^ -(n % 2);
-}
-
-function uint64ToNumber(n) {
-  return typeof n === "bigint" ? Number(n) : Number(n);
-}
-
 function readFloat(buf, offset) {
   if (offset + 4 > buf.length) {
     throw new Error("unexpected end of float");
@@ -43,33 +36,50 @@ function readFloat(buf, offset) {
   };
 }
 
-function readString(buf, offset, length) {
-  if (offset + length > buf.length) {
-    throw new Error("unexpected end of string");
+function readLengthDelimited(buf, offset) {
+  const len = readVarint(buf, offset);
+
+  const end = len.offset + Number(len.value);
+
+  if (end > buf.length) {
+    throw new Error("unexpected end of length-delimited field");
   }
 
   return {
-    value: buf.subarray(offset, offset + length).toString("utf8"),
-    offset: offset + length
+    value: buf.subarray(len.offset, end),
+    offset: end
+  };
+}
+
+function readString(buf, offset) {
+  const r = readLengthDelimited(buf, offset);
+
+  return {
+    value: r.value.toString("utf8"),
+    offset: r.offset
   };
 }
 
 function skipField(buf, offset, wireType) {
   switch (wireType) {
     case 0: {
-      const r = readVarint(buf, offset);
-      return r.offset;
+      return readVarint(buf, offset).offset;
     }
 
     case 1:
+      if (offset + 8 > buf.length) {
+        throw new Error("unexpected end of fixed64");
+      }
       return offset + 8;
 
     case 2: {
-      const r = readVarint(buf, offset);
-      return r.offset + r.value;
+      return readLengthDelimited(buf, offset).offset;
     }
 
     case 5:
+      if (offset + 4 > buf.length) {
+        throw new Error("unexpected end of fixed32");
+      }
       return offset + 4;
 
     default:
@@ -120,198 +130,353 @@ function decodePricingData(buffer) {
     const wireType = key.value % 8;
 
     switch (fieldNumber) {
+      // string
       case 1: {
-        const r = readString(buf, offset, readVarint(buf, offset).value);
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.id = s.value;
-        offset = s.offset;
+        if (wireType !== 2) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readString(buf, offset);
+        tick.id = r.value;
+        offset = r.offset;
         break;
       }
 
+      // float
       case 2: {
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.price = Number(s.value);
-        offset = s.offset;
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readFloat(buf, offset);
+        tick.price = r.value;
+        offset = r.offset;
         break;
       }
 
+      // uint64
       case 3: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.time = uint64ToNumber(zigzagDecode(r.value));
+        tick.time = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // string
       case 4: {
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.currency = s.value;
-        offset = s.offset;
+        if (wireType !== 2) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readString(buf, offset);
+        tick.currency = r.value;
+        offset = r.offset;
         break;
       }
 
+      // string
       case 5: {
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.exchange = s.value;
-        offset = s.offset;
+        if (wireType !== 2) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readString(buf, offset);
+        tick.exchange = r.value;
+        offset = r.offset;
         break;
       }
 
+      // uint32
       case 6: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.quoteType = uint64ToNumber(r.value);
+        tick.quoteType = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // uint32
       case 7: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.marketHours = uint64ToNumber(r.value);
+        tick.marketHours = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // float
       case 8: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.changePercent = r.value;
         offset = r.offset;
         break;
       }
 
+      // uint64
       case 9: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.dayVolume = uint64ToNumber(r.value);
+        tick.dayVolume = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // float
       case 10: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.dayHigh = r.value;
         offset = r.offset;
         break;
       }
 
+      // float
       case 11: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.dayLow = r.value;
         offset = r.offset;
         break;
       }
 
+      // float
       case 12: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.change = r.value;
         offset = r.offset;
         break;
       }
 
+      // string
       case 13: {
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.shortName = s.value;
-        offset = s.offset;
-        break;
-      }
+        if (wireType !== 2) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
 
-      case 14: {
-        const r = readVarint(buf, offset);
-        tick.expireDate = uint64ToNumber(r.value);
+        const r = readString(buf, offset);
+        tick.shortName = r.value;
         offset = r.offset;
         break;
       }
 
+      // uint64
+      case 14: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readVarint(buf, offset);
+        tick.expireDate = Number(r.value);
+        offset = r.offset;
+        break;
+      }
+
+      // float
       case 15: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.openPrice = r.value;
         offset = r.offset;
         break;
       }
 
+      // float
       case 16: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.previousClose = r.value;
         offset = r.offset;
         break;
       }
 
+      // float
       case 17: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.strikePrice = r.value;
         offset = r.offset;
         break;
       }
 
+      // string
       case 18: {
-        const len = readVarint(buf, offset);
-        const s = readString(buf, len.offset, len.value);
-        tick.underlyingSymbol = s.value;
-        offset = s.offset;
+        if (wireType !== 2) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
+        const r = readString(buf, offset);
+        tick.underlyingSymbol = r.value;
+        offset = r.offset;
         break;
       }
 
+      // uint64
       case 19: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.openInterest = uint64ToNumber(r.value);
+        tick.openInterest = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // uint32
       case 20: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.optionsType = uint64ToNumber(r.value);
+        tick.optionsType = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // uint32 / bool
       case 21: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
         tick.miniOption = Boolean(r.value);
         offset = r.offset;
         break;
       }
 
+      // uint64
       case 22: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.lastSize = uint64ToNumber(r.value);
+        tick.lastSize = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // float
       case 23: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.bid = r.value;
         offset = r.offset;
         break;
       }
 
+      // uint64
       case 24: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.bidSize = uint64ToNumber(r.value);
+        tick.bidSize = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // float
       case 25: {
+        if (wireType !== 5) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readFloat(buf, offset);
         tick.ask = r.value;
         offset = r.offset;
         break;
       }
 
+      // uint64
       case 26: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.askSize = uint64ToNumber(r.value);
+        tick.askSize = Number(r.value);
         offset = r.offset;
         break;
       }
 
+      // uint32
       case 27: {
+        if (wireType !== 0) {
+          offset = skipField(buf, offset, wireType);
+          break;
+        }
+
         const r = readVarint(buf, offset);
-        tick.priceHint = uint64ToNumber(r.value);
+        tick.priceHint = Number(r.value);
         offset = r.offset;
         break;
       }
@@ -361,7 +526,9 @@ export class YahooWS {
   }
 
   async connect() {
-    if (this.connected && this.ws) return;
+    if (this.connected && this.ws) {
+      return;
+    }
 
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(YAHOO_WS_URL);
@@ -385,11 +552,17 @@ export class YahooWS {
         this.log("[yahoo-ws] connected");
 
         this.heartbeat = setInterval(() => {
-          if (this.connected && this.ws && this.symbols.length) {
+          if (
+            this.connected &&
+            this.ws &&
+            this.symbols.length
+          ) {
             try {
-              this.ws.send(JSON.stringify({
-                subscribe: this.symbols
-              }));
+              this.ws.send(
+                JSON.stringify({
+                  subscribe: this.symbols
+                })
+              );
             } catch {}
           }
         }, 15000);
@@ -416,7 +589,12 @@ export class YahooWS {
         try {
           const tick = decodeYahooMessage(data);
 
-          if (!tick || !tick.id || tick.price == null) {
+          if (
+            !tick ||
+            !tick.id ||
+            tick.price == null ||
+            !Number.isFinite(tick.price)
+          ) {
             return;
           }
 
@@ -426,7 +604,6 @@ export class YahooWS {
 
             time: tick.time,
 
-            // Yahoo time is already milliseconds since epoch.
             timestamp:
               tick.time != null
                 ? new Date(Number(tick.time)).toISOString()
@@ -482,7 +659,10 @@ export class YahooWS {
       ws.on("error", (err) => {
         this.errors++;
 
-        this.log("[yahoo-ws] error:", err.message);
+        this.log(
+          "[yahoo-ws] error:",
+          err.message
+        );
 
         if (!this.connected) {
           clearTimeout(timeout);
@@ -506,13 +686,19 @@ export class YahooWS {
 
   subscribe(symbols) {
     if (!this.ws || !this.connected) {
-      throw new Error("Yahoo WebSocket is not connected");
+      throw new Error(
+        "Yahoo WebSocket is not connected"
+      );
     }
 
     const list = [
       ...new Set(
         symbols
-          .map(s => String(s).trim().toUpperCase())
+          .map(s =>
+            String(s)
+              .trim()
+              .toUpperCase()
+          )
           .filter(Boolean)
       )
     ];
