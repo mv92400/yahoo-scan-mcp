@@ -9,12 +9,6 @@ import { z } from "zod";
 import { YahooWS } from "./src/yahoo-ws.js";
 
 const PORT = Number(process.env.PORT || 8080);
-const MCP_TOKEN = process.env.MCP_TOKEN || "";
-
-if (!MCP_TOKEN) {
-  console.error("[yahoo-scan-mcp] ERROR: MCP_TOKEN is not set");
-  process.exit(1);
-}
 
 function log(...args) {
   console.error("[yahoo-scan-mcp]", ...args);
@@ -32,16 +26,17 @@ function json(res, status, body) {
   res.end(data);
 }
 
-function authorized(req) {
-  const auth = req.headers.authorization || "";
-  return auth === `Bearer ${MCP_TOKEN}`;
-}
+// ------------------------------------------------------------
+// YAHOO WEBSOCKET
+// ------------------------------------------------------------
 
-// Yahoo WebSocket instance.
-// One persistent instance is shared by the MCP server.
 const yahoo = new YahooWS({
   log
 });
+
+// ------------------------------------------------------------
+// MCP SERVER
+// ------------------------------------------------------------
 
 function buildServer() {
   const server = new McpServer({
@@ -49,9 +44,9 @@ function buildServer() {
     version: "1.0.0"
   });
 
-  // ------------------------------------------------------------
-  // BASIC PING
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // PING
+  // ----------------------------------------------------------
 
   server.tool(
     "ping",
@@ -72,9 +67,9 @@ function buildServer() {
     })
   );
 
-  // ------------------------------------------------------------
-  // SERVER STATUS
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // STATUS
+  // ----------------------------------------------------------
 
   server.tool(
     "get_status",
@@ -97,9 +92,9 @@ function buildServer() {
     })
   );
 
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
   // YAHOO WEBSOCKET TEST
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
 
   server.tool(
     "yahoo_ws_test",
@@ -109,6 +104,7 @@ function buildServer() {
       seconds: z.number().int().min(5).max(120).optional()
     },
     async ({ symbols, seconds }) => {
+
       const list = symbols?.length
         ? symbols
         : [
@@ -124,13 +120,14 @@ function buildServer() {
       const started = Date.now();
 
       try {
-        // Connect to Yahoo WebSocket.
+
+        // Connect to Yahoo
         await yahoo.connect();
 
-        // Subscribe to requested symbols.
+        // Subscribe
         const subscribed = yahoo.subscribe(list);
 
-        // Wait while receiving Yahoo messages.
+        // Wait for incoming messages
         await new Promise(resolve =>
           setTimeout(resolve, duration * 1000)
         );
@@ -151,14 +148,15 @@ function buildServer() {
                 yahoo: status,
 
                 note:
-                  "messages > 0 confirms that Yahoo WebSocket messages were received. " +
-                  "The current test does not yet decode Yahoo protobuf payloads into validated ticker ticks."
+                  "This is currently a raw WebSocket connectivity test. " +
+                  "Yahoo payload decoding into validated ticker ticks will be implemented next."
               }, null, 2)
             }
           ]
         };
 
       } catch (err) {
+
         return {
           content: [
             {
@@ -179,7 +177,7 @@ function buildServer() {
 }
 
 // ------------------------------------------------------------
-// REQUEST BODY
+// READ REQUEST BODY
 // ------------------------------------------------------------
 
 async function readBody(req) {
@@ -187,8 +185,8 @@ async function readBody(req) {
   let size = 0;
 
   for await (const chunk of req) {
-    chunks.push(chunk);
 
+    chunks.push(chunk);
     size += chunk.length;
 
     if (size > 4 * 1024 * 1024) {
@@ -209,118 +207,116 @@ async function readBody(req) {
 // HTTP SERVER
 // ------------------------------------------------------------
 
-const httpServer = http.createServer(async (req, res) => {
-  try {
+const httpServer = http.createServer(
+  async (req, res) => {
 
-    // ----------------------------------------------------------
-    // HEALTH
-    // ----------------------------------------------------------
+    try {
 
-    if (
-      req.method === "GET" &&
-      req.url === "/health"
-    ) {
-      return json(res, 200, {
-        ok: true,
-        service: "yahoo-scan-mcp",
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // ----------------------------------------------------------
-    // MCP
-    // ----------------------------------------------------------
-
-    if (req.url === "/mcp") {
-
-      if (!authorized(req)) {
-        return json(res, 401, {
-          error: "Unauthorized"
-        });
-      }
+      // ------------------------------------------------------
+      // HEALTH
+      // ------------------------------------------------------
 
       if (
-        !["POST", "GET", "DELETE"].includes(req.method)
+        req.method === "GET" &&
+        req.url === "/health"
       ) {
-        res.writeHead(405, {
-          Allow: "GET, POST, DELETE"
+        return json(res, 200, {
+          ok: true,
+          service: "yahoo-scan-mcp",
+          timestamp: new Date().toISOString()
         });
-
-        return res.end();
       }
 
-      const mcpServer = buildServer();
+      // ------------------------------------------------------
+      // MCP
+      // ------------------------------------------------------
 
-      const transport =
-        new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined
-        });
+      if (req.url === "/mcp") {
 
-      res.on("close", () => {
-        transport.close().catch(() => {});
-        mcpServer.close().catch(() => {});
-      });
+        if (
+          !["POST", "GET", "DELETE"].includes(req.method)
+        ) {
+          res.writeHead(405, {
+            Allow: "GET, POST, DELETE"
+          });
 
-      await mcpServer.connect(transport);
-
-      let body;
-
-      if (req.method === "POST") {
-        body = await readBody(req);
-      }
-
-      await transport.handleRequest(
-        req,
-        res,
-        body
-      );
-
-      return;
-    }
-
-    // ----------------------------------------------------------
-    // ROOT
-    // ----------------------------------------------------------
-
-    if (
-      req.method === "GET" &&
-      req.url === "/"
-    ) {
-      return json(res, 200, {
-        ok: true,
-        service: "yahoo-scan-mcp",
-        version: "1.0.0",
-        endpoints: {
-          health: "/health",
-          mcp: "/mcp"
+          return res.end();
         }
+
+        const mcpServer = buildServer();
+
+        const transport =
+          new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined
+          });
+
+        res.on("close", () => {
+          transport.close().catch(() => {});
+          mcpServer.close().catch(() => {});
+        });
+
+        await mcpServer.connect(transport);
+
+        let body;
+
+        if (req.method === "POST") {
+          body = await readBody(req);
+        }
+
+        await transport.handleRequest(
+          req,
+          res,
+          body
+        );
+
+        return;
+      }
+
+      // ------------------------------------------------------
+      // ROOT
+      // ------------------------------------------------------
+
+      if (
+        req.method === "GET" &&
+        req.url === "/"
+      ) {
+        return json(res, 200, {
+          ok: true,
+          service: "yahoo-scan-mcp",
+          version: "1.0.0",
+          authentication: "none",
+          endpoints: {
+            health: "/health",
+            mcp: "/mcp"
+          }
+        });
+      }
+
+      // ------------------------------------------------------
+      // 404
+      // ------------------------------------------------------
+
+      return json(res, 404, {
+        error: "Not found"
       });
+
+    } catch (err) {
+
+      log("HTTP error:", err);
+
+      if (!res.headersSent) {
+        return json(res, 500, {
+          error: "Internal server error"
+        });
+      }
+
+      res.end();
     }
-
-    // ----------------------------------------------------------
-    // NOT FOUND
-    // ----------------------------------------------------------
-
-    return json(res, 404, {
-      error: "Not found"
-    });
-
-  } catch (err) {
-
-    log("HTTP error:", err);
-
-    if (!res.headersSent) {
-      return json(res, 500, {
-        error: "Internal server error"
-      });
-    }
-
-    res.end();
   }
-});
+);
 
 // ------------------------------------------------------------
-// HTTP SERVER ERROR
+// SERVER ERROR
 // ------------------------------------------------------------
 
 httpServer.on("error", (err) => {
@@ -336,8 +332,16 @@ httpServer.listen(
   PORT,
   "0.0.0.0",
   () => {
-    log(`Listening on 0.0.0.0:${PORT}`);
-    log(`Health: /health`);
-    log(`MCP: /mcp`);
+    log(
+      `Listening on 0.0.0.0:${PORT}`
+    );
+
+    log(
+      `Health: /health`
+    );
+
+    log(
+      `MCP: /mcp`
+    );
   }
 );
