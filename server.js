@@ -1,8 +1,9 @@
 /*
 ============================================================
  Yahoo Scan MCP
- Version 1.8.0
+ Version 1.9.0
 ============================================================
+
 Architecture :
 
 S0
@@ -11,10 +12,13 @@ S0
 - Historique 15m
 - J-1 / J-2 FILTER EXCLUSIVELY HERE
 - RVOL15M historical baseline
+- Explicit DATE / ASOF
+- Anti-lookahead historical cutoff
 - Materialized S0
 
 S1
 - Intraday 5m
+- Explicit DATE / ASOF
 - Dynamic as-of
 - VWAP
 - RVOL15M
@@ -27,6 +31,8 @@ S1
 
 SF
 - Works ONLY from validated S1
+- Explicit DATE / ASOF
+- Default 15:59 NY
 - Revalidates configured intraday thresholds
 - Strict blocking filter
 - Winner Gate
@@ -35,6 +41,11 @@ Transport
 - Streamable HTTP
 - Stateless
 - 11 MCP tools
+
+IMPORTANT
+- All market timestamps are interpreted in America/New_York.
+- Historical replay uses explicit date/asof.
+- No stage may use data after its own asof.
 ============================================================
 */
 
@@ -50,7 +61,7 @@ import { z } from "zod";
    CONFIG
 ========================================================= */
 
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.9.0";
 
 const PORT =
   Number(process.env.PORT || 8080);
@@ -66,13 +77,13 @@ const S0_INTERVAL = "15m";
 const S1_RANGE = "1d";
 const S1_INTERVAL = "5m";
 
+const MARKET_TIMEZONE =
+  "America/New_York";
+
 /*
 ------------------------------------------------------------
 STRATEGY THRESHOLDS
 ------------------------------------------------------------
-
-IMPORTANT:
-Do not modify these without a strategy re-validation.
 
 J-1 / J-2:
 maximum absolute session performance = 5%
@@ -83,7 +94,7 @@ RVOL15M >= 1.30
 Accel5M >= 20%
 
 SF:
-defaults remain identical to the tested architecture.
+defaults remain identical to tested architecture.
 ------------------------------------------------------------
 */
 
@@ -97,6 +108,11 @@ const MIN_S0_HISTORICAL_SESSIONS = 5;
 const MIN_S0_VALID_VOLUME_BARS = 20;
 const MIN_RVOL_BASELINE_SESSIONS = 5;
 const MIN_S1_COMPLETED_BARS = 4;
+
+
+/* =========================================================
+   CACHE
+========================================================= */
 
 const CACHE_DIR =
   process.env.DATA_DIR ||
@@ -131,6 +147,18 @@ const scanState = {
     APP_VERSION,
 
   asof:
+    null,
+
+  date:
+    null,
+
+  s0_asof:
+    null,
+
+  s1_asof:
+    null,
+
+  sf_asof:
     null,
 
   elapsed_ms:
@@ -272,8 +300,221 @@ function normalizeSymbols(symbols) {
 
 
 /* =========================================================
-   NEW YORK TIME
+   ASOF / NEW YORK TIME
 ========================================================= */
+
+/*
+------------------------------------------------------------
+parseAsOf
+
+Accepts:
+- ISO timestamp with timezone
+- ISO timestamp ending Z
+- Date-only YYYY-MM-DD
+- null => current time
+
+IMPORTANT:
+For deterministic historical replay, explicit timezone is
+required when a time is supplied.
+
+Examples:
+2026-09-18
+2026-09-18T15:55:00-04:00
+2026-09-18T19:55:00Z
+------------------------------------------------------------
+*/
+
+function parseAsOf(
+  value,
+  defaultHour = 15,
+  defaultMinute = 55
+) {
+
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+
+    return {
+      date:
+        nyDateKey(
+          Date.now()
+        ),
+
+      iso:
+        nowIso(),
+
+      ms:
+        Date.now()
+
+    };
+
+  }
+
+  const raw =
+    String(value)
+      .trim();
+
+  /*
+  ----------------------------------------------------------
+  DATE ONLY
+  ----------------------------------------------------------
+  */
+
+  if (
+    /^\d{4}-\d{2}-\d{2}$/
+      .test(raw)
+  ) {
+
+    const iso =
+      `${raw}T` +
+      `${String(defaultHour).padStart(2, "0")}:` +
+      `${String(defaultMinute).padStart(2, "0")}:00-04:00`;
+
+    const ms =
+      Date.parse(
+        iso
+      );
+
+    if (
+      !Number.isFinite(ms)
+    ) {
+
+      throw new Error(
+        `Invalid date: ${raw}`
+      );
+
+    }
+
+    return {
+
+      date:
+        raw,
+
+      iso:
+        new Date(ms)
+          .toISOString(),
+
+      ms
+
+    };
+
+  }
+
+  /*
+  ----------------------------------------------------------
+  TIMESTAMP
+  ----------------------------------------------------------
+  */
+
+  const ms =
+    Date.parse(
+      raw
+    );
+
+  if (
+    !Number.isFinite(ms)
+  ) {
+
+    throw new Error(
+      `Invalid asof: ${raw}`
+    );
+
+  }
+
+  const date =
+    nyDateKey(
+      ms
+    );
+
+  if (!date) {
+
+    throw new Error(
+      `Unable to determine NY market date for asof: ${raw}`
+    );
+
+  }
+
+  return {
+
+    date,
+
+    iso:
+      new Date(ms)
+        .toISOString(),
+
+    ms
+
+  };
+
+}
+
+
+/*
+------------------------------------------------------------
+Resolve stage ASOF.
+
+If explicit asof is supplied:
+  use it.
+
+If date is supplied:
+  build date + default hour/minute.
+
+If neither:
+  use current time.
+
+S1 default:
+  15:55 NY
+
+SF default:
+  15:59 NY
+------------------------------------------------------------
+*/
+
+function resolveStageAsOf(
+  asof,
+  date,
+  defaultHour,
+  defaultMinute
+) {
+
+  if (
+    asof !== undefined &&
+    asof !== null &&
+    String(asof).trim() !== ""
+  ) {
+
+    return parseAsOf(
+      asof,
+      defaultHour,
+      defaultMinute
+    );
+
+  }
+
+  if (
+    date !== undefined &&
+    date !== null &&
+    String(date).trim() !== ""
+  ) {
+
+    return parseAsOf(
+      String(date).trim(),
+      defaultHour,
+      defaultMinute
+    );
+
+  }
+
+  return parseAsOf(
+    null,
+    defaultHour,
+    defaultMinute
+  );
+
+}
+
 
 function nyParts(ts) {
 
@@ -293,7 +534,7 @@ function nyParts(ts) {
       "en-US",
       {
         timeZone:
-          "America/New_York",
+          MARKET_TIMEZONE,
 
         year:
           "numeric",
@@ -878,6 +1119,54 @@ function extractBars(item) {
 
 
 /* =========================================================
+   ASOF BAR FILTER
+========================================================= */
+
+function filterBarsAsOf(
+  bars,
+  asofMs
+) {
+
+  return bars.filter(
+    bar =>
+      Number.isFinite(bar.ts) &&
+      bar.ts <= asofMs + 1000
+  );
+
+}
+
+
+/*
+------------------------------------------------------------
+For intraday candles, a 5m candle is only completed when
+its END timestamp is <= asof.
+
+Yahoo timestamps are treated as candle-start timestamps.
+------------------------------------------------------------
+*/
+
+function filterCompletedBarsAsOf(
+  bars,
+  asofMs,
+  intervalMinutes
+) {
+
+  const durationMs =
+    intervalMinutes *
+    60 *
+    1000;
+
+  return bars.filter(
+    bar =>
+      Number.isFinite(bar.ts) &&
+      bar.ts + durationMs <=
+        asofMs + 1000
+  );
+
+}
+
+
+/* =========================================================
    SESSION HELPERS
 ========================================================= */
 
@@ -936,12 +1225,10 @@ function getCurrentSessionBars(
 
   const sessions =
     getSessionBars(
-      bars
-        .filter(
-          bar =>
-            bar.ts <=
-            asofMs + 1000
-        )
+      filterBarsAsOf(
+        bars,
+        asofMs
+      )
     );
 
   const dates =
@@ -1167,7 +1454,8 @@ function passesS0HistoricalFilter(
 
 function calculateS0(
   symbol,
-  item
+  item,
+  asofMs
 ) {
 
   if (
@@ -1179,9 +1467,23 @@ function calculateS0(
     return null;
   }
 
-  const bars =
+  const rawBars =
     extractBars(
       item
+    );
+
+  /*
+  ----------------------------------------------------------
+  ASOF PROTECTION
+  ----------------------------------------------------------
+  S0 sees ONLY historical data <= requested asof.
+  ----------------------------------------------------------
+  */
+
+  const bars =
+    filterBarsAsOf(
+      rawBars,
+      asofMs
     );
 
   if (
@@ -1210,30 +1512,45 @@ function calculateS0(
   }
 
   const currentDate =
-    dates[
-      dates.length - 1
-    ];
+    nyDateKey(
+      asofMs
+    );
+
+  if (
+    !currentDate ||
+    !sessions.has(
+      currentDate
+    )
+  ) {
+    return null;
+  }
 
   const currentSession =
     sessions.get(
       currentDate
     ) || [];
 
+  const completedDates =
+    dates.filter(
+      date =>
+        date <
+        currentDate
+    );
+
+  if (
+    completedDates.length <
+    MIN_S0_HISTORICAL_SESSIONS
+  ) {
+    return null;
+  }
+
   const completedSessions =
-    dates
-      .slice(0, -1)
+    completedDates
       .map(
         date =>
           sessions.get(date)
       )
       .filter(Boolean);
-
-  if (
-    completedSessions.length <
-    MIN_S0_HISTORICAL_SESSIONS
-  ) {
-    return null;
-  }
 
   const previous =
     completedSessions[
@@ -1358,6 +1675,14 @@ function calculateS0(
     rvol_baseline_sessions:
       completedSessions.length,
 
+    asof:
+      new Date(
+        asofMs
+      ).toISOString(),
+
+    market_date:
+      currentDate,
+
     prepared_at:
       nowIso()
 
@@ -1445,47 +1770,76 @@ function calculateS1(
   ----------------------------------------------------------
   FUTURE DATA PROTECTION
   ----------------------------------------------------------
-  Never use a candle after the requested/current as-of.
-  ----------------------------------------------------------
   */
 
   const eligibleBars =
-    bars.filter(
-      bar =>
-        bar.ts <=
-        asofMs + 1000
-    );
-
-  const currentSession =
-    getCurrentSessionBars(
-      eligibleBars,
+    filterBarsAsOf(
+      bars,
       asofMs
     );
 
   /*
-  Yahoo 5m candle:
-  A candle ending after as-of must not be used.
+  ----------------------------------------------------------
+  ONLY COMPLETED 5M CANDLES
   ----------------------------------------------------------
   */
 
-  const completed =
-    currentSession.filter(
-      bar =>
-        bar.ts +
-        5 * 60 * 1000
-        <=
-        asofMs + 1000
+  const completedEligible =
+    filterCompletedBarsAsOf(
+      eligibleBars,
+      asofMs,
+      5
+    );
+
+  const currentSession =
+    getCurrentSessionBars(
+      completedEligible,
+      asofMs
+    );
+
+  /*
+  ----------------------------------------------------------
+  Make absolutely sure the session corresponds to the
+  requested NY market date.
+  ----------------------------------------------------------
+  */
+
+  const requestedDate =
+    nyDateKey(
+      asofMs
     );
 
   if (
-    completed.length <
+    !requestedDate
+  ) {
+    return null;
+  }
+
+  const sessionDate =
+    currentSession.length
+      ? nyDateKey(
+          currentSession[
+            currentSession.length - 1
+          ].ts
+        )
+      : null;
+
+  if (
+    sessionDate !==
+    requestedDate
+  ) {
+    return null;
+  }
+
+  if (
+    currentSession.length <
     MIN_S1_COMPLETED_BARS
   ) {
     return null;
   }
 
   const valid =
-    completed.filter(
+    currentSession.filter(
       bar =>
         Number.isFinite(
           bar.volume
@@ -1676,6 +2030,9 @@ function calculateS1(
         asofMs
       ).toISOString(),
 
+    market_date:
+      requestedDate,
+
     session_date:
       nyDateKey(
         last.ts
@@ -1688,6 +2045,9 @@ function calculateS1(
     volume15m,
 
     rvol15m,
+
+    rvol15m_baseline:
+      baseline,
 
     accel5m,
 
@@ -1724,12 +2084,6 @@ function passesS1Filters(
     return false;
   }
 
-  /*
-  ----------------------------------------------------------
-  1. PRICE VS VWAP
-  ----------------------------------------------------------
-  */
-
   if (
     !Number.isFinite(
       record.price_vs_vwap_pct
@@ -1745,12 +2099,6 @@ function passesS1Filters(
     return false;
   }
 
-  /*
-  ----------------------------------------------------------
-  2. RVOL15M
-  ----------------------------------------------------------
-  */
-
   if (
     !Number.isFinite(
       record.rvol15m
@@ -1765,12 +2113,6 @@ function passesS1Filters(
   ) {
     return false;
   }
-
-  /*
-  ----------------------------------------------------------
-  3. ACCEL5M
-  ----------------------------------------------------------
-  */
 
   if (
     !Number.isFinite(
@@ -1797,7 +2139,8 @@ function passesS1Filters(
 ========================================================= */
 
 function validateS1NoLeak(
-  records
+  records,
+  asofMs = null
 ) {
 
   for (
@@ -1813,6 +2156,45 @@ function validateS1NoLeak(
       throw new Error(
         `S1 FILTER LEAK DETECTED: ${record.symbol}`
       );
+
+    }
+
+    if (
+      Number.isFinite(asofMs) &&
+      Number.isFinite(record.ts) &&
+      record.ts >
+      asofMs + 1000
+    ) {
+
+      throw new Error(
+        `S1 ASOF LEAK DETECTED: ${record.symbol}`
+      );
+
+    }
+
+    if (
+      Number.isFinite(asofMs) &&
+      record.asof
+    ) {
+
+      const recordAsOfMs =
+        Date.parse(
+          record.asof
+        );
+
+      if (
+        Number.isFinite(recordAsOfMs) &&
+        Math.abs(
+          recordAsOfMs -
+          asofMs
+        ) > 1000
+      ) {
+
+        throw new Error(
+          `S1 ASOF MISMATCH: ${record.symbol}`
+        );
+
+      }
 
     }
 
@@ -2044,65 +2426,49 @@ function readJson(
 }
 
 
-function currentNYDate() {
-
-  const parts =
-    new Intl.DateTimeFormat(
-      "en-US",
-      {
-        timeZone:
-          "America/New_York",
-
-        year:
-          "numeric",
-
-        month:
-          "2-digit",
-
-        day:
-          "2-digit"
-      }
-    )
-      .formatToParts(
-        new Date()
-      );
-
-  const obj = {};
-
-  for (
-    const p of parts
-  ) {
-
-    if (
-      p.type !==
-      "literal"
-    ) {
-
-      obj[p.type] =
-        p.value;
-
-    }
-
-  }
-
-  return (
-    `${obj.year}-${obj.month}-${obj.day}`
-  );
-
-}
-
-
 function validCache(
-  cache
+  cache,
+  expectedStage = null,
+  expectedDate = null
 ) {
 
-  return Boolean(
-    cache &&
-    cache.version ===
-      APP_VERSION &&
-    cache.market_date ===
-      currentNYDate()
-  );
+  if (
+    !cache ||
+    cache.version !==
+      APP_VERSION
+  ) {
+    return false;
+  }
+
+  if (
+    expectedStage &&
+    cache.stage !==
+      expectedStage
+  ) {
+    return false;
+  }
+
+  if (
+    expectedDate &&
+    cache.market_date !==
+      expectedDate
+  ) {
+    return false;
+  }
+
+  if (
+    !cache.market_date
+  ) {
+    return false;
+  }
+
+  if (
+    !cache.asof
+  ) {
+    return false;
+  }
+
+  return true;
 
 }
 
@@ -2174,7 +2540,8 @@ function readUniverse(
 ========================================================= */
 
 async function runS0(
-  symbols
+  symbols,
+  options = {}
 ) {
 
   if (
@@ -2192,6 +2559,17 @@ async function runS0(
       symbols
     );
 
+  const resolved =
+    resolveStageAsOf(
+      options.asof,
+      options.date,
+      15,
+      55
+    );
+
+  const s0AsOfMs =
+    resolved.ms;
+
   scanState.running =
     true;
 
@@ -2199,7 +2577,13 @@ async function runS0(
     "S0";
 
   scanState.asof =
-    nowIso();
+    resolved.iso;
+
+  scanState.date =
+    resolved.date;
+
+  scanState.s0_asof =
+    resolved.iso;
 
   scanState.last_error =
     null;
@@ -2228,7 +2612,8 @@ async function runS0(
       const record =
         calculateS0(
           symbol,
-          results[symbol]
+          results[symbol],
+          s0AsOfMs
         );
 
       if (record) {
@@ -2256,11 +2641,15 @@ async function runS0(
     writeJson(
       S0_CACHE_FILE,
       {
+
         version:
           APP_VERSION,
 
+        stage:
+          "S0",
+
         market_date:
-          currentNYDate(),
+          resolved.date,
 
         source:
           "Yahoo Chart OHLCV",
@@ -2268,7 +2657,20 @@ async function runS0(
         created_at:
           nowIso(),
 
+        asof:
+          resolved.iso,
+
+        asof_ms:
+          s0AsOfMs,
+
+        universe_requested:
+          universe.length,
+
+        s0_count:
+          s0.length,
+
         s0
+
       }
     );
 
@@ -2280,8 +2682,14 @@ async function runS0(
       stage:
         "S0",
 
+      date:
+        resolved.date,
+
       asof:
-        scanState.asof,
+        resolved.iso,
+
+      asof_ms:
+        s0AsOfMs,
 
       elapsed_ms:
         scanState.elapsed_ms,
@@ -2323,43 +2731,132 @@ async function runS0(
 
 
 /* =========================================================
-   SCAN S1
+   LOAD S0 FOR DATE
 ========================================================= */
 
-async function runS1(
-  symbols
+function loadS0ForDate(
+  date
 ) {
 
-  if (
-    scanState.running
-  ) {
-
-    throw new Error(
-      "Scan already running"
-    );
-
-  }
-
-  const s0Cache =
+  const cache =
     readJson(
       S0_CACHE_FILE
     );
 
   if (
     !validCache(
-      s0Cache
+      cache,
+      "S0",
+      date
     )
   ) {
 
     throw new Error(
-      "Valid S0 cache required"
+      `Valid S0 cache required for ${date}`
     );
 
   }
 
+  return cache;
+
+}
+
+
+/* =========================================================
+   SCAN S1
+========================================================= */
+
+async function runS1(
+  symbols,
+  options = {}
+) {
+
   const requested =
     normalizeSymbols(
       symbols
+    );
+
+  /*
+  ----------------------------------------------------------
+  Resolve ASOF.
+  If no date/asof is supplied, S1 reuses the S0 cache date
+  and defaults to 15:55.
+  ----------------------------------------------------------
+  */
+
+  let resolved;
+
+  if (
+    options.asof !== undefined &&
+    options.asof !== null &&
+    String(options.asof).trim() !== ""
+  ) {
+
+    resolved =
+      resolveStageAsOf(
+        options.asof,
+        null,
+        15,
+        55
+      );
+
+  } else if (
+    options.date !== undefined &&
+    options.date !== null &&
+    String(options.date).trim() !== ""
+  ) {
+
+    resolved =
+      resolveStageAsOf(
+        null,
+        options.date,
+        15,
+        55
+      );
+
+  } else {
+
+    const existingS0 =
+      readJson(
+        S0_CACHE_FILE
+      );
+
+    if (
+      existingS0?.market_date &&
+      existingS0?.asof
+    ) {
+
+      const s0Date =
+        existingS0.market_date;
+
+      resolved =
+        resolveStageAsOf(
+          null,
+          s0Date,
+          15,
+          55
+        );
+
+    } else {
+
+      resolved =
+        resolveStageAsOf(
+          null,
+          null,
+          15,
+          55
+        );
+
+    }
+
+  }
+
+  const s1AsOfMs =
+    resolved.ms;
+
+  const s0Cache =
+    loadS0ForDate(
+      resolved.date
     );
 
   const s0Map =
@@ -2377,13 +2874,43 @@ async function runS1(
         )
     );
 
-  const filtered =
-    requested.filter(
-      symbol =>
-        s0Map.has(
-          symbol
-        )
+  let filtered;
+
+  if (
+    requested.length
+  ) {
+
+    filtered =
+      requested.filter(
+        symbol =>
+          s0Map.has(
+            symbol
+          )
+      );
+
+  } else {
+
+    filtered =
+      (
+        s0Cache.s0 ||
+        []
+      )
+        .map(
+          record =>
+            record.symbol
+        );
+
+  }
+
+  if (
+    scanState.running
+  ) {
+
+    throw new Error(
+      "Scan already running"
     );
+
+  }
 
   scanState.running =
     true;
@@ -2392,24 +2919,18 @@ async function runS1(
     "S1";
 
   scanState.asof =
-    nowIso();
+    resolved.iso;
+
+  scanState.date =
+    resolved.date;
+
+  scanState.s1_asof =
+    resolved.iso;
 
   scanState.last_error =
     null;
 
   const started =
-    Date.now();
-
-  /*
-  ----------------------------------------------------------
-  IMPORTANT:
-  Capture the S1 as-of BEFORE downloading data.
-  This prevents different symbols from being evaluated
-  against different "now" values.
-  ----------------------------------------------------------
-  */
-
-  const s1AsOfMs =
     Date.now();
 
   try {
@@ -2467,13 +2988,11 @@ async function runS1(
     ----------------------------------------------------------
     FINAL SAFETY CHECK
     ----------------------------------------------------------
-    If even one invalid record reaches this point,
-    the entire S1 scan fails instead of returning bad data.
-    ----------------------------------------------------------
     */
 
     validateS1NoLeak(
-      ranked
+      ranked,
+      s1AsOfMs
     );
 
     scanState.s1 =
@@ -2492,11 +3011,15 @@ async function runS1(
     writeJson(
       S1_CACHE_FILE,
       {
+
         version:
           APP_VERSION,
 
+        stage:
+          "S1",
+
         market_date:
-          currentNYDate(),
+          resolved.date,
 
         source:
           "Yahoo Chart OHLCV",
@@ -2505,9 +3028,13 @@ async function runS1(
           nowIso(),
 
         asof:
-          new Date(
-            s1AsOfMs
-          ).toISOString(),
+          resolved.iso,
+
+        asof_ms:
+          s1AsOfMs,
+
+        s0_asof:
+          s0Cache.asof,
 
         input_count:
           filtered.length,
@@ -2517,6 +3044,7 @@ async function runS1(
 
         s1:
           ranked
+
       }
     );
 
@@ -2528,10 +3056,14 @@ async function runS1(
       stage:
         "S1",
 
+      date:
+        resolved.date,
+
       asof:
-        new Date(
-          s1AsOfMs
-        ).toISOString(),
+        resolved.iso,
+
+      asof_ms:
+        s1AsOfMs,
 
       elapsed_ms:
         scanState.elapsed_ms,
@@ -2595,7 +3127,8 @@ async function runSF(
 
   if (
     !validCache(
-      cache
+      cache,
+      "S1"
     )
   ) {
 
@@ -2604,6 +3137,41 @@ async function runSF(
     );
 
   }
+
+  const cacheDate =
+    cache.market_date;
+
+  /*
+  ----------------------------------------------------------
+  SF default:
+  same market date as S1, 15:59 NY.
+
+  Explicit asof always wins.
+  ----------------------------------------------------------
+  */
+
+  const resolved =
+    resolveStageAsOf(
+      options.asof,
+      options.date ||
+        cacheDate,
+      15,
+      59
+    );
+
+  if (
+    resolved.date !==
+    cacheDate
+  ) {
+
+    throw new Error(
+      `SF date mismatch: S1 cache=${cacheDate}, SF=${resolved.date}`
+    );
+
+  }
+
+  const sfAsOfMs =
+    resolved.ms;
 
   let records =
     Array.isArray(
@@ -2615,13 +3183,28 @@ async function runSF(
   /*
   ----------------------------------------------------------
   SAFETY:
-  SF refuses any contaminated S1 cache.
+  SF refuses contaminated S1 cache.
   ----------------------------------------------------------
   */
 
   validateS1NoLeak(
-    records
+    records,
+    Date.parse(
+      cache.asof
+    )
   );
+
+  /*
+  ----------------------------------------------------------
+  SF ASOF SAFETY
+
+  S1 records can only represent information known at S1 asof.
+  SF may use them at 15:59, but it must NOT pretend that
+  these records contain new 15:59 intraday information.
+
+  Therefore SF operates on the validated S1 snapshot.
+  ----------------------------------------------------------
+  */
 
   if (
     Array.isArray(symbols) &&
@@ -2711,14 +3294,11 @@ async function runSF(
       }
     );
 
-  /*
-  ----------------------------------------------------------
-  SF SAFETY CHECK
-  ----------------------------------------------------------
-  */
-
   validateS1NoLeak(
-    sfFiltered
+    sfFiltered,
+    Date.parse(
+      cache.asof
+    )
   );
 
   const ranked =
@@ -2752,7 +3332,13 @@ async function runSF(
     "SF";
 
   scanState.asof =
-    nowIso();
+    resolved.iso;
+
+  scanState.date =
+    resolved.date;
+
+  scanState.sf_asof =
+    resolved.iso;
 
   return {
 
@@ -2762,8 +3348,17 @@ async function runSF(
     stage:
       "SF",
 
+    date:
+      resolved.date,
+
     asof:
-      scanState.asof,
+      resolved.iso,
+
+    asof_ms:
+      sfAsOfMs,
+
+    s1_asof:
+      cache.asof,
 
     input_count:
       records.length,
@@ -2797,7 +3392,8 @@ async function runSF(
 ========================================================= */
 
 async function runS0S1(
-  symbols
+  symbols,
+  options = {}
 ) {
 
   const universe =
@@ -2805,9 +3401,31 @@ async function runS0S1(
       symbols
     );
 
+  /*
+  ----------------------------------------------------------
+  One explicit historical ASOF is used for both S0 and S1.
+
+  If only a date is supplied:
+    S0 = 15:55
+    S1 = 15:55
+  ----------------------------------------------------------
+  */
+
+  const resolved =
+    resolveStageAsOf(
+      options.asof,
+      options.date,
+      15,
+      55
+    );
+
   const s0Result =
     await runS0(
-      universe
+      universe,
+      {
+        asof:
+          resolved.iso
+      }
     );
 
   const s0Symbols =
@@ -2829,8 +3447,17 @@ async function runS0S1(
       stage:
         "S0_S1",
 
+      date:
+        resolved.date,
+
+      s0_asof:
+        s0Result.asof,
+
+      s1_asof:
+        resolved.iso,
+
       asof:
-        nowIso(),
+        resolved.iso,
 
       elapsed_ms:
         s0Result.elapsed_ms,
@@ -2859,7 +3486,11 @@ async function runS0S1(
 
   const s1Result =
     await runS1(
-      s0Symbols
+      s0Symbols,
+      {
+        asof:
+          resolved.iso
+      }
     );
 
   return {
@@ -2870,8 +3501,17 @@ async function runS0S1(
     stage:
       "S0_S1",
 
+    date:
+      resolved.date,
+
+    s0_asof:
+      s0Result.asof,
+
+    s1_asof:
+      s1Result.asof,
+
     asof:
-      nowIso(),
+      s1Result.asof,
 
     elapsed_ms:
       s0Result.elapsed_ms +
@@ -2968,6 +3608,7 @@ function createMcpServer() {
     async () =>
       textResult(
         {
+
           ok:
             true,
 
@@ -2979,6 +3620,7 @@ function createMcpServer() {
 
           time:
             nowIso()
+
         }
       )
   );
@@ -2994,6 +3636,7 @@ function createMcpServer() {
     async () =>
       textResult(
         {
+
           ok:
             true,
 
@@ -3002,6 +3645,7 @@ function createMcpServer() {
 
           state:
             scanState
+
         }
       )
   );
@@ -3051,6 +3695,7 @@ function createMcpServer() {
 
       return textResult(
         {
+
           ok:
             true,
 
@@ -3059,6 +3704,7 @@ function createMcpServer() {
 
           files:
             output
+
         }
       );
 
@@ -3073,12 +3719,15 @@ function createMcpServer() {
   server.tool(
     "get_universe",
     {
+
       limit:
         z.number()
           .int()
           .positive()
           .optional()
+
     },
+
     async ({
       limit
     }) => {
@@ -3090,6 +3739,7 @@ function createMcpServer() {
 
       return textResult(
         {
+
           ok:
             true,
 
@@ -3097,6 +3747,7 @@ function createMcpServer() {
             symbols.length,
 
           symbols
+
         }
       );
 
@@ -3272,10 +3923,12 @@ function createMcpServer() {
   server.tool(
     "yahoo_ws_test",
     {
+
       symbols:
         z.array(
           z.string()
         )
+
     },
 
     async ({
@@ -3327,13 +3980,27 @@ function createMcpServer() {
         z.number()
           .int()
           .positive()
+          .optional(),
+
+      date:
+        z.string()
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            "date must be YYYY-MM-DD"
+          )
+          .optional(),
+
+      asof:
+        z.string()
           .optional()
 
     },
 
     async ({
       symbols,
-      limit
+      limit,
+      date,
+      asof
     }) => {
 
       const universe =
@@ -3349,7 +4016,11 @@ function createMcpServer() {
 
       return textResult(
         await runS0(
-          universe
+          universe,
+          {
+            date,
+            asof
+          }
         )
       );
 
@@ -3375,13 +4046,27 @@ function createMcpServer() {
         z.number()
           .int()
           .positive()
+          .optional(),
+
+      date:
+        z.string()
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            "date must be YYYY-MM-DD"
+          )
+          .optional(),
+
+      asof:
+        z.string()
           .optional()
 
     },
 
     async ({
       symbols,
-      limit
+      limit,
+      date,
+      asof
     }) => {
 
       let universe;
@@ -3405,9 +4090,7 @@ function createMcpServer() {
           );
 
         if (
-          !validCache(
-            s0Cache
-          )
+          !s0Cache?.s0
         ) {
 
           throw new Error(
@@ -3445,7 +4128,11 @@ function createMcpServer() {
 
       return textResult(
         await runS1(
-          universe
+          universe,
+          {
+            date,
+            asof
+          }
         )
       );
 
@@ -3471,13 +4158,27 @@ function createMcpServer() {
         z.number()
           .int()
           .positive()
+          .optional(),
+
+      date:
+        z.string()
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            "date must be YYYY-MM-DD"
+          )
+          .optional(),
+
+      asof:
+        z.string()
           .optional()
 
     },
 
     async ({
       symbols,
-      limit
+      limit,
+      date,
+      asof
     }) => {
 
       const universe =
@@ -3493,7 +4194,11 @@ function createMcpServer() {
 
       return textResult(
         await runS0S1(
-          universe
+          universe,
+          {
+            date,
+            asof
+          }
         )
       );
 
@@ -3515,6 +4220,18 @@ function createMcpServer() {
         )
         .optional(),
 
+      date:
+        z.string()
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            "date must be YYYY-MM-DD"
+          )
+          .optional(),
+
+      asof:
+        z.string()
+          .optional(),
+
       minPriceVsVWAP:
         z.number()
           .optional(),
@@ -3531,6 +4248,8 @@ function createMcpServer() {
 
     async ({
       symbols,
+      date,
+      asof,
       minPriceVsVWAP,
       minAccel5M,
       minVol15M
@@ -3540,6 +4259,10 @@ function createMcpServer() {
         await runSF(
           symbols,
           {
+
+            date,
+
+            asof,
 
             minPriceVsVWAP,
 
@@ -3633,6 +4356,7 @@ app.get(
           nowIso()
 
       }
+
     );
 
   }
@@ -3856,6 +4580,7 @@ app.use(
             "Not found"
 
         }
+
       );
 
   }
@@ -3889,6 +4614,10 @@ app.listen(
 
     console.log(
       `[yahoo-scan-mcp] Universe: ${UNIVERSE_FILE}`
+    );
+
+    console.log(
+      `[yahoo-scan-mcp] Market timezone: ${MARKET_TIMEZONE}`
     );
 
   }
