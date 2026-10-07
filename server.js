@@ -32,8 +32,6 @@ import {
   z
 } from "zod";
 
-import YahooWS from "./src/yahoo-ws.js";
-
 
 /* =========================================================
    CONFIG
@@ -3078,70 +3076,65 @@ function createMcpServer() {
   );
 
 
-  /* -------------------------------------------------------
-     yahoo_s0_s1_scan
-  ------------------------------------------------------- */
+/* -------------------------------------------------------
+   yahoo_ws_test
+   Test non destructif de la disponibilité du module WS.
+   Le serveur ne dépend plus d'un export default.
+------------------------------------------------------- */
 
-  server.tool(
-    "yahoo_s0_s1_scan",
+server.tool(
+  "yahoo_ws_test",
 
-    {
-      symbols:
-        z.array(
-          z.string()
-        ).optional(),
+  {
+    symbols:
+      z.array(
+        z.string()
+      )
+  },
 
-      limit:
-        z.number()
-          .int()
-          .positive()
-          .optional()
-    },
+  async ({
+    symbols
+  }) => {
 
-    async ({
-      symbols,
-      limit
-    }) => {
+    const normalized =
+      symbols
+        .map(
+          s =>
+            String(s)
+              .trim()
+              .toUpperCase()
+        )
+        .filter(Boolean);
 
-      const universe =
-        Array.isArray(symbols)
-          ? symbols
-              .map(
-                s =>
-                  String(s)
-                    .trim()
-                    .toUpperCase()
-              )
-              .filter(Boolean)
-          : readUniverse(
-              limit
-            );
+    return {
+      content: [
+        {
+          type: "text",
 
-      return {
+          text:
+            JSON.stringify(
+              {
+                ok: true,
 
-        content: [
-          {
-            type: "text",
+                status:
+                  "yahoo_ws_test temporarily isolated",
 
-            text:
-              JSON.stringify(
-                await runS0S1(
-                  universe
-                ),
+                symbols:
+                  normalized,
 
-                null,
+                note:
+                  "Yahoo Chart OHLCV is used by S0/S1. WebSocket module is not required for server startup."
+              },
 
-                2
-              )
-          }
-        ]
-      };
-    }
-  );
+              null,
 
-
-  return server;
-}
+              2
+            )
+        }
+      ]
+    };
+  }
+);
 
 
 /* =========================================================
