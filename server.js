@@ -1648,155 +1648,32 @@ function sessionPerformance(
 ========================================================
 */
 
-function buildRvol15mBaseline(
-  completedSessions
-) {
-
-  const slotValues =
-    new Map();
-
-  for (
-    const session of
-      completedSessions
-  ) {
-
-    const slotVolumes =
-      new Map();
-
-    for (
-      const bar of session
-    ) {
-
-      const key =
-        nyTimeKey(
-          bar.ts
-        );
-
-      if (!key) {
-        continue;
-      }
-
-      const volume =
-        Number(
-          bar.volume || 0
-        );
-
-      if (
-        !Number.isFinite(
-          volume
-        ) ||
-        volume < 0
-      ) {
-        continue;
-      }
-
-      slotVolumes.set(
-        key,
-        (
-          slotVolumes.get(
-            key
-          ) || 0
-        ) + volume
-      );
-    }
-
-    for (
-      const [
-        key,
-        volume
-      ] of slotVolumes
-    ) {
-
-      if (
-        !slotValues.has(key)
-      ) {
-
-        slotValues.set(
-          key,
-          []
-        );
-      }
-
-      slotValues
-        .get(key)
-        .push(volume);
-    }
-  }
-
-  const baseline =
-    {};
-
-  for (
-    const [
-      key,
-      values
-    ] of slotValues
-  ) {
-
-    const valid =
-      values.filter(
-function buildRvol15mBaseline(
-  completedSessions
-) {
+function buildRvol15mBaseline(completedSessions) {
   const slotValues = new Map();
 
   for (const session of completedSessions) {
-    if (!Array.isArray(session) || !session.length) {
-      continue;
-    }
-
-    /*
-    --------------------------------------------------------
-    Agrégation des volumes par créneau 15 min
-    --------------------------------------------------------
-    */
+    if (!Array.isArray(session)) continue;
 
     const slotVolumes = new Map();
 
     for (const bar of session) {
-      if (!bar || !Number.isFinite(bar.ts)) {
-        continue;
-      }
+      if (!bar || !Number.isFinite(bar.ts)) continue;
 
       const key = nyTimeKey(bar.ts);
-
-      if (!key) {
-        continue;
-      }
+      if (!key) continue;
 
       const volume = Number(bar.volume);
 
-      /*
-      IMPORTANT :
-      - volume doit être numérique
-      - volume = 0 est ignoré
-      - on ne crée jamais de baseline artificielle à 0
-      */
-
-      if (
-        !Number.isFinite(volume) ||
-        volume <= 0
-      ) {
+      if (!Number.isFinite(volume) || volume <= 0) {
         continue;
       }
 
-      slotVolumes.set(
-        key,
-        (slotVolumes.get(key) || 0) + volume
-      );
+      const previous = slotVolumes.get(key) || 0;
+      slotVolumes.set(key, previous + volume);
     }
 
-    /*
-    --------------------------------------------------------
-    Stockage de la valeur du créneau pour cette session
-    --------------------------------------------------------
-    */
-
     for (const [key, volume] of slotVolumes) {
-      if (
-        !Number.isFinite(volume) ||
-        volume <= 0
-      ) {
+      if (!Number.isFinite(volume) || volume <= 0) {
         continue;
       }
 
@@ -1808,40 +1685,29 @@ function buildRvol15mBaseline(
     }
   }
 
-  /*
-  --------------------------------------------------------
-  Moyenne historique par créneau
-  --------------------------------------------------------
-  */
-
   const baseline = {};
 
   for (const [key, values] of slotValues) {
-    const valid =
-      values.filter(
-        value =>
-          Number.isFinite(value) &&
-          value > 0
-      );
-
-    if (!valid.length) {
+    if (!Array.isArray(values) || values.length === 0) {
       continue;
     }
 
-    const sum =
-      valid.reduce(
-        (total, value) =>
-          total + value,
-        0
-      );
+    const valid = values.filter(
+      value => Number.isFinite(value) && value > 0
+    );
 
-    const average =
-      sum / valid.length;
+    if (valid.length === 0) {
+      continue;
+    }
 
-    if (
-      Number.isFinite(average) &&
-      average > 0
-    ) {
+    const sum = valid.reduce(
+      (total, value) => total + value,
+      0
+    );
+
+    const average = sum / valid.length;
+
+    if (Number.isFinite(average) && average > 0) {
       baseline[key] = average;
     }
   }
