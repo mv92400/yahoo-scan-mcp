@@ -1,7 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import { YahooWS } from "./src/yahoo-ws.js";
@@ -197,7 +198,6 @@ const scanState = {
 YAHOO SPARK
 ============================================================
 
-Important:
 Yahoo Spark returns:
 
 spark.result[]
@@ -225,6 +225,7 @@ async function yahooSpark(
     chunk(symbols, 20);
 
   for (const batch of batches) {
+
     const url =
       "https://query1.finance.yahoo.com/v7/finance/spark" +
       `?symbols=${encodeURIComponent(
@@ -241,7 +242,6 @@ async function yahooSpark(
       "&includePrePost=false";
 
     let success = false;
-
     let lastError = null;
 
     for (
@@ -250,7 +250,9 @@ async function yahooSpark(
       !success;
       attempt++
     ) {
+
       try {
+
         const response =
           await fetch(
             url,
@@ -267,10 +269,6 @@ async function yahooSpark(
             }
           );
 
-        /*
-        If Yahoo rejects a batch, retrying
-        the same oversized batch is pointless.
-        */
         if (!response.ok) {
           throw new Error(
             `Yahoo HTTP ${response.status}`
@@ -295,10 +293,10 @@ async function yahooSpark(
           body?.spark?.result || [];
 
         /*
-        CRITICAL:
         Spark result rows contain response[0].
         */
         for (const item of rows) {
+
           const responseRow =
             item?.response?.[0] ??
             item;
@@ -310,6 +308,7 @@ async function yahooSpark(
             ) ||
             !responseRow.timestamp.length
           ) {
+
             results.push({
               _invalid:
                 true,
@@ -346,11 +345,11 @@ async function yahooSpark(
         }
 
         /*
-        A successful HTTP response with zero rows
-        is still recorded, so it cannot silently
-        become a false S0=0.
+        Successful HTTP response with zero rows
+        must not silently become S0=0.
         */
         if (!rows.length) {
+
           results.push({
             _invalid:
               true,
@@ -364,7 +363,9 @@ async function yahooSpark(
         }
 
         success = true;
+
       } catch (err) {
+
         lastError = err;
 
         if (attempt < 3) {
@@ -376,6 +377,7 @@ async function yahooSpark(
     }
 
     if (!success) {
+
       results.push({
         _error:
           true,
@@ -402,6 +404,7 @@ S1 METRICS
 */
 
 function extractBars(row) {
+
   const timestamps =
     row?.timestamp || [];
 
@@ -410,29 +413,19 @@ function extractBars(row) {
       ?.quote?.[0] || {};
 
   const closes =
-    row?.indicators
-      ?.quote?.[0]
-      ?.close || [];
+    quote.close || [];
 
   const opens =
-    row?.indicators
-      ?.quote?.[0]
-      ?.open || [];
+    quote.open || [];
 
   const highs =
-    row?.indicators
-      ?.quote?.[0]
-      ?.high || [];
+    quote.high || [];
 
   const lows =
-    row?.indicators
-      ?.quote?.[0]
-      ?.low || [];
+    quote.low || [];
 
   const volumes =
-    row?.indicators
-      ?.quote?.[0]
-      ?.volume || [];
+    quote.volume || [];
 
   const bars = [];
 
@@ -441,6 +434,7 @@ function extractBars(row) {
     i < timestamps.length;
     i++
   ) {
+
     const close =
       cleanNumber(
         closes[i]
@@ -487,17 +481,21 @@ function extractBars(row) {
 }
 
 function sessionKey(timestamp) {
+
   return new Date(
     timestamp * 1000
-  ).toISOString()
+  )
+    .toISOString()
     .slice(0, 10);
 }
 
 function calculateVWAP(bars) {
+
   let pv = 0;
   let volume = 0;
 
   for (const bar of bars) {
+
     const typical =
       (
         (bar.high ??
@@ -522,9 +520,8 @@ function calculateVWAP(bars) {
   return pv / volume;
 }
 
-function calculateS1(
-  row
-) {
+function calculateS1(row) {
+
   const symbol =
     String(
       row?.meta?.symbol ||
@@ -536,6 +533,7 @@ function calculateS1(
     extractBars(row);
 
   if (bars.length < 4) {
+
     return {
       ok: false,
 
@@ -563,6 +561,7 @@ function calculateS1(
   if (
     completed.length < 4
   ) {
+
     return {
       ok: false,
 
@@ -599,16 +598,10 @@ function calculateS1(
     );
 
   const preceding =
-    completed.slice(
-      0,
-      -3
-    );
+    completed.slice(0, -3);
 
   /*
   Historical same-time-of-day baseline.
-
-  We use the previous sessions in the
-  5-day Yahoo window.
   */
   const currentDate =
     sessionKey(
@@ -623,6 +616,7 @@ function calculateS1(
         ) !== currentDate
       )
       .filter(bar => {
+
         const d =
           new Date(
             bar.timestamp * 1000
@@ -662,14 +656,13 @@ function calculateS1(
       : null;
 
   const accelBase =
-    completed
-      .slice(
-        Math.max(
-          0,
-          completed.length - 6
-        ),
-        -3
-      );
+    completed.slice(
+      Math.max(
+        0,
+        completed.length - 6
+      ),
+      -3
+    );
 
   const accelMean =
     accelBase.length
@@ -736,6 +729,7 @@ function calculateS1(
       : null;
 
   return {
+
     ok: true,
 
     symbol,
@@ -784,9 +778,8 @@ S0 FILTER
 ============================================================
 */
 
-function isOrdinaryStock(
-  row
-) {
+function isOrdinaryStock(row) {
+
   const meta =
     row?.meta || {};
 
@@ -857,9 +850,8 @@ function isOrdinaryStock(
   return true;
 }
 
-function getCurrentPrice(
-  row
-) {
+function getCurrentPrice(row) {
+
   const meta =
     row?.meta || {};
 
@@ -882,9 +874,8 @@ WS TEST LOCK
 let wsTestQueue =
   Promise.resolve();
 
-function withWsTestLock(
-  task
-) {
+function withWsTestLock(task) {
+
   const run =
     wsTestQueue.then(
       task,
@@ -945,6 +936,7 @@ server.tool(
           timestamp:
             new Date()
               .toISOString()
+
         }, null, 2)
     }]
   })
@@ -959,30 +951,54 @@ GET STATUS
 server.tool(
   "get_status",
 
-  "Return current Yahoo WebSocket and scanner state",
+  "Return current scanner state and Yahoo diagnostic status",
 
   {},
 
-  async () => ({
-    content: [{
-      type:
-        "text",
+  async () => {
 
-      text:
-        JSON.stringify({
-          ok: true,
+    /*
+    There is intentionally no global YahooWS connection.
 
-          version:
-            APP_VERSION,
+    yahoo_ws_test creates an isolated YahooWS instance for
+    each diagnostic test. Therefore get_status must not call
+    an undefined global "yahoo" object.
+    */
 
-          scanner:
-            scanState,
+    const yahooStatus = {
+      connected:
+        false,
 
-          yahoo:
-            yahoo.status()
-        }, null, 2)
-    }]
-  })
+      mode:
+        "on-demand",
+
+      note:
+        "Yahoo WebSocket is created by yahoo_ws_test"
+    };
+
+    return {
+      content: [{
+        type:
+          "text",
+
+        text:
+          JSON.stringify({
+
+            ok: true,
+
+            version:
+              APP_VERSION,
+
+            scanner:
+              scanState,
+
+            yahoo:
+              yahooStatus
+
+          }, null, 2)
+      }]
+    };
+  }
 );
 
 /*
@@ -1008,7 +1024,9 @@ server.tool(
   async ({
     limit
   }) => {
+
     try {
+
       const symbols =
         await loadUniverse();
 
@@ -1027,6 +1045,7 @@ server.tool(
 
           text:
             JSON.stringify({
+
               ok: true,
 
               source:
@@ -1043,10 +1062,13 @@ server.tool(
 
               symbols:
                 out
+
             }, null, 2)
         }]
       };
+
     } catch (err) {
+
       return {
         content: [{
           type:
@@ -1054,11 +1076,13 @@ server.tool(
 
           text:
             JSON.stringify({
+
               ok: false,
 
               error:
                 err?.message ||
                 String(err)
+
             }, null, 2)
         }]
       };
@@ -1124,13 +1148,12 @@ server.tool(
           null;
 
         try {
+
           /*
-          IMPORTANT:
-          Do NOT reuse the global YahooWS
-          instance for diagnostic tests.
-          This prevents old symbols from
-          contaminating the new test.
+          Do NOT reuse the global YahooWS instance.
+          This keeps each diagnostic isolated.
           */
+
           testYahoo =
             new YahooWS({
               log
@@ -1147,8 +1170,7 @@ server.tool(
             resolve =>
               setTimeout(
                 resolve,
-                duration *
-                  1000
+                duration * 1000
               )
           );
 
@@ -1161,8 +1183,7 @@ server.tool(
           status.latest =
             Object.fromEntries(
               Object.entries(
-                status.latest ||
-                {}
+                status.latest || {}
               ).filter(
                 ([symbol]) =>
                   requestedSet.has(
@@ -1189,6 +1210,7 @@ server.tool(
 
               text:
                 JSON.stringify({
+
                   ok: true,
 
                   requested_symbols:
@@ -1209,6 +1231,7 @@ server.tool(
 
                   yahoo:
                     status
+
                 }, null, 2)
             }]
           };
@@ -1222,6 +1245,7 @@ server.tool(
 
               text:
                 JSON.stringify({
+
                   ok: false,
 
                   error:
@@ -1232,6 +1256,7 @@ server.tool(
                     testYahoo
                       ? testYahoo.status()
                       : null
+
                 }, null, 2)
             }]
           };
@@ -1241,6 +1266,7 @@ server.tool(
           try {
             testYahoo?.close();
           } catch {}
+
         }
       }
     )
@@ -1301,8 +1327,11 @@ server.tool(
       }
 
       /*
-      Reset state completely.
+      --------------------------------------------------------
+      RESET STATE
+      --------------------------------------------------------
       */
+
       scanState.stage =
         "S0_S1";
 
@@ -1354,6 +1383,7 @@ server.tool(
       for (const row of rows) {
 
         if (row?._error) {
+
           scanState.errors.push({
             type:
               "yahoo",
@@ -1369,6 +1399,7 @@ server.tool(
         }
 
         if (row?._invalid) {
+
           scanState.errors.push({
             type:
               "invalid",
@@ -1391,6 +1422,7 @@ server.tool(
           ).toUpperCase();
 
         if (!symbol) {
+
           scanState.errors.push({
             type:
               "missing_symbol",
@@ -1412,6 +1444,7 @@ server.tool(
         ordinary stock,
         live price < $5.
         */
+
         if (
           price === null ||
           price >= 5 ||
@@ -1429,6 +1462,7 @@ server.tool(
         }
 
         const s0Item = {
+
           symbol,
 
           price,
@@ -1455,6 +1489,7 @@ server.tool(
         /*
         S1 metrics.
         */
+
         const metrics =
           calculateS1(
             row
@@ -1463,10 +1498,13 @@ server.tool(
         if (
           metrics.ok
         ) {
+
           scanState.s1.push(
             metrics
           );
+
         } else {
+
           scanState.errors.push({
             type:
               "s1",
@@ -1502,9 +1540,7 @@ server.tool(
               if (
                 br !== ar
               ) {
-                return (
-                  br - ar
-                );
+                return br - ar;
               }
 
               const aa =
@@ -1518,9 +1554,7 @@ server.tool(
               if (
                 ba !== aa
               ) {
-                return (
-                  ba - aa
-                );
+                return ba - aa;
               }
 
               const av =
@@ -1531,9 +1565,7 @@ server.tool(
                 b.price_vs_vwap ??
                 -Infinity;
 
-              return (
-                bv - av
-              );
+              return bv - av;
             }
           );
 
@@ -1580,6 +1612,7 @@ server.tool(
 
           text:
             JSON.stringify({
+
               ok: true,
 
               stage:
@@ -1620,6 +1653,7 @@ server.tool(
 
               errors:
                 scanState.errors
+
             }, null, 2)
         }]
       };
@@ -1650,6 +1684,7 @@ server.tool(
 
           text:
             JSON.stringify({
+
               ok: false,
 
               version:
@@ -1663,6 +1698,7 @@ server.tool(
 
               errors:
                 scanState.errors
+
             }, null, 2)
         }]
       };
@@ -1705,6 +1741,7 @@ server.tool(
 
         text:
           JSON.stringify({
+
             ok: true,
 
             version:
@@ -1754,6 +1791,7 @@ server.tool(
 
             errors:
               scanState.errors
+
           }, null, 2)
       }]
     };
@@ -1762,60 +1800,172 @@ server.tool(
 
 /*
 ============================================================
-HTTP HEALTH SERVER
+MCP STREAMABLE HTTP TRANSPORT
+============================================================
+*/
+
+/*
+Railway needs a real HTTP MCP endpoint.
+
+We intentionally use a stateful Streamable HTTP transport
+here because the existing server/tool registrations are
+created once and connected once.
+
+A session ID is generated for each MCP client session.
+*/
+
+const mcpTransport =
+  new StreamableHTTPServerTransport({
+    sessionIdGenerator:
+      () => randomUUID(),
+
+    enableJsonResponse:
+      true
+  });
+
+/*
+Transport-level error logging.
+*/
+
+mcpTransport.onerror =
+  error => {
+
+    log(
+      "MCP transport error:",
+      error
+    );
+  };
+
+/*
+============================================================
+HTTP SERVER
 ============================================================
 */
 
 const httpServer =
   http.createServer(
-    (req, res) => {
+    async (req, res) => {
 
-      if (
-        req.url ===
-          "/health" ||
-        req.url ===
-          "/"
-      ) {
+      try {
+
+        /*
+        ------------------------------------------------------
+        HEALTH
+        ------------------------------------------------------
+        */
+
+        if (
+          req.url === "/" ||
+          req.url === "/health"
+        ) {
+
+          res.writeHead(
+            200,
+            {
+              "Content-Type":
+                "application/json; charset=utf-8"
+            }
+          );
+
+          res.end(
+            JSON.stringify({
+
+              ok: true,
+
+              service:
+                "yahoo-scan-mcp",
+
+              version:
+                APP_VERSION
+
+            })
+          );
+
+          return;
+        }
+
+        /*
+        ------------------------------------------------------
+        MCP
+        ------------------------------------------------------
+        */
+
+        if (
+          req.url === "/mcp"
+        ) {
+
+          await mcpTransport.handleRequest(
+            req,
+            res
+          );
+
+          return;
+        }
+
+        /*
+        ------------------------------------------------------
+        404
+        ------------------------------------------------------
+        */
 
         res.writeHead(
-          200,
+          404,
           {
             "Content-Type":
-              "application/json"
+              "application/json; charset=utf-8"
           }
         );
 
         res.end(
           JSON.stringify({
-            ok: true,
 
-            service:
-              "yahoo-scan-mcp",
+            ok: false,
 
-            version:
-              APP_VERSION
+            error:
+              "Not found"
+
           })
         );
 
-        return;
-      }
+      } catch (error) {
 
-      res.writeHead(
-        404,
-        {
-          "Content-Type":
-            "application/json"
+        log(
+          "HTTP request error:",
+          error
+        );
+
+        if (
+          !res.headersSent
+        ) {
+
+          res.writeHead(
+            500,
+            {
+              "Content-Type":
+                "application/json; charset=utf-8"
+            }
+          );
+
+          res.end(
+            JSON.stringify({
+
+              ok: false,
+
+              error:
+                error?.message ||
+                String(error)
+
+            })
+          );
+
+        } else {
+
+          try {
+            res.end();
+          } catch {}
+
         }
-      );
-
-      res.end(
-        JSON.stringify({
-          ok: false,
-
-          error:
-            "Not found"
-        })
-      );
+      }
     }
   );
 
@@ -1827,30 +1977,46 @@ START
 
 async function main() {
 
+  /*
+  Connect the MCP server to the Streamable HTTP
+  transport exactly once.
+  */
+
+  await server.connect(
+    mcpTransport
+  );
+
+  /*
+  Start Railway HTTP listener.
+  */
+
   httpServer.listen(
     PORT,
     "0.0.0.0",
     () => {
+
       log(
         `HTTP server listening on ${PORT}`
       );
+
+      log(
+        `MCP endpoint: /mcp`
+      );
+
+      log(
+        `Health endpoint: /health`
+      );
+
+      log(
+        `MCP server started v${APP_VERSION}`
+      );
     }
-  );
-
-  const transport =
-    new StdioServerTransport();
-
-  await server.connect(
-    transport
-  );
-
-  log(
-    `MCP server started v${APP_VERSION}`
   );
 }
 
 main().catch(
   error => {
+
     log(
       "Fatal error:",
       error
