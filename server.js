@@ -904,8 +904,12 @@ function extractBars(item) {
   }
 
   const response =
-    item.response ||
-    item;
+  Array.isArray(item.response)
+    ? item.response[0]
+    : (
+        item.response ||
+        item
+      );
 
   const timestamps =
     Array.isArray(
