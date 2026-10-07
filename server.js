@@ -1,20 +1,17 @@
 /*
 ========================================================
  Yahoo Scan MCP
- Version 1.6.0
+ Version 1.6.1
 
  PRINCIPES
- - Railway doit démarrer même si universe_s0.txt
-   n'est pas trouvé au boot.
- - universe_s0.txt est recherché uniquement lors
-   de yahoo_s0_prepare / get_universe.
- - Plusieurs chemins sont testés.
- - Diagnostic précis du filesystem.
+ - Railway démarre même si universe_s0.txt manque.
+ - universe_s0.txt est chargé uniquement à la demande.
  - Streamable HTTP stateless.
- - Yahoo WS inchangé.
  - Tous les tools utilisent registerTool().
- - RVOL15M calculé à partir d'une baseline historique
-   matérialisée pendant S0.
+ - Yahoo WS conservé.
+ - Yahoo Spark diagnostiquable directement depuis Railway.
+ - Aucune modification des critères S0/S1 sans validation
+   de la réponse réelle de Yahoo.
 ========================================================
 */
 
@@ -36,24 +33,44 @@ import { YahooWS } from "./src/yahoo-ws.js";
 ========================================================
 */
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT =
+  Number(process.env.PORT || 8080);
 
-const APP_VERSION = "1.6.0";
+const APP_VERSION =
+  "1.6.1";
 
-const __filename = fileURLToPath(import.meta.url);
-const APP_DIR = path.dirname(__filename);
-const CWD = process.cwd();
+const __filename =
+  fileURLToPath(import.meta.url);
 
-const BATCH_SIZE = 20;
-const CONCURRENCY = 4;
-const RETRIES = 3;
-const REQUEST_TIMEOUT_MS = 15000;
-const RETRY_DELAY_MS = 600;
+const APP_DIR =
+  path.dirname(__filename);
 
-const UNIVERSE_FILENAME = "universe_s0.txt";
+const CWD =
+  process.cwd();
 
-const S0_CACHE_FILENAME = "s0_materialized.json";
-const S1_CACHE_FILENAME = "s1_materialized.json";
+const BATCH_SIZE =
+  20;
+
+const CONCURRENCY =
+  4;
+
+const RETRIES =
+  3;
+
+const REQUEST_TIMEOUT_MS =
+  15000;
+
+const RETRY_DELAY_MS =
+  600;
+
+const UNIVERSE_FILENAME =
+  "universe_s0.txt";
+
+const S0_CACHE_FILENAME =
+  "s0_materialized.json";
+
+const S1_CACHE_FILENAME =
+  "s1_materialized.json";
 
 
 /*
@@ -68,6 +85,7 @@ const TOOL_NAMES = [
   "diagnose_filesystem",
   "get_universe",
   "yahoo_ws_test",
+  "yahoo_spark_test",
   "yahoo_s0_prepare",
   "yahoo_s1_scan",
   "yahoo_sf_scan",
@@ -84,28 +102,45 @@ const TOOL_NAMES = [
 
 const scanState = {
   ok: true,
-  version: APP_VERSION,
 
-  stage: "IDLE",
+  version:
+    APP_VERSION,
 
-  asof: null,
-  elapsed_ms: 0,
+  stage:
+    "IDLE",
 
-  symbols_requested: 0,
+  asof:
+    null,
 
-  source: null,
+  elapsed_ms:
+    0,
 
-  s0: [],
-  s1: [],
+  symbols_requested:
+    0,
 
-  lots: [],
+  source:
+    null,
 
-  errors: [],
+  s0:
+    [],
 
-  universe_file: null,
+  s1:
+    [],
 
-  started_at: null,
-  finished_at: null
+  lots:
+    [],
+
+  errors:
+    [],
+
+  universe_file:
+    null,
+
+  started_at:
+    null,
+
+  finished_at:
+    null
 };
 
 
@@ -115,10 +150,14 @@ const scanState = {
 ========================================================
 */
 
-let universeCache = null;
+let universeCache =
+  null;
 
-let s0Cache = null;
-let s1Cache = null;
+let s0Cache =
+  null;
+
+let s1Cache =
+  null;
 
 
 /*
@@ -128,7 +167,9 @@ let s1Cache = null;
 */
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(
+    resolve => setTimeout(resolve, ms)
+  );
 }
 
 
@@ -141,7 +182,12 @@ function uniqueUppercase(list) {
   return [
     ...new Set(
       list
-        .map(x => String(x || "").trim().toUpperCase())
+        .map(
+          x =>
+            String(x || "")
+              .trim()
+              .toUpperCase()
+        )
         .filter(Boolean)
     )
   ];
@@ -151,8 +197,14 @@ function uniqueUppercase(list) {
 function chunk(array, size) {
   const result = [];
 
-  for (let i = 0; i < array.length; i += size) {
-    result.push(array.slice(i, i + size));
+  for (
+    let i = 0;
+    i < array.length;
+    i += size
+  ) {
+    result.push(
+      array.slice(i, i + size)
+    );
   }
 
   return result;
@@ -160,50 +212,89 @@ function chunk(array, size) {
 
 
 function isFiniteNumber(value) {
-  return Number.isFinite(Number(value));
+  return Number.isFinite(
+    Number(value)
+  );
 }
 
 
 /*
 ========================================================
- FILE PATH DISCOVERY
-========================================================
-
- IMPORTANT:
- NO filesystem read is performed at server startup
- before the HTTP server is listening.
+ FILESYSTEM
 ========================================================
 */
 
 function universeCandidates() {
+
   const candidates = [
-    path.join(APP_DIR, UNIVERSE_FILENAME),
-    path.join(CWD, UNIVERSE_FILENAME),
-    path.join("/app", UNIVERSE_FILENAME),
-    path.join(APP_DIR, "data", UNIVERSE_FILENAME),
-    path.join(CWD, "data", UNIVERSE_FILENAME),
-    path.join("/app/data", UNIVERSE_FILENAME)
+    path.join(
+      APP_DIR,
+      UNIVERSE_FILENAME
+    ),
+
+    path.join(
+      CWD,
+      UNIVERSE_FILENAME
+    ),
+
+    path.join(
+      "/app",
+      UNIVERSE_FILENAME
+    ),
+
+    path.join(
+      APP_DIR,
+      "data",
+      UNIVERSE_FILENAME
+    ),
+
+    path.join(
+      CWD,
+      "data",
+      UNIVERSE_FILENAME
+    ),
+
+    path.join(
+      "/app/data",
+      UNIVERSE_FILENAME
+    )
   ];
 
-  return [...new Set(candidates)];
+  return [
+    ...new Set(candidates)
+  ];
 }
 
 
 async function fileExists(filename) {
+
   try {
-    await fs.access(filename);
+
+    await fs.access(
+      filename
+    );
+
     return true;
+
   } catch {
+
     return false;
   }
 }
 
 
 async function resolveUniverseFile() {
-  const candidates = universeCandidates();
 
-  for (const candidate of candidates) {
-    if (await fileExists(candidate)) {
+  const candidates =
+    universeCandidates();
+
+  for (
+    const candidate of candidates
+  ) {
+
+    if (
+      await fileExists(candidate)
+    ) {
       return candidate;
     }
   }
@@ -213,28 +304,61 @@ async function resolveUniverseFile() {
 
 
 async function filesystemDiagnostic() {
+
   const result = {
-    cwd: CWD,
-    app_dir: APP_DIR,
-    candidates: universeCandidates(),
-    found: null,
-    app_dir_files: [],
-    cwd_files: []
+
+    cwd:
+      CWD,
+
+    app_dir:
+      APP_DIR,
+
+    candidates:
+      universeCandidates(),
+
+    found:
+      null,
+
+    app_dir_files:
+      [],
+
+    cwd_files:
+      []
   };
 
-  result.found = await resolveUniverseFile();
+  result.found =
+    await resolveUniverseFile();
 
   try {
-    result.app_dir_files = await fs.readdir(APP_DIR);
+
+    result.app_dir_files =
+      await fs.readdir(
+        APP_DIR
+      );
+
   } catch (err) {
-    result.app_dir_files = [`ERROR: ${err.message}`];
+
+    result.app_dir_files = [
+      `ERROR: ${err.message}`
+    ];
   }
 
-  if (CWD !== APP_DIR) {
+  if (
+    CWD !== APP_DIR
+  ) {
+
     try {
-      result.cwd_files = await fs.readdir(CWD);
+
+      result.cwd_files =
+        await fs.readdir(
+          CWD
+        );
+
     } catch (err) {
-      result.cwd_files = [`ERROR: ${err.message}`];
+
+      result.cwd_files = [
+        `ERROR: ${err.message}`
+      ];
     }
   }
 
@@ -250,35 +374,62 @@ async function filesystemDiagnostic() {
 
 async function loadUniverse() {
 
-  if (universeCache) {
+  if (
+    universeCache
+  ) {
     return universeCache;
   }
 
-  const filename = await resolveUniverseFile();
+  const filename =
+    await resolveUniverseFile();
 
   if (!filename) {
 
-    const diagnostic = await filesystemDiagnostic();
+    const diagnostic =
+      await filesystemDiagnostic();
 
     throw new Error(
       "universe_s0.txt introuvable dans le filesystem Railway.\n" +
-      JSON.stringify(diagnostic, null, 2)
+      JSON.stringify(
+        diagnostic,
+        null,
+        2
+      )
     );
   }
 
-  const raw = await fs.readFile(filename, "utf8");
+  const raw =
+    await fs.readFile(
+      filename,
+      "utf8"
+    );
 
-  const symbols = uniqueUppercase(
-    raw
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith("#"))
-      .map(line => line.split(/[\s,;]+/)[0])
-  );
+  const symbols =
+    uniqueUppercase(
+      raw
+        .split(/\r?\n/)
+        .map(
+          line =>
+            line.trim()
+        )
+        .filter(
+          line =>
+            line &&
+            !line.startsWith("#")
+        )
+        .map(
+          line =>
+            line.split(
+              /[\s,;]+/
+            )[0]
+        )
+    );
 
-  universeCache = symbols;
+  universeCache =
+    symbols;
 
-  scanState.universe_file = filename;
+  scanState.universe_file =
+    filename;
 
   return symbols;
 }
@@ -290,18 +441,34 @@ async function loadUniverse() {
 ========================================================
 */
 
-async function cachePath(filename) {
-  return path.join(APP_DIR, filename);
+async function cachePath(
+  filename
+) {
+
+  return path.join(
+    APP_DIR,
+    filename
+  );
 }
 
 
-async function saveJson(filename, data) {
+async function saveJson(
+  filename,
+  data
+) {
 
-  const filenamePath = await cachePath(filename);
+  const filenamePath =
+    await cachePath(
+      filename
+    );
 
   await fs.writeFile(
     filenamePath,
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     "utf8"
   );
 
@@ -309,18 +476,26 @@ async function saveJson(filename, data) {
 }
 
 
-async function readJsonIfExists(filename) {
+async function readJsonIfExists(
+  filename
+) {
 
-  const filenamePath = await cachePath(filename);
+  const filenamePath =
+    await cachePath(
+      filename
+    );
 
   try {
 
-    const raw = await fs.readFile(
-      filenamePath,
-      "utf8"
-    );
+    const raw =
+      await fs.readFile(
+        filenamePath,
+        "utf8"
+      );
 
-    return JSON.parse(raw);
+    return JSON.parse(
+      raw
+    );
 
   } catch {
 
@@ -341,7 +516,9 @@ async function restoreCaches() {
       S1_CACHE_FILENAME
     );
 
-  if (s0Cache?.s0) {
+  if (
+    s0Cache?.s0
+  ) {
 
     scanState.s0 =
       s0Cache.s0;
@@ -355,7 +532,9 @@ async function restoreCaches() {
       null;
   }
 
-  if (s1Cache?.s1) {
+  if (
+    s1Cache?.s1
+  ) {
 
     scanState.s1 =
       s1Cache.s1;
@@ -372,13 +551,14 @@ async function restoreCaches() {
 
 /*
 ========================================================
- YAHOO SPARK
+ HTTP FETCH
 ========================================================
 */
 
 async function fetchWithTimeout(
   url,
-  timeoutMs = REQUEST_TIMEOUT_MS
+  timeoutMs =
+    REQUEST_TIMEOUT_MS
 ) {
 
   const controller =
@@ -386,7 +566,8 @@ async function fetchWithTimeout(
 
   const timer =
     setTimeout(
-      () => controller.abort(),
+      () =>
+        controller.abort(),
       timeoutMs
     );
 
@@ -396,9 +577,11 @@ async function fetchWithTimeout(
       await fetch(
         url,
         {
-          method: "GET",
+          method:
+            "GET",
 
           headers: {
+
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
               "AppleWebKit/537.36 Chrome/140 Safari/537.36",
@@ -412,21 +595,89 @@ async function fetchWithTimeout(
         }
       );
 
-    if (!response.ok) {
+    const text =
+      await response.text();
 
-      throw new Error(
-        `Yahoo HTTP ${response.status}`
-      );
+    let data =
+      null;
+
+    try {
+
+      data =
+        JSON.parse(text);
+
+    } catch {
+
+      data =
+        null;
     }
 
-    return await response.json();
+    if (
+      !response.ok
+    ) {
+
+      const error =
+        new Error(
+          `Yahoo HTTP ${response.status}`
+        );
+
+      error.status =
+        response.status;
+
+      error.contentType =
+        response.headers.get(
+          "content-type"
+        );
+
+      error.bodyPreview =
+        text.slice(
+          0,
+          500
+        );
+
+      throw error;
+    }
+
+    if (!data) {
+
+      const error =
+        new Error(
+          "Yahoo returned non-JSON response"
+        );
+
+      error.status =
+        response.status;
+
+      error.contentType =
+        response.headers.get(
+          "content-type"
+        );
+
+      error.bodyPreview =
+        text.slice(
+          0,
+          500
+        );
+
+      throw error;
+    }
+
+    return data;
 
   } finally {
 
-    clearTimeout(timer);
+    clearTimeout(
+      timer
+    );
   }
 }
 
+
+/*
+========================================================
+ YAHOO SPARK
+========================================================
+*/
 
 async function yahooSpark(
   symbols,
@@ -440,9 +691,11 @@ async function yahooSpark(
       BATCH_SIZE
     );
 
-  const results = {};
+  const results =
+    {};
 
-  let cursor = 0;
+  let cursor =
+    0;
 
   async function worker() {
 
@@ -463,15 +716,24 @@ async function yahooSpark(
 
       const url =
         "https://query1.finance.yahoo.com/v7/finance/spark" +
-        `?symbols=${encodeURIComponent(batch.join(","))}` +
-        `&range=${encodeURIComponent(range)}` +
-        `&interval=${encodeURIComponent(interval)}` +
+        `?symbols=${encodeURIComponent(
+          batch.join(",")
+        )}` +
+        `&range=${encodeURIComponent(
+          range
+        )}` +
+        `&interval=${encodeURIComponent(
+          interval
+        )}` +
         "&indicators=quote,close" +
         "&includeTimestamps=true" +
         "&includePrePost=false";
 
-      let data = null;
-      let lastError = null;
+      let data =
+        null;
+
+      let lastError =
+        null;
 
       for (
         let attempt = 1;
@@ -482,13 +744,16 @@ async function yahooSpark(
         try {
 
           data =
-            await fetchWithTimeout(url);
+            await fetchWithTimeout(
+              url
+            );
 
           break;
 
         } catch (err) {
 
-          lastError = err;
+          lastError =
+            err;
 
           if (
             attempt < RETRIES
@@ -509,11 +774,24 @@ async function yahooSpark(
         ) {
 
           results[symbol] = {
+
             symbol,
 
             error:
               lastError?.message ||
-              "Yahoo request failed"
+              "Yahoo request failed",
+
+            http_status:
+              lastError?.status ||
+              null,
+
+            content_type:
+              lastError?.contentType ||
+              null,
+
+            body_preview:
+              lastError?.bodyPreview ||
+              null
           };
         }
 
@@ -521,31 +799,106 @@ async function yahooSpark(
       }
 
       const spark =
-        data?.spark?.result ||
-        [];
+        data?.spark?.result;
+
+      if (
+        !Array.isArray(
+          spark
+        )
+      ) {
+
+        for (
+          const symbol of batch
+        ) {
+
+          results[symbol] = {
+
+            symbol,
+
+            error:
+              "Yahoo response missing spark.result",
+
+            response_keys:
+              Object.keys(
+                data || {}
+              ),
+
+            spark_keys:
+              data?.spark
+                ? Object.keys(
+                    data.spark
+                  )
+                : []
+          };
+        }
+
+        continue;
+      }
 
       for (
         const item of spark
       ) {
 
-        if (!item?.symbol) {
+        if (
+          !item?.symbol
+        ) {
           continue;
         }
 
-        results[item.symbol] =
+        results[
+          item.symbol
+        ] =
           item;
+      }
+
+      /*
+       Important:
+       les symboles sans résultat Yahoo sont
+       explicitement conservés comme erreurs.
+      */
+
+      const returned =
+        new Set(
+          spark
+            .map(
+              item =>
+                item?.symbol
+            )
+            .filter(Boolean)
+        );
+
+      for (
+        const symbol of batch
+      ) {
+
+        if (
+          !returned.has(
+            symbol
+          )
+        ) {
+
+          results[symbol] = {
+
+            symbol,
+
+            error:
+              "Yahoo returned no result for symbol"
+          };
+        }
       }
     }
   }
 
-  const workers = [];
+  const workers =
+    [];
 
   for (
     let i = 0;
-    i < Math.min(
-      CONCURRENCY,
-      batches.length
-    );
+    i <
+      Math.min(
+        CONCURRENCY,
+        batches.length
+      );
     i++
   ) {
 
@@ -559,6 +912,276 @@ async function yahooSpark(
   );
 
   return results;
+}
+
+
+/*
+========================================================
+ YAHOO SPARK DIAGNOSTIC
+========================================================
+
+ Teste UNE requête réelle depuis Railway.
+
+ Ne retourne pas le body complet.
+========================================================
+*/
+
+async function runYahooSparkTest(
+  symbol = "AAPL",
+  range = "5d",
+  interval = "5m"
+) {
+
+  const started =
+    Date.now();
+
+  const requestedSymbol =
+    String(
+      symbol || "AAPL"
+    )
+      .trim()
+      .toUpperCase();
+
+  const url =
+    "https://query1.finance.yahoo.com/v7/finance/spark" +
+    `?symbols=${encodeURIComponent(
+      requestedSymbol
+    )}` +
+    `&range=${encodeURIComponent(
+      range
+    )}` +
+    `&interval=${encodeURIComponent(
+      interval
+    )}` +
+    "&indicators=quote,close" +
+    "&includeTimestamps=true" +
+    "&includePrePost=false";
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      REQUEST_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        url,
+        {
+          method:
+            "GET",
+
+          headers: {
+
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+              "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+
+            "Accept":
+              "application/json"
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const contentType =
+      response.headers.get(
+        "content-type"
+      );
+
+    const body =
+      await response.text();
+
+    let parsed =
+      null;
+
+    let jsonError =
+      null;
+
+    try {
+
+      parsed =
+        JSON.parse(
+          body
+        );
+
+    } catch (err) {
+
+      jsonError =
+        err.message;
+    }
+
+    const spark =
+      parsed?.spark ||
+      null;
+
+    const result =
+      spark?.result;
+
+    const first =
+      Array.isArray(result) &&
+      result.length
+        ? result[0]
+        : null;
+
+    const bars =
+      first
+        ? extractBars(first)
+        : [];
+
+    const quote =
+      first
+        ?.indicators
+        ?.quote
+        ?.[0] ||
+      null;
+
+    return {
+
+      ok:
+        response.ok,
+
+      version:
+        APP_VERSION,
+
+      symbol:
+        requestedSymbol,
+
+      range,
+
+      interval,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      http_status:
+        response.status,
+
+      content_type:
+        contentType,
+
+      body_length:
+        body.length,
+
+      json_parse_ok:
+        Boolean(parsed),
+
+      json_error:
+        jsonError,
+
+      top_level_keys:
+        parsed
+          ? Object.keys(parsed)
+          : [],
+
+      spark_present:
+        Boolean(spark),
+
+      spark_keys:
+        spark
+          ? Object.keys(spark)
+          : [],
+
+      result_is_array:
+        Array.isArray(result),
+
+      result_count:
+        Array.isArray(result)
+          ? result.length
+          : 0,
+
+      first_result_keys:
+        first
+          ? Object.keys(first)
+          : [],
+
+      first_result_symbol:
+        first?.symbol ||
+        null,
+
+      timestamp_count:
+        Array.isArray(
+          first?.timestamp
+        )
+          ? first.timestamp.length
+          : 0,
+
+      extracted_bar_count:
+        bars.length,
+
+      quote_keys:
+        quote
+          ? Object.keys(quote)
+          : [],
+
+      error:
+        response.ok
+          ? null
+          : `Yahoo HTTP ${response.status}`,
+
+      body_preview:
+        response.ok
+          ? null
+          : body.slice(
+              0,
+              500
+            )
+    };
+
+  } catch (err) {
+
+    return {
+
+      ok:
+        false,
+
+      version:
+        APP_VERSION,
+
+      symbol:
+        requestedSymbol,
+
+      range,
+
+      interval,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        err.message,
+
+      error_name:
+        err.name,
+
+      http_status:
+        err.status ||
+        null,
+
+      content_type:
+        err.contentType ||
+        null,
+
+      body_preview:
+        err.bodyPreview ||
+        null
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+  }
 }
 
 
@@ -579,12 +1202,14 @@ function extractBars(item) {
     [];
 
   const quote =
-    item.indicators?.quote?.[0] ||
+    item.indicators
+      ?.quote?.[0] ||
     {};
 
   const closes =
-    item.indicators?.quote?.[0]?.close ||
-    item.indicators?.close?.[0]?.close ||
+    quote.close ||
+    item.indicators
+      ?.close?.[0]?.close ||
     [];
 
   const opens =
@@ -603,7 +1228,8 @@ function extractBars(item) {
     quote.volume ||
     [];
 
-  const bars = [];
+  const bars =
+    [];
 
   for (
     let i = 0;
@@ -612,27 +1238,40 @@ function extractBars(item) {
   ) {
 
     const ts =
-      Number(timestamps[i]) *
-      1000;
+      Number(
+        timestamps[i]
+      ) * 1000;
 
-    const close =
-      Number(closes[i]);
-
-    const open =
-      Number(opens[i]);
-
-    const high =
-      Number(highs[i]);
-
-    const low =
-      Number(lows[i]);
-
-    const volume =
-      Number(volumes[i]);
-
-    if (!Number.isFinite(ts)) {
+    if (
+      !Number.isFinite(ts)
+    ) {
       continue;
     }
+
+    const close =
+      Number(
+        closes[i]
+      );
+
+    const open =
+      Number(
+        opens[i]
+      );
+
+    const high =
+      Number(
+        highs[i]
+      );
+
+    const low =
+      Number(
+        lows[i]
+      );
+
+    const volume =
+      Number(
+        volumes[i]
+      );
 
     bars.push({
 
@@ -671,7 +1310,7 @@ function extractBars(item) {
 
 /*
 ========================================================
- NEW YORK TIME HELPERS
+ NEW YORK TIME
 ========================================================
 */
 
@@ -683,9 +1322,14 @@ function nyDateKey(ts) {
       timeZone:
         "America/New_York",
 
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit"
+      year:
+        "numeric",
+
+      month:
+        "2-digit",
+
+      day:
+        "2-digit"
     }
   ).format(
     new Date(ts)
@@ -702,23 +1346,29 @@ function nyTimeParts(ts) {
         timeZone:
           "America/New_York",
 
-        hour: "2-digit",
-        minute: "2-digit",
+        hour:
+          "2-digit",
 
-        hour12: false
+        minute:
+          "2-digit",
+
+        hour12:
+          false
       }
     ).formatToParts(
       new Date(ts)
     );
 
-  const map = {};
+  const map =
+    {};
 
   for (
     const part of parts
   ) {
 
     if (
-      part.type !== "literal"
+      part.type !==
+      "literal"
     ) {
 
       map[part.type] =
@@ -727,28 +1377,19 @@ function nyTimeParts(ts) {
   }
 
   return {
+
     hour:
-      Number(map.hour),
+      Number(
+        map.hour
+      ),
 
     minute:
-      Number(map.minute)
+      Number(
+        map.minute
+      )
   };
 }
 
-
-/*
-========================================================
- 15-MINUTE TIME SLOT
-========================================================
-
- Example:
- 09:30 / 09:35 / 09:40
- => 09:30
-
- 15:45 / 15:50 / 15:55
- => 15:45
-========================================================
-*/
 
 function nyTimeKey(ts) {
 
@@ -771,15 +1412,11 @@ function nyTimeKey(ts) {
     ) * 15;
 
   return (
-    String(hour).padStart(
-      2,
-      "0"
-    ) +
+    String(hour)
+      .padStart(2, "0") +
     ":" +
-    String(slot).padStart(
-      2,
-      "0"
-    )
+    String(slot)
+      .padStart(2, "0")
   );
 }
 
@@ -790,7 +1427,9 @@ function nyTimeKey(ts) {
 ========================================================
 */
 
-function getSessionBars(bars) {
+function getSessionBars(
+  bars
+) {
 
   const groups =
     new Map();
@@ -820,7 +1459,8 @@ function getSessionBars(bars) {
   }
 
   for (
-    const list of groups.values()
+    const list of
+      groups.values()
   ) {
 
     list.sort(
@@ -837,7 +1477,9 @@ function getCurrentSessionBars(
   bars
 ) {
 
-  if (!bars.length) {
+  if (
+    !bars.length
+  ) {
     return [];
   }
 
@@ -874,8 +1516,11 @@ function calculateVWAP(
   bars
 ) {
 
-  let pv = 0;
-  let volume = 0;
+  let pv =
+    0;
+
+  let volume =
+    0;
 
   for (
     const bar of bars
@@ -915,13 +1560,15 @@ function calculateVWAP(
     return null;
   }
 
-  return pv / volume;
+  return (
+    pv / volume
+  );
 }
 
 
 /*
 ========================================================
- HISTORICAL SESSION PERFORMANCE
+ SESSION PERFORMANCE
 ========================================================
 */
 
@@ -929,7 +1576,9 @@ function sessionPerformance(
   session
 ) {
 
-  if (!session?.length) {
+  if (
+    !session?.length
+  ) {
     return null;
   }
 
@@ -972,22 +1621,6 @@ function sessionPerformance(
 /*
 ========================================================
  RVOL BASELINE
-========================================================
-
- Baseline:
- - completed historical sessions only
- - volume aggregated in 15-minute slots
- - average volume for each time-of-day slot
-
- Example:
-
- 09:30 average over J-1/J-2/...
- 09:45 average
- ...
- 15:45 average
-
- S1 compares current Vol15M against the
- corresponding historical 15-minute slot.
 ========================================================
 */
 
@@ -1066,7 +1699,8 @@ function buildRvol15mBaseline(
     }
   }
 
-  const baseline = {};
+  const baseline =
+    {};
 
   for (
     const [
@@ -1080,13 +1714,18 @@ function buildRvol15mBaseline(
         Number.isFinite
       );
 
-    if (!valid.length) {
+    if (
+      !valid.length
+    ) {
       continue;
     }
 
     baseline[key] =
       valid.reduce(
-        (sum, value) =>
+        (
+          sum,
+          value
+        ) =>
           sum + value,
         0
       ) /
@@ -1108,18 +1747,14 @@ function isOrdinaryStock(
   item
 ) {
 
-  if (!symbol) {
+  if (
+    !symbol
+  ) {
     return false;
   }
 
   const upper =
     symbol.toUpperCase();
-
-  /*
-   Conservative exclusion.
-   Final universe remains controlled by
-   universe_s0.txt.
-  */
 
   if (
     upper.endsWith("W") ||
@@ -1136,7 +1771,7 @@ function isOrdinaryStock(
 
 /*
 ========================================================
- S0 CALCULATION
+ S0
 ========================================================
 */
 
@@ -1227,7 +1862,9 @@ function calculateS0(
           )
       );
 
-  if (!currentLast) {
+  if (
+    !currentLast
+  ) {
     return null;
   }
 
@@ -1255,10 +1892,6 @@ function calculateS0(
       previous2
     );
 
-  /*
-   Historical RVOL baseline.
-  */
-
   const rvol15mBaseline =
     buildRvol15mBaseline(
       completedSessions
@@ -1270,9 +1903,11 @@ function calculateS0(
 
     price,
 
-    j1_pct: j1,
+    j1_pct:
+      j1,
 
-    j2_pct: j2,
+    j2_pct:
+      j2,
 
     historical_sessions:
       completedSessions.length,
@@ -1294,7 +1929,7 @@ function calculateS0(
 
 /*
 ========================================================
- CURRENT 15-MINUTE VOLUME
+ CURRENT VOL15M
 ========================================================
 */
 
@@ -1305,14 +1940,21 @@ function calculateCurrentVol15M(
   if (
     completed.length < 3
   ) {
+
     return {
-      vol15m: null,
-      slot: null
+
+      vol15m:
+        null,
+
+      slot:
+        null
     };
   }
 
   const last3 =
-    completed.slice(-3);
+    completed.slice(
+      -3
+    );
 
   const vol15m =
     last3.reduce(
@@ -1333,7 +1975,9 @@ function calculateCurrentVol15M(
     );
 
   return {
+
     vol15m,
+
     slot
   };
 }
@@ -1341,7 +1985,7 @@ function calculateCurrentVol15M(
 
 /*
 ========================================================
- S1 CALCULATION
+ S1
 ========================================================
 */
 
@@ -1351,7 +1995,9 @@ function calculateS1(
   s0Record
 ) {
 
-  if (!s0Record) {
+  if (
+    !s0Record
+  ) {
     return null;
   }
 
@@ -1371,11 +2017,6 @@ function calculateS1(
     return null;
   }
 
-  /*
-   Yahoo 5m bars are treated as
-   interval-start bars.
-  */
-
   const now =
     Date.now();
 
@@ -1383,8 +2024,7 @@ function calculateS1(
     currentSession.filter(
       bar =>
         bar.ts +
-        5 * 60 * 1000
-        <=
+        5 * 60 * 1000 <=
         now + 1000
     );
 
@@ -1423,32 +2063,19 @@ function calculateS1(
     return null;
   }
 
-  /*
-   ---------------------------------------------
-   Vol15M
-   ---------------------------------------------
-  */
-
   const {
     vol15m,
-    slot: rvolSlot
+    slot:
+      rvolSlot
   } =
     calculateCurrentVol15M(
       completed
     );
 
-
-  /*
-   ---------------------------------------------
-   RVOL15M
-   ---------------------------------------------
-  */
-
   const baseline =
     s0Record
-      ?.rvol15m_baseline?.[
-        rvolSlot
-      ];
+      ?.rvol15m_baseline
+      ?.[rvolSlot];
 
   const rvol15m =
     (
@@ -1456,20 +2083,19 @@ function calculateS1(
         vol15m
       ) &&
       Number.isFinite(
-        Number(baseline)
+        Number(
+          baseline
+        )
       ) &&
-      Number(baseline) > 0
+      Number(
+        baseline
+      ) > 0
     )
       ? vol15m /
-        Number(baseline)
+        Number(
+          baseline
+        )
       : null;
-
-
-  /*
-   ---------------------------------------------
-   Accel5M
-   ---------------------------------------------
-  */
 
   const baselineVolumes =
     completed
@@ -1481,7 +2107,8 @@ function calculateS1(
           )
       )
       .filter(
-        v => v > 0
+        v =>
+          v > 0
       );
 
   const meanBaseline =
@@ -1505,13 +2132,6 @@ function calculateS1(
         meanBaseline
       : null;
 
-
-  /*
-   ---------------------------------------------
-   VWAP
-   ---------------------------------------------
-  */
-
   const vwap =
     calculateVWAP(
       completed
@@ -1520,23 +2140,19 @@ function calculateS1(
   const priceVsVWAP =
     vwap > 0
       ? (
-          price / vwap -
+          price /
+          vwap -
           1
         ) * 100
       : null;
-
-
-  /*
-   ---------------------------------------------
-   HOD
-   ---------------------------------------------
-  */
 
   const highs =
     completed
       .map(
         b =>
-          Number(b.high)
+          Number(
+            b.high
+          )
       )
       .filter(
         Number.isFinite
@@ -1544,23 +2160,19 @@ function calculateS1(
 
   const hod =
     highs.length
-      ? Math.max(...highs)
+      ? Math.max(
+          ...highs
+        )
       : null;
 
   const hodDistance =
     hod > 0
       ? (
-          price / hod -
+          price /
+          hod -
           1
         ) * 100
       : null;
-
-
-  /*
-   ---------------------------------------------
-   Short-term movement
-   ---------------------------------------------
-  */
 
   const change5m =
     previous.close > 0
@@ -1580,7 +2192,6 @@ function calculateS1(
         ) * 100
       : null;
 
-
   return {
 
     symbol,
@@ -1596,9 +2207,13 @@ function calculateS1(
 
     rvol15m_baseline:
       Number.isFinite(
-        Number(baseline)
+        Number(
+          baseline
+        )
       )
-        ? Number(baseline)
+        ? Number(
+            baseline
+          )
         : null,
 
     accel5m,
@@ -1638,92 +2253,107 @@ function calculateS1(
 ========================================================
 */
 
-function rankS1(records) {
+function rankS1(
+  records
+) {
 
-  return [...records]
-    .sort(
-      (a, b) => {
+  return [
+    ...records
+  ].sort(
+    (
+      a,
+      b
+    ) => {
 
-        const rvA =
-          Number.isFinite(
-            a.rvol15m
-          )
-            ? a.rvol15m
-            : -Infinity;
+      const rvA =
+        Number.isFinite(
+          a.rvol15m
+        )
+          ? a.rvol15m
+          : -Infinity;
 
-        const rvB =
-          Number.isFinite(
-            b.rvol15m
-          )
-            ? b.rvol15m
-            : -Infinity;
+      const rvB =
+        Number.isFinite(
+          b.rvol15m
+        )
+          ? b.rvol15m
+          : -Infinity;
 
-        if (
-          rvB !== rvA
-        ) {
-          return rvB - rvA;
-        }
-
-        const acA =
-          Number.isFinite(
-            a.accel5m
-          )
-            ? a.accel5m
-            : -Infinity;
-
-        const acB =
-          Number.isFinite(
-            b.accel5m
-          )
-            ? b.accel5m
-            : -Infinity;
-
-        if (
-          acB !== acA
-        ) {
-          return acB - acA;
-        }
-
-        const vwA =
-          Number.isFinite(
-            a.priceVsVWAP
-          )
-            ? a.priceVsVWAP
-            : -Infinity;
-
-        const vwB =
-          Number.isFinite(
-            b.priceVsVWAP
-          )
-            ? b.priceVsVWAP
-            : -Infinity;
-
-        if (
-          vwB !== vwA
-        ) {
-          return vwB - vwA;
-        }
-
-        const hodA =
-          Number.isFinite(
-            a.hodDistance
-          )
-            ? a.hodDistance
-            : -Infinity;
-
-        const hodB =
-          Number.isFinite(
-            b.hodDistance
-          )
-            ? b.hodDistance
-            : -Infinity;
-
+      if (
+        rvB !== rvA
+      ) {
         return (
-          hodB -
-          hodA
+          rvB -
+          rvA
         );
       }
-    );
+
+      const acA =
+        Number.isFinite(
+          a.accel5m
+        )
+          ? a.accel5m
+          : -Infinity;
+
+      const acB =
+        Number.isFinite(
+          b.accel5m
+        )
+          ? b.accel5m
+          : -Infinity;
+
+      if (
+        acB !== acA
+      ) {
+        return (
+          acB -
+          acA
+        );
+      }
+
+      const vwA =
+        Number.isFinite(
+          a.priceVsVWAP
+        )
+          ? a.priceVsVWAP
+          : -Infinity;
+
+      const vwB =
+        Number.isFinite(
+          b.priceVsVWAP
+        )
+          ? b.priceVsVWAP
+          : -Infinity;
+
+      if (
+        vwB !== vwA
+      ) {
+        return (
+          vwB -
+          vwA
+        );
+      }
+
+      const hodA =
+        Number.isFinite(
+          a.hodDistance
+        )
+          ? a.hodDistance
+          : -Infinity;
+
+      const hodB =
+        Number.isFinite(
+          b.hodDistance
+        )
+          ? b.hodDistance
+          : -Infinity;
+
+      return (
+        hodB -
+        hodA
+      );
+    }
+  );
 }
 
 
@@ -1741,27 +2371,28 @@ function makeLots(
   return chunk(
     records,
     size
-  )
-    .map(
-      (
-        lot,
-        index
-      ) => ({
-        lot:
-          index + 1,
+  ).map(
+    (
+      lot,
+      index
+    ) => ({
 
-        size:
-          lot.length,
+      lot:
+        index + 1,
 
-        symbols:
-          lot.map(
-            x => x.symbol
-          ),
+      size:
+        lot.length,
 
-        records:
-          lot
-      })
-    );
+      symbols:
+        lot.map(
+          x =>
+            x.symbol
+        ),
+
+      records:
+        lot
+    })
+  );
 }
 
 
@@ -1776,7 +2407,9 @@ function passesWinnerGate(
   options = {}
 ) {
 
-  if (!record) {
+  if (
+    !record
+  ) {
     return false;
   }
 
@@ -1893,14 +2526,29 @@ async function runS0Prepare(
       "5m"
     );
 
-  const s0 = [];
+  const s0 =
+    [];
+
+  let yahooErrors =
+    0;
 
   for (
     const symbol of list
   ) {
 
     const item =
-      yahooData[symbol];
+      yahooData[
+        symbol
+      ];
+
+    if (
+      item?.error
+    ) {
+
+      yahooErrors++;
+
+      continue;
+    }
 
     const record =
       calculateS0(
@@ -1908,9 +2556,22 @@ async function runS0Prepare(
         item
       );
 
-    if (record) {
-      s0.push(record);
+    if (
+      record
+    ) {
+      s0.push(
+        record
+      );
     }
+  }
+
+  if (
+    yahooErrors > 0
+  ) {
+
+    scanState.errors.push(
+      `Yahoo Spark: ${yahooErrors} symboles/batches sans données exploitables.`
+    );
   }
 
   s0Cache = {
@@ -1926,6 +2587,9 @@ async function runS0Prepare(
 
     universe_file:
       scanState.universe_file,
+
+    yahoo_errors:
+      yahooErrors,
 
     s0
   };
@@ -1957,7 +2621,8 @@ async function runS0Prepare(
 
   return {
 
-    ok: true,
+    ok:
+      true,
 
     stage:
       "S0_READY",
@@ -1976,6 +2641,9 @@ async function runS0Prepare(
 
     s0_count:
       s0.length,
+
+    yahoo_errors:
+      yahooErrors,
 
     cache_file:
       cacheFile,
@@ -2013,7 +2681,9 @@ async function runS1Scan(
       : s0Cache?.s0 ||
         [];
 
-  if (!s0.length) {
+  if (
+    !s0.length
+  ) {
 
     throw new Error(
       "S0 non préparé. Exécute d'abord yahoo_s0_prepare."
@@ -2035,7 +2705,8 @@ async function runS1Scan(
 
   const symbols =
     s0.map(
-      x => x.symbol
+      x =>
+        x.symbol
     );
 
   const yahooData =
@@ -2045,7 +2716,8 @@ async function runS1Scan(
       "5m"
     );
 
-  const s1 = [];
+  const s1 =
+    [];
 
   for (
     const s0Record of s0
@@ -2056,6 +2728,12 @@ async function runS1Scan(
         s0Record.symbol
       ];
 
+    if (
+      item?.error
+    ) {
+      continue;
+    }
+
     const record =
       calculateS1(
         s0Record.symbol,
@@ -2063,8 +2741,12 @@ async function runS1Scan(
         s0Record
       );
 
-    if (record) {
-      s1.push(record);
+    if (
+      record
+    ) {
+      s1.push(
+        record
+      );
     }
   }
 
@@ -2135,7 +2817,8 @@ async function runS1Scan(
 
   return {
 
-    ok: true,
+    ok:
+      true,
 
     stage:
       "S1_READY",
@@ -2164,6 +2847,7 @@ async function runS1Scan(
     lots:
       lots.map(
         lot => ({
+
           lot:
             lot.lot,
 
@@ -2223,7 +2907,8 @@ async function runSFScan(
       source.length
     );
 
-  const checked = [];
+  const checked =
+    [];
 
   let winner =
     null;
@@ -2244,10 +2929,6 @@ async function runSFScan(
     const symbols =
       lot.symbols;
 
-    /*
-     Refresh uniquement du lot courant.
-    */
-
     const yahooData =
       await yahooSpark(
         symbols,
@@ -2255,11 +2936,12 @@ async function runSFScan(
         "5m"
       );
 
-    const refreshed = [];
+    const refreshed =
+      [];
 
     for (
-      const oldRecord
-        of lot.records
+      const oldRecord of
+        lot.records
     ) {
 
       const item =
@@ -2267,7 +2949,10 @@ async function runSFScan(
           oldRecord.symbol
         ];
 
-      if (!item) {
+      if (
+        !item ||
+        item.error
+      ) {
         continue;
       }
 
@@ -2278,7 +2963,9 @@ async function runSFScan(
           oldRecord
         );
 
-      if (!current) {
+      if (
+        !current
+      ) {
         continue;
       }
 
@@ -2311,11 +2998,9 @@ async function runSFScan(
         refreshed
     });
 
-    /*
-     STOP IMMEDIATEMENT
-    */
-
-    if (winner) {
+    if (
+      winner
+    ) {
       break;
     }
   }
@@ -2334,7 +3019,8 @@ async function runSFScan(
 
   return {
 
-    ok: true,
+    ok:
+      true,
 
     stage:
       scanState.stage,
@@ -2390,12 +3076,14 @@ async function runYahooWSTest() {
         ? ws.getStatus()
 
         : {
-            connected: true
+            connected:
+              true
           };
 
     return {
 
-      ok: true,
+      ok:
+        true,
 
       elapsed_ms:
         Date.now() -
@@ -2407,7 +3095,9 @@ async function runYahooWSTest() {
   } finally {
 
     try {
+
       await ws.close();
+
     } catch {}
   }
 }
@@ -2417,21 +3107,14 @@ async function runYahooWSTest() {
 ========================================================
  MCP TOOLS
 ========================================================
-
- IMPORTANT:
- registerTool(name, config, callback)
-
- Cette forme correspond à l'API MCP actuelle et évite
- l'ancien appel variadique server.tool().
-========================================================
 */
 
-function registerTools(server) {
+function registerTools(
+  server
+) {
 
   /*
-   ---------------------------------------------
    PING
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2446,12 +3129,17 @@ function registerTools(server) {
     },
 
     async () => ({
+
       content: [{
-        type: "text",
+
+        type:
+          "text",
 
         text:
           JSON.stringify({
-            ok: true,
+
+            ok:
+              true,
 
             service:
               "yahoo-scan-mcp",
@@ -2468,9 +3156,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
    STATUS
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2485,12 +3171,17 @@ function registerTools(server) {
     },
 
     async () => ({
+
       content: [{
-        type: "text",
+
+        type:
+          "text",
 
         text:
           JSON.stringify({
-            ok: true,
+
+            ok:
+              true,
 
             version:
               APP_VERSION,
@@ -2540,9 +3231,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
-   FILESYSTEM DIAGNOSTIC
-   ---------------------------------------------
+   FILESYSTEM
   */
 
   server.registerTool(
@@ -2550,7 +3239,7 @@ function registerTools(server) {
 
     {
       description:
-        "Diagnostic du filesystem Railway sans charger universe_s0.txt.",
+        "Diagnostic du filesystem Railway.",
 
       inputSchema:
         z.object({})
@@ -2564,12 +3253,16 @@ function registerTools(server) {
       return {
 
         content: [{
-          type: "text",
+
+          type:
+            "text",
 
           text:
             JSON.stringify(
               {
-                ok: true,
+
+                ok:
+                  true,
 
                 version:
                   APP_VERSION,
@@ -2578,7 +3271,6 @@ function registerTools(server) {
               },
 
               null,
-
               2
             )
         }]
@@ -2588,9 +3280,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
-   GET UNIVERSE
-   ---------------------------------------------
+   UNIVERSE
   */
 
   server.registerTool(
@@ -2614,11 +3304,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: true,
+
+                ok:
+                  true,
 
                 count:
                   universe.length,
@@ -2637,11 +3331,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: false,
+
+                ok:
+                  false,
 
                 error:
                   err.message
@@ -2654,9 +3352,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
    WS TEST
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2680,7 +3376,9 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify(
@@ -2694,11 +3392,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: false,
+
+                ok:
+                  false,
 
                 error:
                   err.message
@@ -2711,9 +3413,96 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
+   YAHOO SPARK TEST
+  */
+
+  server.registerTool(
+    "yahoo_spark_test",
+
+    {
+      description:
+        "Diagnostic direct de Yahoo Spark depuis Railway. Teste une seule action sans modifier le scan.",
+
+      inputSchema:
+        z.object({
+
+          symbol:
+            z.string()
+              .optional(),
+
+          range:
+            z.string()
+              .optional(),
+
+          interval:
+            z.string()
+              .optional()
+        })
+    },
+
+    async ({
+      symbol,
+      range,
+      interval
+    }) => {
+
+      try {
+
+        const result =
+          await runYahooSparkTest(
+            symbol ||
+              "AAPL",
+
+            range ||
+              "5d",
+
+            interval ||
+              "5m"
+          );
+
+        return {
+
+          content: [{
+
+            type:
+              "text",
+
+            text:
+              JSON.stringify(
+                result,
+                null,
+                2
+              )
+          }]
+        };
+
+      } catch (err) {
+
+        return {
+
+          content: [{
+
+            type:
+              "text",
+
+            text:
+              JSON.stringify({
+
+                ok:
+                  false,
+
+                error:
+                  err.message
+              })
+          }]
+        };
+      }
+    }
+  );
+
+
+  /*
    S0
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2725,10 +3514,12 @@ function registerTools(server) {
 
       inputSchema:
         z.object({
+
           symbols:
             z.array(
               z.string()
-            ).optional()
+            )
+            .optional()
         })
     },
 
@@ -2746,7 +3537,9 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify(
@@ -2767,11 +3560,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: false,
+
+                ok:
+                  false,
 
                 stage:
                   "S0_ERROR",
@@ -2790,9 +3587,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
    S1
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2824,14 +3619,18 @@ function registerTools(server) {
 
         const result =
           await runS1Scan({
+
             limit,
+
             s1_limit
           });
 
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify(
@@ -2852,11 +3651,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: false,
+
+                ok:
+                  false,
 
                 stage:
                   "S1_ERROR",
@@ -2875,9 +3678,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
    SF
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -2885,7 +3686,7 @@ function registerTools(server) {
 
     {
       description:
-        "Rafraîchit les lots S1 un par un et s'arrête au premier Winner Gate.",
+        "Rafraîchit les lots S1 et s'arrête au premier Winner Gate.",
 
       inputSchema:
         z.object({
@@ -2939,7 +3740,9 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify(
@@ -2960,11 +3763,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
-                ok: false,
+
+                ok:
+                  false,
 
                 stage:
                   "SF_ERROR",
@@ -2983,9 +3790,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
    SCAN STATE
-   ---------------------------------------------
   */
 
   server.registerTool(
@@ -3002,7 +3807,9 @@ function registerTools(server) {
     async () => ({
 
       content: [{
-        type: "text",
+
+        type:
+          "text",
 
         text:
           JSON.stringify(
@@ -3016,9 +3823,7 @@ function registerTools(server) {
 
 
   /*
-   ---------------------------------------------
-   COMPATIBILITY TOOL
-   ---------------------------------------------
+   COMPATIBILITY
   */
 
   server.registerTool(
@@ -3034,7 +3839,8 @@ function registerTools(server) {
           symbols:
             z.array(
               z.string()
-            ).optional(),
+            )
+            .optional(),
 
           s1_limit:
             z.number()
@@ -3062,12 +3868,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
 
-                ok: true,
+                ok:
+                  true,
 
                 stage:
                   "S0_S1",
@@ -3084,12 +3893,15 @@ function registerTools(server) {
         return {
 
           content: [{
-            type: "text",
+
+            type:
+              "text",
 
             text:
               JSON.stringify({
 
-                ok: false,
+                ok:
+                  false,
 
                 stage:
                   "S0_S1_ERROR",
@@ -3145,9 +3957,7 @@ const httpServer =
     ) => {
 
       /*
-       ---------------------------------------------
        ROOT
-       ---------------------------------------------
       */
 
       if (
@@ -3166,7 +3976,8 @@ const httpServer =
         res.end(
           JSON.stringify({
 
-            ok: true,
+            ok:
+              true,
 
             service:
               "yahoo-scan-mcp",
@@ -3190,9 +4001,7 @@ const httpServer =
 
 
       /*
-       ---------------------------------------------
        HEALTH
-       ---------------------------------------------
       */
 
       if (
@@ -3211,7 +4020,8 @@ const httpServer =
         res.end(
           JSON.stringify({
 
-            ok: true,
+            ok:
+              true,
 
             service:
               "yahoo-scan-mcp",
@@ -3235,9 +4045,7 @@ const httpServer =
 
 
       /*
-       ---------------------------------------------
        DEBUG TOOLS
-       ---------------------------------------------
       */
 
       if (
@@ -3256,7 +4064,8 @@ const httpServer =
         res.end(
           JSON.stringify({
 
-            ok: true,
+            ok:
+              true,
 
             version:
               APP_VERSION,
@@ -3274,9 +4083,7 @@ const httpServer =
 
 
       /*
-       ---------------------------------------------
        MCP
-       ---------------------------------------------
       */
 
       if (
@@ -3290,8 +4097,7 @@ const httpServer =
             [];
 
           for await (
-            const chunk
-              of req
+            const chunk of req
           ) {
 
             bodyChunks.push(
@@ -3317,7 +4123,7 @@ const httpServer =
 
           /*
            Stateless:
-           nouveau transport + serveur
+           nouveau serveur + transport
            pour chaque requête.
           */
 
@@ -3366,7 +4172,8 @@ const httpServer =
             res.end(
               JSON.stringify({
 
-                ok: false,
+                ok:
+                  false,
 
                 error:
                   err.message
@@ -3380,9 +4187,7 @@ const httpServer =
 
 
       /*
-       ---------------------------------------------
        404
-       ---------------------------------------------
       */
 
       res.writeHead(
@@ -3396,7 +4201,8 @@ const httpServer =
       res.end(
         JSON.stringify({
 
-          ok: false,
+          ok:
+            false,
 
           error:
             "Not found"
@@ -3409,12 +4215,6 @@ const httpServer =
 /*
 ========================================================
  START
-========================================================
-
- IMPORTANT:
- - NO loadUniverse()
- - NO blocking restoreCaches()
- - server starts regardless of universe_s0.txt
 ========================================================
 */
 
@@ -3448,14 +4248,8 @@ httpServer.listen(
     );
 
     console.log(
-      `[yahoo-scan-mcp] universe loading deferred until yahoo_s0_prepare`
+      "[yahoo-scan-mcp] universe loading deferred until yahoo_s0_prepare"
     );
-
-    /*
-     Restore les caches après le démarrage HTTP.
-     Une erreur de cache ne doit jamais empêcher Railway
-     de démarrer.
-    */
 
     restoreCaches()
       .then(() => {
