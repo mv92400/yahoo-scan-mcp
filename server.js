@@ -1,140 +1,133 @@
 /*
-========================================================
+============================================================
  Yahoo Scan MCP
- Version 1.6.2
+ Version 1.7.0
+============================================================
 
- PRINCIPES
- - Railway démarre même si universe_s0.txt manque.
- - universe_s0.txt est chargé uniquement à la demande.
- - Streamable HTTP stateless.
- - Tous les tools utilisent registerTool().
- - Yahoo WS conservé.
- - Yahoo Spark diagnostiquable directement depuis Railway.
- - CORRECTION 1.6.2 :
-   Yahoo Spark retourne result[].response.timestamp
-   et result[].response.indicators.
-========================================================
+Objectif :
+- Yahoo Chart comme source OHLCV fiable
+- S0 historique 15m
+- S1 intraday 5m
+- RVOL15M robuste
+- VWAP
+- Accel5M
+- HOD / HOD distance
+- transport MCP Streamable HTTP stateless
+- compatibilité avec les 11 tools existants
+============================================================
 */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
+import express from "express";
+import fs from "fs";
+import path from "path";
+import {
+  McpServer
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import http from "node:http";
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  StreamableHTTPServerTransport
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { YahooWS } from "./src/yahoo-ws.js";
+import {
+  z
+} from "zod";
+
+import YahooWS from "./src/yahoo-ws.js";
 
 
-/*
-========================================================
- CONFIG
-========================================================
-*/
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const APP_VERSION = "1.7.0";
 
 const PORT =
   Number(process.env.PORT || 8080);
 
-const APP_VERSION =
-  "1.6.2";
+const DATA_CONCURRENCY = 8;
+const RETRIES = 3;
+const REQUEST_TIMEOUT_MS = 15000;
+const RETRY_DELAY_MS = 600;
 
-const __filename =
-  fileURLToPath(import.meta.url);
+const S0_RANGE = "1mo";
+const S0_INTERVAL = "15m";
 
-const APP_DIR =
-  path.dirname(__filename);
+const S1_RANGE = "1d";
+const S1_INTERVAL = "5m";
 
-const CWD =
+const MIN_S0_HISTORICAL_SESSIONS = 5;
+const MIN_S0_VALID_VOLUME_BARS = 20;
+const MIN_RVOL_BASELINE_SESSIONS = 5;
+const MIN_S1_COMPLETED_BARS = 4;
+
+const CACHE_DIR =
+  process.env.DATA_DIR ||
   process.cwd();
 
-const BATCH_SIZE =
-  20;
+const UNIVERSE_FILE =
+  path.join(
+    CACHE_DIR,
+    "universe_s0.txt"
+  );
 
-const CONCURRENCY =
-  4;
+const S0_CACHE_FILE =
+  path.join(
+    CACHE_DIR,
+    "s0_materialized.json"
+  );
 
-const RETRIES =
-  3;
-
-const REQUEST_TIMEOUT_MS =
-  15000;
-
-const RETRY_DELAY_MS =
-  600;
-
-const UNIVERSE_FILENAME =
-  "universe_s0.txt";
-
-const S0_CACHE_FILENAME =
-  "s0_materialized.json";
-
-const S1_CACHE_FILENAME =
-  "s1_materialized.json";
+const S1_CACHE_FILE =
+  path.join(
+    CACHE_DIR,
+    "s1_materialized.json"
+  );
 
 
-/*
-========================================================
- TOOL REGISTRY
-========================================================
-*/
-
-const TOOL_NAMES = [
-  "ping",
-  "get_status",
-  "diagnose_filesystem",
-  "get_universe",
-  "yahoo_ws_test",
-  "yahoo_spark_test",
-  "yahoo_s0_prepare",
-  "yahoo_s1_scan",
-  "yahoo_sf_scan",
-  "get_scan_state",
-  "yahoo_s0_s1_scan"
-];
-
-
-/*
-========================================================
- STATE
-========================================================
-*/
+/* =========================================================
+   GLOBAL STATE
+========================================================= */
 
 const scanState = {
-  ok: true,
   version: APP_VERSION,
-  stage: "IDLE",
+
   asof: null,
+
   elapsed_ms: 0,
-  symbols_requested: 0,
-  source: null,
+
+  running: false,
+
+  stage: null,
+
+  universe_requested: 0,
+
+  s0_count: 0,
+
+  s1_count: 0,
+
+  sf_count: 0,
+
   s0: [],
+
   s1: [],
-  lots: [],
-  errors: [],
-  universe_file: null,
-  started_at: null,
-  finished_at: null
+
+  sf: [],
+
+  winner: null,
+
+  yahoo_errors: 0,
+
+  last_error: null
 };
 
 
-/*
-========================================================
- CACHE
-========================================================
-*/
+/* =========================================================
+   UTILS
+========================================================= */
 
-let universeCache = null;
-let s0Cache = null;
-let s1Cache = null;
+function nowIso() {
+  return new Date().toISOString();
+}
 
-
-/*
-========================================================
- BASIC HELPERS
-========================================================
-*/
 
 function sleep(ms) {
   return new Promise(
@@ -143,389 +136,287 @@ function sleep(ms) {
 }
 
 
-function nowIso() {
-  return new Date().toISOString();
+function isFiniteNumber(value) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
 }
 
 
-function uniqueUppercase(list) {
-  return [
-    ...new Set(
-      list
-        .map(
-          x =>
-            String(x || "")
-              .trim()
-              .toUpperCase()
-        )
-        .filter(Boolean)
-    )
-  ];
+function clamp(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
+}
+
+
+function median(values) {
+
+  const arr =
+    values
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+
+  if (!arr.length) {
+    return null;
+  }
+
+  const middle =
+    Math.floor(arr.length / 2);
+
+  if (arr.length % 2) {
+    return arr[middle];
+  }
+
+  return (
+    (arr[middle - 1] +
+      arr[middle]) / 2
+  );
+}
+
+
+function average(values) {
+
+  const valid =
+    values.filter(Number.isFinite);
+
+  if (!valid.length) {
+    return null;
+  }
+
+  return (
+    valid.reduce(
+      (a, b) => a + b,
+      0
+    ) / valid.length
+  );
 }
 
 
 function chunk(array, size) {
-  const result = [];
+
+  const output = [];
 
   for (
     let i = 0;
     i < array.length;
     i += size
   ) {
-    result.push(
+    output.push(
       array.slice(i, i + size)
     );
   }
 
-  return result;
+  return output;
 }
 
 
-function isFiniteNumber(value) {
-  return Number.isFinite(
-    Number(value)
-  );
-}
+/* =========================================================
+   NEW YORK TIME
+========================================================= */
 
+function nyParts(ts) {
 
-/*
-========================================================
- FILESYSTEM
-========================================================
-*/
+  const date =
+    new Date(ts);
 
-function universeCandidates() {
-
-  const candidates = [
-    path.join(
-      APP_DIR,
-      UNIVERSE_FILENAME
-    ),
-
-    path.join(
-      CWD,
-      UNIVERSE_FILENAME
-    ),
-
-    path.join(
-      "/app",
-      UNIVERSE_FILENAME
-    ),
-
-    path.join(
-      APP_DIR,
-      "data",
-      UNIVERSE_FILENAME
-    ),
-
-    path.join(
-      CWD,
-      "data",
-      UNIVERSE_FILENAME
-    ),
-
-    path.join(
-      "/app/data",
-      UNIVERSE_FILENAME
+  if (
+    !Number.isFinite(
+      date.getTime()
     )
-  ];
-
-  return [
-    ...new Set(candidates)
-  ];
-}
-
-
-async function fileExists(filename) {
-
-  try {
-
-    await fs.access(
-      filename
-    );
-
-    return true;
-
-  } catch {
-
-    return false;
-  }
-}
-
-
-async function resolveUniverseFile() {
-
-  const candidates =
-    universeCandidates();
-
-  for (
-    const candidate of candidates
   ) {
-
-    if (
-      await fileExists(candidate)
-    ) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
-
-async function filesystemDiagnostic() {
-
-  const result = {
-
-    cwd:
-      CWD,
-
-    app_dir:
-      APP_DIR,
-
-    candidates:
-      universeCandidates(),
-
-    found:
-      null,
-
-    app_dir_files:
-      [],
-
-    cwd_files:
-      []
-  };
-
-  result.found =
-    await resolveUniverseFile();
-
-  try {
-
-    result.app_dir_files =
-      await fs.readdir(
-        APP_DIR
-      );
-
-  } catch (err) {
-
-    result.app_dir_files = [
-      `ERROR: ${err.message}`
-    ];
-  }
-
-  if (
-    CWD !== APP_DIR
-  ) {
-
-    try {
-
-      result.cwd_files =
-        await fs.readdir(
-          CWD
-        );
-
-    } catch (err) {
-
-      result.cwd_files = [
-        `ERROR: ${err.message}`
-      ];
-    }
-  }
-
-  return result;
-}
-
-
-/*
-========================================================
- UNIVERSE
-========================================================
-*/
-
-async function loadUniverse() {
-
-  if (
-    universeCache
-  ) {
-    return universeCache;
-  }
-
-  const filename =
-    await resolveUniverseFile();
-
-  if (!filename) {
-
-    const diagnostic =
-      await filesystemDiagnostic();
-
-    throw new Error(
-      "universe_s0.txt introuvable dans le filesystem Railway.\n" +
-      JSON.stringify(
-        diagnostic,
-        null,
-        2
-      )
-    );
-  }
-
-  const raw =
-    await fs.readFile(
-      filename,
-      "utf8"
-    );
-
-  const symbols =
-    uniqueUppercase(
-      raw
-        .split(/\r?\n/)
-        .map(
-          line =>
-            line.trim()
-        )
-        .filter(
-          line =>
-            line &&
-            !line.startsWith("#")
-        )
-        .map(
-          line =>
-            line.split(
-              /[\s,;]+/
-            )[0]
-        )
-    );
-
-  universeCache =
-    symbols;
-
-  scanState.universe_file =
-    filename;
-
-  return symbols;
-}
-
-
-/*
-========================================================
- CACHE FILES
-========================================================
-*/
-
-function cachePath(filename) {
-
-  return path.join(
-    APP_DIR,
-    filename
-  );
-}
-
-
-async function saveJson(
-  filename,
-  data
-) {
-
-  const filenamePath =
-    cachePath(
-      filename
-    );
-
-  await fs.writeFile(
-    filenamePath,
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-  return filenamePath;
-}
-
-
-async function readJsonIfExists(
-  filename
-) {
-
-  const filenamePath =
-    cachePath(
-      filename
-    );
-
-  try {
-
-    const raw =
-      await fs.readFile(
-        filenamePath,
-        "utf8"
-      );
-
-    return JSON.parse(
-      raw
-    );
-
-  } catch {
-
     return null;
   }
+
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone:
+          "America/New_York",
+
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+
+        hourCycle: "h23"
+      }
+    ).formatToParts(date);
+
+  const result = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      result[part.type] =
+        part.value;
+    }
+  }
+
+  return result;
 }
 
 
-async function restoreCaches() {
+function nyDateKey(ts) {
 
-  s0Cache =
-    await readJsonIfExists(
-      S0_CACHE_FILENAME
-    );
+  const p =
+    nyParts(ts);
 
-  s1Cache =
-    await readJsonIfExists(
-      S1_CACHE_FILENAME
-    );
-
-  if (
-    s0Cache?.s0
-  ) {
-
-    scanState.s0 =
-      s0Cache.s0;
-
-    scanState.source =
-      s0Cache.source ||
-      "Yahoo Spark";
-
-    scanState.universe_file =
-      s0Cache.universe_file ||
-      null;
+  if (!p) {
+    return null;
   }
 
-  if (
-    s1Cache?.s1
-  ) {
-
-    scanState.s1 =
-      s1Cache.s1;
-
-    scanState.lots =
-      s1Cache.lots ||
-      makeLots(
-        s1Cache.s1,
-        20
-      );
-  }
+  return (
+    `${p.year}-${p.month}-${p.day}`
+  );
 }
 
 
-/*
-========================================================
- HTTP FETCH
-========================================================
-*/
+function nyTimeKey(ts) {
+
+  const p =
+    nyParts(ts);
+
+  if (!p) {
+    return null;
+  }
+
+  const hour =
+    Number(p.hour);
+
+  const minute =
+    Number(p.minute);
+
+  if (
+    hour < 9 ||
+    (
+      hour === 9 &&
+      minute < 30
+    )
+  ) {
+    return null;
+  }
+
+  if (
+    hour > 16 ||
+    (
+      hour === 16 &&
+      minute > 0
+    )
+  ) {
+    return null;
+  }
+
+  return (
+    `${p.hour}:${p.minute}`
+  );
+}
+
+
+function nyMinutes(ts) {
+
+  const p =
+    nyParts(ts);
+
+  if (!p) {
+    return null;
+  }
+
+  return (
+    Number(p.hour) * 60 +
+    Number(p.minute)
+  );
+}
+
+
+function isRegularSessionBar(ts) {
+
+  const minutes =
+    nyMinutes(ts);
+
+  if (minutes === null) {
+    return false;
+  }
+
+  return (
+    minutes >= 570 &&
+    minutes <= 960
+  );
+}
+
+
+/* =========================================================
+   ORDINARY STOCK FILTER
+========================================================= */
+
+function isOrdinaryStock(
+  symbol,
+  item
+) {
+
+  if (
+    !symbol ||
+    typeof symbol !== "string"
+  ) {
+    return false;
+  }
+
+  const meta =
+    item?.response?.[0]?.meta ||
+    item?.meta ||
+    {};
+
+  const quoteType =
+    String(
+      meta.quoteType || ""
+    ).toUpperCase();
+
+  const exchange =
+    String(
+      meta.exchangeName || ""
+    ).toUpperCase();
+
+  const fullExchange =
+    String(
+      meta.fullExchangeName || ""
+    ).toUpperCase();
+
+  if (
+    quoteType &&
+    quoteType !== "EQUITY"
+  ) {
+    return false;
+  }
+
+  const nasdaq =
+    (
+      exchange === "NMS" ||
+      exchange === "NGM" ||
+      exchange === "NCM"
+    ) ||
+    fullExchange.includes(
+      "NASDAQ"
+    );
+
+  if (!nasdaq) {
+    return false;
+  }
+
+  return true;
+}
+
+
+/* =========================================================
+   YAHOO CHART
+========================================================= */
 
 async function fetchWithTimeout(
-  url,
-  timeoutMs = REQUEST_TIMEOUT_MS
+  url
 ) {
 
   const controller =
@@ -533,8 +424,9 @@ async function fetchWithTimeout(
 
   const timer =
     setTimeout(
-      () => controller.abort(),
-      timeoutMs
+      () =>
+        controller.abort(),
+      REQUEST_TIMEOUT_MS
     );
 
   try {
@@ -543,125 +435,117 @@ async function fetchWithTimeout(
       await fetch(
         url,
         {
-          method:
-            "GET",
+          signal:
+            controller.signal,
 
           headers: {
-
             "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-              "AppleWebKit/537.36 Chrome/140 Safari/537.36",
-
-            "Accept":
-              "application/json"
-          },
-
-          signal:
-            controller.signal
+              "Mozilla/5.0"
+          }
         }
       );
 
-    const text =
-      await response.text();
-
-    let data =
-      null;
-
-    try {
-
-      data =
-        JSON.parse(text);
-
-    } catch {
-
-      data =
-        null;
-    }
-
-    if (
-      !response.ok
-    ) {
-
-      const error =
-        new Error(
-          `Yahoo HTTP ${response.status}`
-        );
-
-      error.status =
-        response.status;
-
-      error.contentType =
-        response.headers.get(
-          "content-type"
-        );
-
-      error.bodyPreview =
-        text.slice(
-          0,
-          500
-        );
-
-      throw error;
-    }
-
-    if (!data) {
-
-      const error =
-        new Error(
-          "Yahoo returned non-JSON response"
-        );
-
-      error.status =
-        response.status;
-
-      error.contentType =
-        response.headers.get(
-          "content-type"
-        );
-
-      error.bodyPreview =
-        text.slice(
-          0,
-          500
-        );
-
-      throw error;
-    }
-
-    return data;
+    return response;
 
   } finally {
 
-    clearTimeout(
-      timer
-    );
+    clearTimeout(timer);
   }
 }
 
 
-/*
-========================================================
- YAHOO SPARK
-========================================================
-*/
-
-async function yahooSpark(
-  symbols,
-  range = "5d",
-  interval = "5m"
+async function yahooChart(
+  symbol,
+  range,
+  interval
 ) {
 
-  const batches =
-    chunk(
-      symbols,
-      BATCH_SIZE
+  const url =
+    "https://query1.finance.yahoo.com/v8/finance/chart/" +
+    encodeURIComponent(symbol) +
+    `?range=${encodeURIComponent(range)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    "&includePrePost=false" +
+    "&events=div%2Csplits";
+
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= RETRIES;
+    attempt++
+  ) {
+
+    try {
+
+      const response =
+        await fetchWithTimeout(
+          url
+        );
+
+      if (!response.ok) {
+
+        throw new Error(
+          `Yahoo HTTP ${response.status}`
+        );
+      }
+
+      const json =
+        await response.json();
+
+      if (
+        !json?.chart?.result?.length
+      ) {
+
+        throw new Error(
+          "Yahoo Chart result absent"
+        );
+      }
+
+      return {
+        symbol,
+
+        response:
+          json.chart.result
+      };
+
+    } catch (error) {
+
+      lastError =
+        error;
+
+      if (
+        attempt < RETRIES
+      ) {
+        await sleep(
+          RETRY_DELAY_MS *
+          attempt
+        );
+      }
+    }
+  }
+
+  throw lastError ||
+    new Error(
+      "Yahoo Chart failed"
     );
+}
 
-  const results =
-    {};
 
-  let cursor =
-    0;
+/* =========================================================
+   BATCH DATA LOADER
+========================================================= */
+
+async function yahooChartBatch(
+  symbols,
+  range,
+  interval
+) {
+
+  const results = {};
+  let errors = 0;
+
+  let cursor = 0;
 
   async function worker() {
 
@@ -671,245 +555,81 @@ async function yahooSpark(
         cursor++;
 
       if (
-        index >=
-        batches.length
+        index >= symbols.length
       ) {
         return;
       }
 
-      const batch =
-        batches[index];
+      const symbol =
+        symbols[index];
 
-      const url =
-        "https://query1.finance.yahoo.com/v7/finance/spark" +
-        `?symbols=${encodeURIComponent(
-          batch.join(",")
-        )}` +
-        `&range=${encodeURIComponent(
-          range
-        )}` +
-        `&interval=${encodeURIComponent(
-          interval
-        )}` +
-        "&indicators=quote,close" +
-        "&includeTimestamps=true" +
-        "&includePrePost=false";
+      try {
 
-      let data =
-        null;
-
-      let lastError =
-        null;
-
-      for (
-        let attempt = 1;
-        attempt <= RETRIES;
-        attempt++
-      ) {
-
-        try {
-
-          data =
-            await fetchWithTimeout(
-              url
-            );
-
-          break;
-
-        } catch (err) {
-
-          lastError =
-            err;
-
-          if (
-            attempt < RETRIES
-          ) {
-
-            await sleep(
-              RETRY_DELAY_MS *
-              attempt
-            );
-          }
-        }
-      }
-
-      if (!data) {
-
-        for (
-          const symbol of batch
-        ) {
-
-          results[symbol] = {
-
+        results[symbol] =
+          await yahooChart(
             symbol,
+            range,
+            interval
+          );
 
-            error:
-              lastError?.message ||
-              "Yahoo request failed",
+      } catch (error) {
 
-            http_status:
-              lastError?.status ||
-              null,
+        errors++;
 
-            content_type:
-              lastError?.contentType ||
-              null,
+        results[symbol] = {
+          symbol,
 
-            body_preview:
-              lastError?.bodyPreview ||
-              null
-          };
-        }
+          error:
+            String(
+              error?.message ||
+              error
+            ),
 
-        continue;
-      }
-
-      const spark =
-        data?.spark?.result;
-
-      if (
-        !Array.isArray(
-          spark
-        )
-      ) {
-
-        for (
-          const symbol of batch
-        ) {
-
-          results[symbol] = {
-
-            symbol,
-
-            error:
-              "Yahoo response missing spark.result",
-
-            response_keys:
-              Object.keys(
-                data || {}
-              ),
-
-            spark_keys:
-              data?.spark
-                ? Object.keys(
-                    data.spark
-                  )
-                : []
-          };
-        }
-
-        continue;
-      }
-
-      for (
-        const item of spark
-      ) {
-
-        if (
-          !item?.symbol
-        ) {
-          continue;
-        }
-
-        results[
-          item.symbol
-        ] =
-          item;
-      }
-
-      const returned =
-        new Set(
-          spark
-            .map(
-              item =>
-                item?.symbol
-            )
-            .filter(Boolean)
-        );
-
-      for (
-        const symbol of batch
-      ) {
-
-        if (
-          !returned.has(
-            symbol
-          )
-        ) {
-
-          results[symbol] = {
-
-            symbol,
-
-            error:
-              "Yahoo returned no result for symbol"
-          };
-        }
+          response: []
+        };
       }
     }
   }
 
   const workers =
-    [];
-
-  for (
-    let i = 0;
-    i <
-      Math.min(
-        CONCURRENCY,
-        batches.length
-      );
-    i++
-  ) {
-
-    workers.push(
-      worker()
+    Math.min(
+      DATA_CONCURRENCY,
+      symbols.length
     );
-  }
 
   await Promise.all(
-    workers
+    Array.from(
+      { length: workers },
+      () => worker()
+    )
   );
 
-  return results;
+  return {
+    results,
+    errors
+  };
 }
 
 
-/*
-========================================================
- BAR EXTRACTION — CORRECTED 1.6.2
-========================================================
+/* =========================================================
+   BAR EXTRACTION
+========================================================= */
 
- Yahoo Spark actuel :
-
- result[] = {
-   symbol: "AAPL",
-   response: {
-     timestamp: [...],
-     indicators: {
-       quote: [...]
-     }
-   }
- }
-
- Certaines réponses peuvent toutefois fournir directement
- timestamp/indicators. Les deux formats sont acceptés.
-========================================================
-*/
-
-function extractBars(item) {
-
-  if (!item) {
-    return [];
-  }
+function extractBars(
+  item
+) {
 
   const response =
-  Array.isArray(item.response)
-    ? item.response[0]
-    : (
-        item.response ||
-        item
-      );
+    Array.isArray(item?.response)
+      ? item.response[0]
+      : (
+          item?.response ||
+          item
+        );
+
+  if (!response) {
+    return [];
+  }
 
   const timestamps =
     Array.isArray(
@@ -919,7 +639,8 @@ function extractBars(item) {
       : [];
 
   const quote =
-    response.indicators
+    response
+      ?.indicators
       ?.quote?.[0] ||
     {};
 
@@ -930,11 +651,15 @@ function extractBars(item) {
       ? quote.close
       : (
           Array.isArray(
-            response.indicators
-              ?.close?.[0]?.close
+            response
+              ?.indicators
+              ?.close?.[0]
+              ?.close
           )
-            ? response.indicators
-                .close[0].close
+            ? response
+                .indicators
+                .close[0]
+                .close
             : []
         );
 
@@ -966,50 +691,55 @@ function extractBars(item) {
       ? quote.volume
       : [];
 
-  const bars =
-    [];
+  const count =
+    Math.max(
+      timestamps.length,
+      closes.length
+    );
+
+  const bars = [];
 
   for (
     let i = 0;
-    i < timestamps.length;
+    i < count;
     i++
   ) {
 
-    const ts =
+    const timestamp =
       Number(
         timestamps[i]
-      ) * 1000;
+      );
 
     if (
-      !Number.isFinite(ts)
+      !Number.isFinite(timestamp)
     ) {
       continue;
     }
 
-    const close =
-      Number(
-        closes[i]
-      );
+    const ts =
+      timestamp * 1000;
 
     const open =
-      Number(
-        opens[i]
-      );
+      Number(opens[i]);
 
     const high =
-      Number(
-        highs[i]
-      );
+      Number(highs[i]);
 
     const low =
-      Number(
-        lows[i]
-      );
+      Number(lows[i]);
+
+    const close =
+      Number(closes[i]);
 
     const volume =
-      Number(
-        volumes[i]
-      );
+      Number(volumes[i]);
+
+    if (
+      !Number.isFinite(close) ||
+      close <= 0
+    ) {
+      continue;
+    }
 
     bars.push({
 
@@ -1030,470 +760,66 @@ function extractBars(item) {
           ? low
           : null,
 
-      close:
-        Number.isFinite(close)
-          ? close
-          : null,
+      close,
 
       volume:
-        Number.isFinite(volume)
+        Number.isFinite(volume) &&
+        volume >= 0
           ? volume
-          : 0
+          : null
     });
   }
 
-  return bars;
-}
-
-
-/*
-========================================================
- YAHOO SPARK DIAGNOSTIC — CORRECTED
-========================================================
-*/
-
-async function runYahooSparkTest(
-  symbol = "AAPL",
-  range = "5d",
-  interval = "5m"
-) {
-
-  const started =
-    Date.now();
-
-  const requestedSymbol =
-    String(
-      symbol || "AAPL"
-    )
-      .trim()
-      .toUpperCase();
-
-  const url =
-    "https://query1.finance.yahoo.com/v7/finance/spark" +
-    `?symbols=${encodeURIComponent(
-      requestedSymbol
-    )}` +
-    `&range=${encodeURIComponent(
-      range
-    )}` +
-    `&interval=${encodeURIComponent(
-      interval
-    )}` +
-    "&indicators=quote,close" +
-    "&includeTimestamps=true" +
-    "&includePrePost=false";
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () => controller.abort(),
-      REQUEST_TIMEOUT_MS
-    );
-
-  try {
-
-    const response =
-      await fetch(
-        url,
-        {
-          method:
-            "GET",
-
-          headers: {
-
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-              "AppleWebKit/537.36 Chrome/140 Safari/537.36",
-
-            "Accept":
-              "application/json"
-          },
-
-          signal:
-            controller.signal
-        }
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      );
-
-    const body =
-      await response.text();
-
-    let parsed =
-      null;
-
-    let jsonError =
-      null;
-
-    try {
-
-      parsed =
-        JSON.parse(
-          body
-        );
-
-    } catch (err) {
-
-      jsonError =
-        err.message;
-    }
-
-    const spark =
-      parsed?.spark ||
-      null;
-
-    const result =
-      spark?.result;
-
-    const first =
-      Array.isArray(result) &&
-      result.length
-        ? result[0]
-        : null;
-
-    /*
-     CORRECTION :
-     Yahoo place les données dans first.response.
-    */
-
-    const firstResponse =
-      first?.response ||
-      first ||
-      null;
-
-    const bars =
-      first
-        ? extractBars(first)
-        : [];
-
-    const quote =
-      firstResponse
-        ?.indicators
-        ?.quote
-        ?.[0] ||
-      null;
-
-    return {
-
-      ok:
-        response.ok,
-
-      version:
-        APP_VERSION,
-
-      symbol:
-        requestedSymbol,
-
-      range,
-
-      interval,
-
-      elapsed_ms:
-        Date.now() -
-        started,
-
-      http_status:
-        response.status,
-
-      content_type:
-        contentType,
-
-      body_length:
-        body.length,
-
-      json_parse_ok:
-        Boolean(parsed),
-
-      json_error:
-        jsonError,
-
-      top_level_keys:
-        parsed
-          ? Object.keys(parsed)
-          : [],
-
-      spark_present:
-        Boolean(spark),
-
-      spark_keys:
-        spark
-          ? Object.keys(spark)
-          : [],
-
-      result_is_array:
-        Array.isArray(result),
-
-      result_count:
-        Array.isArray(result)
-          ? result.length
-          : 0,
-
-      first_result_keys:
-        first
-          ? Object.keys(first)
-          : [],
-
-      first_result_symbol:
-        first?.symbol ||
-        null,
-
-      response_present:
-        Boolean(
-          first?.response
-        ),
-
-      response_keys:
-        firstResponse
-          ? Object.keys(
-              firstResponse
-            )
-          : [],
-
-      timestamp_count:
-        Array.isArray(
-          firstResponse?.timestamp
-        )
-          ? firstResponse.timestamp.length
-          : 0,
-
-      extracted_bar_count:
-        bars.length,
-
-      quote_keys:
-        quote
-          ? Object.keys(quote)
-          : [],
-
-      error:
-        response.ok
-          ? null
-          : `Yahoo HTTP ${response.status}`,
-
-      body_preview:
-        response.ok
-          ? null
-          : body.slice(
-              0,
-              500
-            )
-    };
-
-  } catch (err) {
-
-    return {
-
-      ok:
-        false,
-
-      version:
-        APP_VERSION,
-
-      symbol:
-        requestedSymbol,
-
-      range,
-
-      interval,
-
-      elapsed_ms:
-        Date.now() -
-        started,
-
-      error:
-        err.message,
-
-      error_name:
-        err.name,
-
-      http_status:
-        err.status ||
-        null,
-
-      content_type:
-        err.contentType ||
-        null,
-
-      body_preview:
-        err.bodyPreview ||
-        null
-    };
-
-  } finally {
-
-    clearTimeout(
-      timer
-    );
-  }
-}
-
-
-/*
-========================================================
- NEW YORK TIME
-========================================================
-*/
-
-function nyDateKey(ts) {
-
-  return new Intl.DateTimeFormat(
-    "en-CA",
-    {
-      timeZone:
-        "America/New_York",
-
-      year:
-        "numeric",
-
-      month:
-        "2-digit",
-
-      day:
-        "2-digit"
-    }
-  ).format(
-    new Date(ts)
+  return bars.sort(
+    (a, b) =>
+      a.ts - b.ts
   );
 }
 
 
-function nyTimeParts(ts) {
-
-  const parts =
-    new Intl.DateTimeFormat(
-      "en-US",
-      {
-        timeZone:
-          "America/New_York",
-
-        hour:
-          "2-digit",
-
-        minute:
-          "2-digit",
-
-        hour12:
-          false
-      }
-    ).formatToParts(
-      new Date(ts)
-    );
-
-  const map =
-    {};
-
-  for (
-    const part of parts
-  ) {
-
-    if (
-      part.type !==
-      "literal"
-    ) {
-
-      map[part.type] =
-        part.value;
-    }
-  }
-
-  return {
-
-    hour:
-      Number(
-        map.hour
-      ),
-
-    minute:
-      Number(
-        map.minute
-      )
-  };
-}
-
-
-function nyTimeKey(ts) {
-
-  const {
-    hour,
-    minute
-  } =
-    nyTimeParts(ts);
-
-  if (
-    !Number.isFinite(hour) ||
-    !Number.isFinite(minute)
-  ) {
-    return null;
-  }
-
-  const slot =
-    Math.floor(
-      minute / 15
-    ) * 15;
-
-  return (
-    String(hour)
-      .padStart(2, "0") +
-    ":" +
-    String(slot)
-      .padStart(2, "0")
-  );
-}
-
-
-/*
-========================================================
- SESSION
-========================================================
-*/
+/* =========================================================
+   SESSION HELPERS
+========================================================= */
 
 function getSessionBars(
   bars
 ) {
 
-  const groups =
+  const sessions =
     new Map();
 
-  for (
-    const bar of bars
-  ) {
+  for (const bar of bars) {
 
-    const key =
+    if (
+      !isRegularSessionBar(
+        bar.ts
+      )
+    ) {
+      continue;
+    }
+
+    const date =
       nyDateKey(
         bar.ts
       );
 
-    if (
-      !groups.has(key)
-    ) {
+    if (!date) {
+      continue;
+    }
 
-      groups.set(
-        key,
+    if (!sessions.has(date)) {
+      sessions.set(
+        date,
         []
       );
     }
 
-    groups
-      .get(key)
+    sessions
+      .get(date)
       .push(bar);
   }
 
-  for (
-    const list of
-      groups.values()
-  ) {
-
-    list.sort(
-      (a, b) =>
-        a.ts - b.ts
-    );
-  }
-
-  return groups;
+  return sessions;
 }
 
 
@@ -1501,121 +827,49 @@ function getCurrentSessionBars(
   bars
 ) {
 
-  if (
-    !bars.length
-  ) {
-    return [];
-  }
-
   const sessions =
     getSessionBars(
       bars
     );
 
   const dates =
-    [
-      ...sessions.keys()
-    ].sort();
+    [...sessions.keys()]
+      .sort();
 
-  const currentDate =
-    dates[
-      dates.length - 1
-    ];
+  if (!dates.length) {
+    return [];
+  }
 
   return (
     sessions.get(
-      currentDate
+      dates[dates.length - 1]
     ) || []
   );
 }
 
 
-/*
-========================================================
- VWAP
-========================================================
-*/
-
-function calculateVWAP(
+function sessionPerformance(
   bars
 ) {
 
-  let pv =
-    0;
-
-  let volume =
-    0;
-
-  for (
-    const bar of bars
-  ) {
-
-    if (
-      !isFiniteNumber(
-        bar.close
-      ) ||
-      !isFiniteNumber(
-        bar.volume
-      )
-    ) {
-      continue;
-    }
-
-    const typical =
-      (
-        (bar.high ??
-          bar.close) +
-        (bar.low ??
-          bar.close) +
-        bar.close
-      ) / 3;
-
-    pv +=
-      typical *
-      bar.volume;
-
-    volume +=
-      bar.volume;
-  }
-
   if (
-    volume <= 0
-  ) {
-    return null;
-  }
-
-  return (
-    pv / volume
-  );
-}
-
-
-/*
-========================================================
- SESSION PERFORMANCE
-========================================================
-*/
-
-function sessionPerformance(
-  session
-) {
-
-  if (
-    !session?.length
+    !bars ||
+    bars.length < 2
   ) {
     return null;
   }
 
   const first =
-    session.find(
+    bars.find(
       b =>
         isFiniteNumber(
-          b.close
-        )
+          b.open
+        ) &&
+        b.open > 0
     );
 
   const last =
-    [...session]
+    [...bars]
       .reverse()
       .find(
         b =>
@@ -1624,136 +878,129 @@ function sessionPerformance(
           )
       );
 
-  if (
-    !first ||
-    !last ||
-    first.close <= 0
-  ) {
+  if (!first || !last) {
     return null;
   }
 
   return (
     (
       last.close /
-      first.close -
+      first.open -
       1
     ) * 100
   );
 }
 
 
-/*
-========================================================
- RVOL BASELINE
-========================================================
-*/
+/* =========================================================
+   RVOL BASELINE
+========================================================= */
 
-function buildRvol15mBaseline(completedSessions) {
-  const slotValues = new Map();
+function buildRvol15mBaseline(
+  completedSessions
+) {
 
-  for (const session of completedSessions) {
-    if (!Array.isArray(session)) continue;
+  const slotValues =
+    new Map();
 
-    const slotVolumes = new Map();
+  for (
+    const session of
+    completedSessions
+  ) {
 
-    for (const bar of session) {
-      if (!bar || !Number.isFinite(bar.ts)) continue;
+    const slotVolumes =
+      new Map();
 
-      const key = nyTimeKey(bar.ts);
-      if (!key) continue;
+    for (
+      const bar of session
+    ) {
 
-      const volume = Number(bar.volume);
+      const key =
+        nyTimeKey(
+          bar.ts
+        );
 
-      if (!Number.isFinite(volume) || volume <= 0) {
+      if (!key) {
         continue;
       }
 
-      const previous = slotVolumes.get(key) || 0;
-      slotVolumes.set(key, previous + volume);
+      const volume =
+        Number(
+          bar.volume
+        );
+
+      if (
+        !Number.isFinite(volume) ||
+        volume <= 0
+      ) {
+        continue;
+      }
+
+      slotVolumes.set(
+        key,
+        (
+          slotVolumes.get(key) ||
+          0
+        ) + volume
+      );
     }
 
-    for (const [key, volume] of slotVolumes) {
-      if (!Number.isFinite(volume) || volume <= 0) {
-        continue;
-      }
+    for (
+      const [
+        key,
+        volume
+      ] of slotVolumes
+    ) {
 
       if (!slotValues.has(key)) {
-        slotValues.set(key, []);
+        slotValues.set(
+          key,
+          []
+        );
       }
 
-      slotValues.get(key).push(volume);
+      slotValues
+        .get(key)
+        .push(volume);
     }
   }
 
   const baseline = {};
 
-  for (const [key, values] of slotValues) {
-    if (!Array.isArray(values) || values.length === 0) {
+  for (
+    const [
+      key,
+      values
+    ] of slotValues
+  ) {
+
+    const valid =
+      values.filter(
+        value =>
+          Number.isFinite(
+            value
+          ) &&
+          value > 0
+      );
+
+    if (
+      valid.length <
+      MIN_RVOL_BASELINE_SESSIONS
+    ) {
       continue;
     }
 
-    const valid = values.filter(
-      value => Number.isFinite(value) && value > 0
-    );
-
-    if (valid.length === 0) {
-      continue;
-    }
-
-    const sum = valid.reduce(
-      (total, value) => total + value,
-      0
-    );
-
-    const average = sum / valid.length;
-
-    if (Number.isFinite(average) && average > 0) {
-      baseline[key] = average;
-    }
+    baseline[key] =
+      median(valid);
   }
 
   return baseline;
 }
 
 
-/*
-========================================================
- ORDINARY STOCK FILTER
-========================================================
-*/
-
-function isOrdinaryStock(
-  symbol,
-  item
-) {
-
-  if (
-    !symbol
-  ) {
-    return false;
-  }
-
-  const upper =
-    symbol.toUpperCase();
-
-  if (
-    upper.endsWith("W") ||
-    upper.endsWith("WS") ||
-    upper.endsWith("WT") ||
-    upper.endsWith("U")
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-
-/*
-========================================================
- S0
-========================================================
-*/
+/* =========================================================
+   S0
+========================================================= */
 
 function calculateS0(
   symbol,
@@ -1775,7 +1022,8 @@ function calculateS0(
     );
 
   if (
-    bars.length < 20
+    bars.length <
+    MIN_S0_VALID_VOLUME_BARS
   ) {
     return null;
   }
@@ -1786,20 +1034,18 @@ function calculateS0(
     );
 
   const dates =
-    [
-      ...sessions.keys()
-    ].sort();
+    [...sessions.keys()]
+      .sort();
 
   if (
-    dates.length < 3
+    dates.length <
+    MIN_S0_HISTORICAL_SESSIONS + 1
   ) {
     return null;
   }
 
   const currentDate =
-    dates[
-      dates.length - 1
-    ];
+    dates[dates.length - 1];
 
   const currentSession =
     sessions.get(
@@ -1810,10 +1056,17 @@ function calculateS0(
     dates
       .slice(0, -1)
       .map(
-        d =>
-          sessions.get(d)
+        date =>
+          sessions.get(date)
       )
       .filter(Boolean);
+
+  if (
+    completedSessions.length <
+    MIN_S0_HISTORICAL_SESSIONS
+  ) {
+    return null;
+  }
 
   const previous =
     completedSessions[
@@ -1836,15 +1089,13 @@ function calculateS0(
     [...currentSession]
       .reverse()
       .find(
-        b =>
+        bar =>
           isFiniteNumber(
-            b.close
+            bar.close
           )
       );
 
-  if (
-    !currentLast
-  ) {
+  if (!currentLast) {
     return null;
   }
 
@@ -1854,28 +1105,39 @@ function calculateS0(
     );
 
   if (
-    !(
-      price > 0 &&
-      price < 5
-    )
+    !(price > 0 && price < 5)
   ) {
     return null;
   }
 
-  const j1 =
-    sessionPerformance(
-      previous
+  const validVolumeBars =
+    bars.filter(
+      bar =>
+        Number.isFinite(
+          bar.volume
+        ) &&
+        bar.volume > 0
     );
 
-  const j2 =
-    sessionPerformance(
-      previous2
-    );
+  if (
+    validVolumeBars.length <
+    MIN_S0_VALID_VOLUME_BARS
+  ) {
+    return null;
+  }
 
   const rvol15mBaseline =
     buildRvol15mBaseline(
       completedSessions
     );
+
+  if (
+    Object.keys(
+      rvol15mBaseline
+    ).length < 10
+  ) {
+    return null;
+  }
 
   return {
 
@@ -1884,16 +1146,23 @@ function calculateS0(
     price,
 
     j1_pct:
-      j1,
+      sessionPerformance(
+        previous
+      ),
 
     j2_pct:
-      j2,
+      sessionPerformance(
+        previous2
+      ),
 
     historical_sessions:
       completedSessions.length,
 
     current_session_bars:
       currentSession.length,
+
+    valid_volume_bars:
+      validVolumeBars.length,
 
     rvol15m_baseline:
       rvol15mBaseline,
@@ -1907,67 +1176,62 @@ function calculateS0(
 }
 
 
-/*
-========================================================
- CURRENT VOL15M
-========================================================
-*/
+/* =========================================================
+   S1 METRICS
+========================================================= */
 
-function calculateCurrentVol15M(
-  completed
+function calculateVWAP(
+  bars
 ) {
 
-  if (
-    completed.length < 3
-  ) {
+  let pv = 0;
+  let volume = 0;
 
-    return {
+  for (const bar of bars) {
 
-      vol15m:
-        null,
+    if (
+      !Number.isFinite(
+        bar.volume
+      ) ||
+      bar.volume <= 0
+    ) {
+      continue;
+    }
 
-      slot:
-        null
-    };
+    const typical =
+      (
+        (
+          Number.isFinite(
+            bar.high
+          )
+            ? bar.high
+            : bar.close
+        ) +
+        (
+          Number.isFinite(
+            bar.low
+          )
+            ? bar.low
+            : bar.close
+        ) +
+        bar.close
+      ) / 3;
+
+    pv +=
+      typical *
+      bar.volume;
+
+    volume +=
+      bar.volume;
   }
 
-  const last3 =
-    completed.slice(
-      -3
-    );
+  if (volume <= 0) {
+    return null;
+  }
 
-  const vol15m =
-    last3.reduce(
-      (
-        sum,
-        bar
-      ) =>
-        sum +
-        Number(
-          bar.volume || 0
-        ),
-      0
-    );
-
-  const slot =
-    nyTimeKey(
-      last3[0].ts
-    );
-
-  return {
-
-    vol15m,
-
-    slot
-  };
+  return pv / volume;
 }
 
-
-/*
-========================================================
- S1
-========================================================
-*/
 
 function calculateS1(
   symbol,
@@ -1975,9 +1239,7 @@ function calculateS1(
   s0Record
 ) {
 
-  if (
-    !s0Record
-  ) {
+  if (!s0Record) {
     return null;
   }
 
@@ -1991,12 +1253,6 @@ function calculateS1(
       bars
     );
 
-  if (
-    currentSession.length < 4
-  ) {
-    return null;
-  }
-
   const now =
     Date.now();
 
@@ -2004,171 +1260,190 @@ function calculateS1(
     currentSession.filter(
       bar =>
         bar.ts +
-        5 * 60 * 1000 <=
-        now + 1000
+        5 * 60 * 1000
+        <= now + 1000
     );
 
   if (
-    completed.length < 4
+    completed.length <
+    MIN_S1_COMPLETED_BARS
   ) {
     return null;
   }
 
-  const current =
-    completed[
-      completed.length - 1
-    ];
-
-  const previous =
-    completed[
-      completed.length - 2
-    ];
-
-  const previous2 =
-    completed[
-      completed.length - 3
-    ];
-
-  const price =
-    Number(
-      current.close
+  const valid =
+    completed.filter(
+      bar =>
+        Number.isFinite(
+          bar.volume
+        ) &&
+        bar.volume > 0
     );
 
   if (
-    !(
-      price > 0 &&
-      price < 5
-    )
+    valid.length <
+    MIN_S1_COMPLETED_BARS
   ) {
     return null;
   }
 
-  const {
-    vol15m,
-    slot:
-      rvolSlot
-  } =
-    calculateCurrentVol15M(
-      completed
+  const last =
+    valid[valid.length - 1];
+
+  const last5 =
+    valid.slice(-1);
+
+  const last10 =
+    valid.slice(-2);
+
+  const last15 =
+    valid.slice(-3);
+
+  const volume5 =
+    last5.reduce(
+      (sum, bar) =>
+        sum + bar.volume,
+      0
+    );
+
+  const volume10 =
+    last10.reduce(
+      (sum, bar) =>
+        sum + bar.volume,
+      0
+    );
+
+  const volume15 =
+    last15.reduce(
+      (sum, bar) =>
+        sum + bar.volume,
+      0
+    );
+
+  const slotKey =
+    nyTimeKey(
+      last.ts
     );
 
   const baseline =
     s0Record
       ?.rvol15m_baseline
-      ?.[rvolSlot];
+      ?.[
+        slotKey
+      ];
 
   const rvol15m =
-    (
-      Number.isFinite(
-        vol15m
-      ) &&
-      Number.isFinite(
-        Number(
-          baseline
-        )
-      ) &&
-      Number(
-        baseline
-      ) > 0
-    )
-      ? vol15m /
-        Number(
-          baseline
-        )
+    Number.isFinite(
+      baseline
+    ) &&
+    baseline > 0
+      ? volume15 / baseline
       : null;
 
-  const baselineVolumes =
-    completed
-      .slice(-4, -1)
-      .map(
-        b =>
-          Number(
-            b.volume || 0
-          )
-      )
-      .filter(
-        v =>
-          v > 0
-      );
-
-  const meanBaseline =
-    baselineVolumes.length
-      ? baselineVolumes.reduce(
-          (
-            a,
-            b
-          ) =>
-            a + b,
-          0
-        ) /
-        baselineVolumes.length
+  const previous5 =
+    valid.length >= 2
+      ? valid[
+          valid.length - 2
+        ].volume
       : null;
 
   const accel5m =
-    meanBaseline > 0
-      ? Number(
-          current.volume || 0
-        ) /
-        meanBaseline
+    Number.isFinite(
+      previous5
+    ) &&
+    previous5 > 0
+      ? (
+          (
+            last.volume /
+            previous5
+          ) - 1
+        ) * 100
       : null;
 
   const vwap =
     calculateVWAP(
-      completed
+      valid
     );
 
+  const price =
+    last.close;
+
   const priceVsVWAP =
+    Number.isFinite(
+      vwap
+    ) &&
     vwap > 0
       ? (
-          price /
-          vwap -
-          1
+          (
+            price /
+            vwap
+          ) - 1
         ) * 100
       : null;
-
-  const highs =
-    completed
-      .map(
-        b =>
-          Number(
-            b.high
-          )
-      )
-      .filter(
-        Number.isFinite
-      );
 
   const hod =
-    highs.length
-      ? Math.max(
-          ...highs
+    Math.max(
+      ...valid
+        .map(
+          bar =>
+            Number.isFinite(
+              bar.high
+            )
+              ? bar.high
+              : bar.close
         )
-      : null;
+    );
 
   const hodDistance =
+    Number.isFinite(
+      hod
+    ) &&
     hod > 0
       ? (
-          price /
-          hod -
-          1
+          (
+            price /
+            hod
+          ) - 1
         ) * 100
+      : null;
+
+  const previousClose =
+    valid.length >= 2
+      ? valid[
+          valid.length - 2
+        ].close
       : null;
 
   const change5m =
-    previous.close > 0
+    Number.isFinite(
+      previousClose
+    ) &&
+    previousClose > 0
       ? (
-          price /
-          previous.close -
-          1
+          (
+            price /
+            previousClose
+          ) - 1
         ) * 100
       : null;
 
+  const tenAgo =
+    valid.length >= 3
+      ? valid[
+          valid.length - 3
+        ].close
+      : null;
+
   const change10m =
-    previous2.close > 0
+    Number.isFinite(
+      tenAgo
+    ) &&
+    tenAgo > 0
       ? (
-          price /
-          previous2.close -
-          1
+          (
+            price /
+            tenAgo
+          ) - 1
         ) * 100
       : null;
 
@@ -2178,2027 +1453,1901 @@ function calculateS1(
 
     price,
 
-    vol15m,
+    ts:
+      last.ts,
+
+    session_date:
+      nyDateKey(
+        last.ts
+      ),
+
+    volume5m:
+      last.volume,
+
+    volume10m,
+
+    volume15m,
 
     rvol15m,
-
-    rvol15m_slot:
-      rvolSlot,
-
-    rvol15m_baseline:
-      Number.isFinite(
-        Number(
-          baseline
-        )
-      )
-        ? Number(
-            baseline
-          )
-        : null,
 
     accel5m,
 
     vwap,
 
-    priceVsVWAP,
+    price_vs_vwap_pct:
+      priceVsVWAP,
 
     hod,
 
-    hodDistance,
+    hod_distance_pct:
+      hodDistance,
 
-    change5m,
+    change5m_pct:
+      change5m,
 
-    change10m,
+    change10m_pct:
+      change10m,
 
     j1_pct:
       s0Record.j1_pct,
 
     j2_pct:
-      s0Record.j2_pct,
-
-    bars_completed:
-      completed.length,
-
-    asof:
-      new Date(
-        current.ts
-      ).toISOString()
+      s0Record.j2_pct
   };
 }
 
 
-/*
-========================================================
- RANKING
-========================================================
-*/
+/* =========================================================
+   RANKING
+========================================================= */
 
 function rankS1(
   records
 ) {
 
-  return [
-    ...records
-  ].sort(
-    (
-      a,
-      b
-    ) => {
+  return [...records]
+    .sort(
+      (a, b) => {
 
-      const rvA =
-        Number.isFinite(
-          a.rvol15m
-        )
-          ? a.rvol15m
-          : -Infinity;
+        const ar =
+          Number.isFinite(
+            a.rvol15m
+          )
+            ? a.rvol15m
+            : -Infinity;
 
-      const rvB =
-        Number.isFinite(
-          b.rvol15m
-        )
-          ? b.rvol15m
-          : -Infinity;
+        const br =
+          Number.isFinite(
+            b.rvol15m
+          )
+            ? b.rvol15m
+            : -Infinity;
 
-      if (
-        rvB !== rvA
-      ) {
-        return (
-          rvB -
-          rvA
-        );
+        if (br !== ar) {
+          return br - ar;
+        }
+
+        const aa =
+          Number.isFinite(
+            a.accel5m
+          )
+            ? a.accel5m
+            : -Infinity;
+
+        const ba =
+          Number.isFinite(
+            b.accel5m
+          )
+            ? b.accel5m
+            : -Infinity;
+
+        if (ba !== aa) {
+          return ba - aa;
+        }
+
+        const av =
+          Number.isFinite(
+            a.price_vs_vwap_pct
+          )
+            ? a.price_vs_vwap_pct
+            : -Infinity;
+
+        const bv =
+          Number.isFinite(
+            b.price_vs_vwap_pct
+          )
+            ? b.price_vs_vwap_pct
+            : -Infinity;
+
+        if (bv !== av) {
+          return bv - av;
+        }
+
+        const ah =
+          Number.isFinite(
+            a.hod_distance_pct
+          )
+            ? a.hod_distance_pct
+            : -Infinity;
+
+        const bh =
+          Number.isFinite(
+            b.hod_distance_pct
+          )
+            ? b.hod_distance_pct
+            : -Infinity;
+
+        return bh - ah;
       }
-
-      const acA =
-        Number.isFinite(
-          a.accel5m
-        )
-          ? a.accel5m
-          : -Infinity;
-
-      const acB =
-        Number.isFinite(
-          b.accel5m
-        )
-          ? b.accel5m
-          : -Infinity;
-
-      if (
-        acB !== acA
-      ) {
-        return (
-          acB -
-          acA
-        );
-      }
-
-      const vwA =
-        Number.isFinite(
-          a.priceVsVWAP
-        )
-          ? a.priceVsVWAP
-          : -Infinity;
-
-      const vwB =
-        Number.isFinite(
-          b.priceVsVWAP
-        )
-          ? b.priceVsVWAP
-          : -Infinity;
-
-      if (
-        vwB !== vwA
-      ) {
-        return (
-          vwB -
-          vwA
-        );
-      }
-
-      const hodA =
-        Number.isFinite(
-          a.hodDistance
-        )
-          ? a.hodDistance
-          : -Infinity;
-
-      const hodB =
-        Number.isFinite(
-          b.hodDistance
-        )
-          ? b.hodDistance
-          : -Infinity;
-
-      return (
-        hodB -
-        hodA
-      );
-    }
-  );
+    );
 }
 
 
-/*
-========================================================
- LOTS
-========================================================
-*/
+/* =========================================================
+   WINNER GATE
+========================================================= */
 
-function makeLots(
+function winnerGate(
   records,
-  size = 20
-) {
-
-  return chunk(
-    records,
-    size
-  ).map(
-    (
-      lot,
-      index
-    ) => ({
-
-      lot:
-        index + 1,
-
-      size:
-        lot.length,
-
-      symbols:
-        lot.map(
-          x =>
-            x.symbol
-        ),
-
-      records:
-        lot
-    })
-  );
-}
-
-
-/*
-========================================================
- WINNER GATE
-========================================================
-*/
-
-function passesWinnerGate(
-  record,
   options = {}
 ) {
-
-  if (
-    !record
-  ) {
-    return false;
-  }
 
   const minPriceVsVWAP =
     Number.isFinite(
       options.minPriceVsVWAP
     )
       ? options.minPriceVsVWAP
-      : null;
+      : -1;
 
   const minAccel5M =
     Number.isFinite(
       options.minAccel5M
     )
       ? options.minAccel5M
-      : null;
+      : 1;
 
   const minVol15M =
     Number.isFinite(
       options.minVol15M
     )
       ? options.minVol15M
-      : null;
+      : 0;
 
-  if (
-    minPriceVsVWAP !== null &&
-    (
-      !Number.isFinite(
-        record.priceVsVWAP
-      ) ||
-      record.priceVsVWAP <
-        minPriceVsVWAP
-    )
+  for (
+    const record of records
   ) {
-    return false;
-  }
 
-  if (
-    minAccel5M !== null &&
-    (
+    if (
+      !Number.isFinite(
+        record.price_vs_vwap_pct
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      record.price_vs_vwap_pct <
+      minPriceVsVWAP
+    ) {
+      continue;
+    }
+
+    if (
       !Number.isFinite(
         record.accel5m
       ) ||
       record.accel5m <
-        minAccel5M
-    )
-  ) {
-    return false;
-  }
+      minAccel5M
+    ) {
+      continue;
+    }
 
-  if (
-    minVol15M !== null &&
-    (
+    if (
       !Number.isFinite(
-        record.vol15m
+        record.volume15m
       ) ||
-      record.vol15m <
-        minVol15M
+      record.volume15m <
+      minVol15M
+    ) {
+      continue;
+    }
+
+    return record;
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   CACHE
+========================================================= */
+
+function writeJson(
+  file,
+  data
+) {
+
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+
+function readJson(
+  file
+) {
+
+  if (
+    !fs.existsSync(file)
+  ) {
+    return null;
+  }
+
+  try {
+
+    return JSON.parse(
+      fs.readFileSync(
+        file,
+        "utf8"
+      )
+    );
+
+  } catch {
+
+    return null;
+  }
+}
+
+
+function currentNYDate() {
+
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone:
+          "America/New_York",
+
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }
+    ).formatToParts(
+      new Date()
+    );
+
+  const obj = {};
+
+  for (const p of parts) {
+    if (p.type !== "literal") {
+      obj[p.type] =
+        p.value;
+    }
+  }
+
+  return (
+    `${obj.year}-${obj.month}-${obj.day}`
+  );
+}
+
+
+function validCache(
+  cache
+) {
+
+  return (
+    cache &&
+    cache.version ===
+      APP_VERSION &&
+    cache.market_date ===
+      currentNYDate()
+  );
+}
+
+
+/* =========================================================
+   UNIVERSE
+========================================================= */
+
+function readUniverse(
+  limit = null
+) {
+
+  if (
+    !fs.existsSync(
+      UNIVERSE_FILE
     )
   ) {
-    return false;
-  }
-
-  return true;
-}
-
-
-/*
-========================================================
- S0 PREPARE
-========================================================
-*/
-
-async function runS0Prepare(
-  symbols = null
-) {
-
-  const started =
-    Date.now();
-
-  scanState.stage =
-    "S0_PREPARE";
-
-  scanState.started_at =
-    nowIso();
-
-  scanState.errors =
-    [];
-
-  let list;
-
-  if (
-    symbols?.length
-  ) {
-
-    list =
-      uniqueUppercase(
-        symbols
-      );
-
-  } else {
-
-    list =
-      await loadUniverse();
-  }
-
-  scanState.symbols_requested =
-    list.length;
-
-  const yahooData =
-    await yahooSpark(
-      list,
-      "5d",
-      "5m"
-    );
-
-  const s0 =
-    [];
-
-  let yahooErrors =
-    0;
-
-  for (
-    const symbol of list
-  ) {
-
-    const item =
-      yahooData[
-        symbol
-      ];
-
-    if (
-      item?.error
-    ) {
-
-      yahooErrors++;
-
-      continue;
-    }
-
-    const record =
-      calculateS0(
-        symbol,
-        item
-      );
-
-    if (
-      record
-    ) {
-      s0.push(
-        record
-      );
-    }
-  }
-
-  if (
-    yahooErrors > 0
-  ) {
-
-    scanState.errors.push(
-      `Yahoo Spark: ${yahooErrors} symboles/batches sans données exploitables.`
-    );
-  }
-
-  s0Cache = {
-
-    version:
-      APP_VERSION,
-
-    created_at:
-      nowIso(),
-
-    source:
-      "Yahoo Spark",
-
-    universe_file:
-      scanState.universe_file,
-
-    yahoo_errors:
-      yahooErrors,
-
-    s0
-  };
-
-  const cacheFile =
-    await saveJson(
-      S0_CACHE_FILENAME,
-      s0Cache
-    );
-
-  scanState.s0 =
-    s0;
-
-  scanState.source =
-    "Yahoo Spark";
-
-  scanState.asof =
-    nowIso();
-
-  scanState.elapsed_ms =
-    Date.now() -
-    started;
-
-  scanState.stage =
-    "S0_READY";
-
-  scanState.finished_at =
-    nowIso();
-
-  return {
-
-    ok:
-      true,
-
-    stage:
-      "S0_READY",
-
-    version:
-      APP_VERSION,
-
-    elapsed_ms:
-      scanState.elapsed_ms,
-
-    universe_file:
-      scanState.universe_file,
-
-    universe_count:
-      list.length,
-
-    s0_count:
-      s0.length,
-
-    yahoo_errors:
-      yahooErrors,
-
-    cache_file:
-      cacheFile,
-
-    s0
-  };
-}
-
-
-/*
-========================================================
- S1 SCAN
-========================================================
-*/
-
-async function runS1Scan(
-  options = {}
-) {
-
-  const started =
-    Date.now();
-
-  scanState.stage =
-    "S1";
-
-  scanState.started_at =
-    nowIso();
-
-  scanState.errors =
-    [];
-
-  let s0 =
-    scanState.s0?.length
-      ? scanState.s0
-      : s0Cache?.s0 ||
-        [];
-
-  if (
-    !s0.length
-  ) {
-
     throw new Error(
-      "S0 non préparé. Exécute d'abord yahoo_s0_prepare."
+      `Missing ${UNIVERSE_FILE}`
     );
   }
 
-  if (
-    options.limit
-  ) {
-
-    s0 =
-      s0.slice(
-        0,
-        Number(
-          options.limit
-        )
-      );
-  }
-
-  const symbols =
-    s0.map(
-      x =>
-        x.symbol
+  const content =
+    fs.readFileSync(
+      UNIVERSE_FILE,
+      "utf8"
     );
 
-  const yahooData =
-    await yahooSpark(
-      symbols,
-      "1d",
-      "5m"
-    );
-
-  const s1 =
-    [];
-
-  for (
-    const s0Record of s0
-  ) {
-
-    const item =
-      yahooData[
-        s0Record.symbol
-      ];
-
-    if (
-      item?.error
-    ) {
-      continue;
-    }
-
-    const record =
-      calculateS1(
-        s0Record.symbol,
-        item,
-        s0Record
-      );
-
-    if (
-      record
-    ) {
-      s1.push(
-        record
-      );
-    }
-  }
-
-  const ranked =
-    rankS1(
-      s1
-    );
-
-  const limit =
-    Number(
-      options.s1_limit ||
-      100
-    );
-
-  const selected =
-    ranked.slice(
-      0,
-      limit
-    );
-
-  const lots =
-    makeLots(
-      selected,
-      20
-    );
-
-  s1Cache = {
-
-    version:
-      APP_VERSION,
-
-    created_at:
-      nowIso(),
-
-    source:
-      "Yahoo Spark",
-
-    s1:
-      selected,
-
-    lots
-  };
-
-  const cacheFile =
-    await saveJson(
-      S1_CACHE_FILENAME,
-      s1Cache
-    );
-
-  scanState.s1 =
-    selected;
-
-  scanState.lots =
-    lots;
-
-  scanState.asof =
-    nowIso();
-
-  scanState.elapsed_ms =
-    Date.now() -
-    started;
-
-  scanState.stage =
-    "S1_READY";
-
-  scanState.finished_at =
-    nowIso();
-
-  return {
-
-    ok:
-      true,
-
-    stage:
-      "S1_READY",
-
-    version:
-      APP_VERSION,
-
-    elapsed_ms:
-      scanState.elapsed_ms,
-
-    s0_count:
-      s0.length,
-
-    s1_count:
-      selected.length,
-
-    lots_count:
-      lots.length,
-
-    cache_file:
-      cacheFile,
-
-    s1:
-      selected,
-
-    lots:
-      lots.map(
-        lot => ({
-
-          lot:
-            lot.lot,
-
-          size:
-            lot.size,
-
-          symbols:
-            lot.symbols
-        })
+  let symbols =
+    content
+      .split(/\r?\n/)
+      .map(
+        line =>
+          line
+            .trim()
+            .toUpperCase()
       )
-  };
-}
-
-
-/*
-========================================================
- SF SCAN
-========================================================
-*/
-
-async function runSFScan(
-  options = {}
-) {
-
-  const started =
-    Date.now();
-
-  scanState.stage =
-    "SF";
-
-  const source =
-    s1Cache?.lots?.length
-      ? s1Cache.lots
-      : scanState.lots;
-
-  if (
-    !source?.length
-  ) {
-
-    throw new Error(
-      "Aucun lot S1 disponible. Exécute d'abord yahoo_s1_scan."
-    );
-  }
-
-  const startLot =
-    Math.max(
-      1,
-      Number(
-        options.start_lot ||
-        1
-      )
-    );
-
-  const maxLots =
-    Number(
-      options.max_lots ||
-      source.length
-    );
-
-  const checked =
-    [];
-
-  let winner =
-    null;
-
-  for (
-    const lot of source
+      .filter(Boolean)
       .filter(
-        x =>
-          x.lot >=
-          startLot
-      )
-      .slice(
-        0,
-        maxLots
-      )
+        symbol =>
+          /^[A-Z0-9.\-]+$/
+            .test(symbol)
+      );
+
+  symbols =
+    [...new Set(symbols)];
+
+  if (
+    Number.isInteger(limit) &&
+    limit > 0
   ) {
-
-    const symbols =
-      lot.symbols;
-
-    const yahooData =
-      await yahooSpark(
-        symbols,
-        "1d",
-        "5m"
+    symbols =
+      symbols.slice(
+        0,
+        limit
       );
-
-    const refreshed =
-      [];
-
-    for (
-      const oldRecord of
-        lot.records
-    ) {
-
-      const item =
-        yahooData[
-          oldRecord.symbol
-        ];
-
-      if (
-        !item ||
-        item.error
-      ) {
-        continue;
-      }
-
-      const current =
-        calculateS1(
-          oldRecord.symbol,
-          item,
-          oldRecord
-        );
-
-      if (
-        !current
-      ) {
-        continue;
-      }
-
-      refreshed.push(
-        current
-      );
-
-      if (
-        !winner &&
-        passesWinnerGate(
-          current,
-          options
-        )
-      ) {
-
-        winner =
-          current;
-      }
-    }
-
-    checked.push({
-
-      lot:
-        lot.lot,
-
-      checked_count:
-        refreshed.length,
-
-      records:
-        refreshed
-    });
-
-    if (
-      winner
-    ) {
-      break;
-    }
   }
 
-  scanState.stage =
-    winner
-      ? "WINNER_FOUND"
-      : "SF_COMPLETE";
-
-  scanState.elapsed_ms =
-    Date.now() -
-    started;
-
-  scanState.asof =
-    nowIso();
-
-  return {
-
-    ok:
-      true,
-
-    stage:
-      scanState.stage,
-
-    version:
-      APP_VERSION,
-
-    elapsed_ms:
-      scanState.elapsed_ms,
-
-    winner,
-
-    lots_checked:
-      checked.length,
-
-    checked
-  };
+  return symbols;
 }
 
 
-/*
-========================================================
- WEBSOCKET TEST
-========================================================
-*/
+/* =========================================================
+   SCAN S0
+========================================================= */
 
-async function runYahooWSTest() {
+async function runS0(
+  symbols
+) {
 
-  const ws =
-    new YahooWS();
+  if (scanState.running) {
+    throw new Error(
+      "Scan already running"
+    );
+  }
+
+  scanState.running = true;
+  scanState.stage = "S0";
+  scanState.asof = nowIso();
+  scanState.last_error = null;
 
   const started =
     Date.now();
 
   try {
 
-    await ws.connect();
+    const {
+      results,
+      errors
+    } =
+      await yahooChartBatch(
+        symbols,
+        S0_RANGE,
+        S0_INTERVAL
+      );
 
-    await ws.subscribe([
-      "AAPL",
-      "MSFT",
-      "NVDA"
-    ]);
+    const s0 = [];
 
-    await sleep(
-      10000
+    for (
+      const symbol of symbols
+    ) {
+
+      const item =
+        results[symbol];
+
+      const record =
+        calculateS0(
+          symbol,
+          item
+        );
+
+      if (record) {
+        s0.push(record);
+      }
+    }
+
+    scanState.universe_requested =
+      symbols.length;
+
+    scanState.s0 =
+      s0;
+
+    scanState.s0_count =
+      s0.length;
+
+    scanState.yahoo_errors =
+      errors;
+
+    scanState.elapsed_ms =
+      Date.now() - started;
+
+    const cache = {
+
+      version:
+        APP_VERSION,
+
+      market_date:
+        currentNYDate(),
+
+      source:
+        "Yahoo Chart OHLCV",
+
+      created_at:
+        nowIso(),
+
+      s0
+    };
+
+    writeJson(
+      S0_CACHE_FILE,
+      cache
     );
 
-    const status =
-      typeof ws.getStatus ===
-      "function"
-
-        ? ws.getStatus()
-
-        : {
-            connected:
-              true
-          };
-
     return {
+      ok: true,
 
-      ok:
-        true,
+      stage: "S0",
+
+      asof:
+        scanState.asof,
 
       elapsed_ms:
-        Date.now() -
-        started,
+        scanState.elapsed_ms,
 
-      ...status
+      universe_requested:
+        symbols.length,
+
+      s0_count:
+        s0.length,
+
+      s0,
+
+      yahoo_errors:
+        errors
     };
+
+  } catch (error) {
+
+    scanState.last_error =
+      String(
+        error?.message ||
+        error
+      );
+
+    throw error;
 
   } finally {
 
-    try {
-
-      await ws.close();
-
-    } catch {}
+    scanState.running = false;
+    scanState.stage = null;
   }
 }
 
 
-/*
-========================================================
- MCP TOOLS
-========================================================
-*/
+/* =========================================================
+   SCAN S1
+========================================================= */
 
-function registerTools(
-  server
+async function runS1(
+  symbols
 ) {
 
-  server.registerTool(
+  if (scanState.running) {
+    throw new Error(
+      "Scan already running"
+    );
+  }
+
+  const s0Cache =
+    readJson(
+      S0_CACHE_FILE
+    );
+
+  if (
+    !validCache(
+      s0Cache
+    )
+  ) {
+    throw new Error(
+      "Valid S0 cache required"
+    );
+  }
+
+  const s0Map =
+    new Map(
+      (
+        s0Cache.s0 ||
+        []
+      ).map(
+        record => [
+          record.symbol,
+          record
+        ]
+      )
+    );
+
+  const filtered =
+    symbols.filter(
+      symbol =>
+        s0Map.has(symbol)
+    );
+
+  scanState.running = true;
+  scanState.stage = "S1";
+  scanState.asof = nowIso();
+
+  const started =
+    Date.now();
+
+  try {
+
+    const {
+      results,
+      errors
+    } =
+      await yahooChartBatch(
+        filtered,
+        S1_RANGE,
+        S1_INTERVAL
+      );
+
+    const s1 = [];
+
+    for (
+      const symbol of filtered
+    ) {
+
+      const record =
+        calculateS1(
+          symbol,
+          results[symbol],
+          s0Map.get(symbol)
+        );
+
+      if (record) {
+        s1.push(record);
+      }
+    }
+
+    const ranked =
+      rankS1(
+        s1
+      );
+
+    scanState.s1 =
+      ranked;
+
+    scanState.s1_count =
+      ranked.length;
+
+    scanState.yahoo_errors =
+      errors;
+
+    scanState.elapsed_ms =
+      Date.now() - started;
+
+    writeJson(
+      S1_CACHE_FILE,
+      {
+        version:
+          APP_VERSION,
+
+        market_date:
+          currentNYDate(),
+
+        source:
+          "Yahoo Chart OHLCV",
+
+        created_at:
+          nowIso(),
+
+        s1:
+          ranked
+      }
+    );
+
+    return {
+
+      ok: true,
+
+      stage: "S1",
+
+      asof:
+        scanState.asof,
+
+      elapsed_ms:
+        scanState.elapsed_ms,
+
+      universe_requested:
+        filtered.length,
+
+      s1_count:
+        ranked.length,
+
+      s1:
+        ranked,
+
+      yahoo_errors:
+        errors
+    };
+
+  } catch (error) {
+
+    scanState.last_error =
+      String(
+        error?.message ||
+        error
+      );
+
+    throw error;
+
+  } finally {
+
+    scanState.running = false;
+    scanState.stage = null;
+  }
+}
+
+
+/* =========================================================
+   SF
+========================================================= */
+
+async function runSF(
+  symbols = null,
+  options = {}
+) {
+
+  const cache =
+    readJson(
+      S1_CACHE_FILE
+    );
+
+  if (
+    !validCache(
+      cache
+    )
+  ) {
+    throw new Error(
+      "Valid S1 cache required"
+    );
+  }
+
+  let records =
+    cache.s1 || [];
+
+  if (
+    Array.isArray(symbols) &&
+    symbols.length
+  ) {
+
+    const wanted =
+      new Set(
+        symbols.map(
+          s =>
+            String(s)
+              .toUpperCase()
+        )
+      );
+
+    records =
+      records.filter(
+        r =>
+          wanted.has(
+            r.symbol
+          )
+      );
+  }
+
+  const ranked =
+    rankS1(
+      records
+    );
+
+  const winner =
+    winnerGate(
+      ranked,
+      options
+    );
+
+  scanState.sf =
+    ranked;
+
+  scanState.sf_count =
+    ranked.length;
+
+  scanState.winner =
+    winner;
+
+  scanState.stage =
+    "SF";
+
+  scanState.asof =
+    nowIso();
+
+  return {
+
+    ok: true,
+
+    stage: "SF",
+
+    asof:
+      scanState.asof,
+
+    sf_count:
+      ranked.length,
+
+    sf:
+      ranked,
+
+    winner
+  };
+}
+
+
+/* =========================================================
+   S0 + S1
+========================================================= */
+
+async function runS0S1(
+  symbols
+) {
+
+  const s0Result =
+    await runS0(
+      symbols
+    );
+
+  const s0Symbols =
+    s0Result.s0
+      .map(
+        r =>
+          r.symbol
+      );
+
+  if (!s0Symbols.length) {
+
+    return {
+
+      ok: true,
+
+      stage: "S0_S1",
+
+      asof:
+        nowIso(),
+
+      s0_count: 0,
+
+      s1_count: 0,
+
+      s0:
+        [],
+
+      s1:
+        []
+    };
+  }
+
+  const s1Result =
+    await runS1(
+      s0Symbols
+    );
+
+  return {
+
+    ok: true,
+
+    stage: "S0_S1",
+
+    asof:
+      nowIso(),
+
+    elapsed_ms:
+      s0Result.elapsed_ms +
+      s1Result.elapsed_ms,
+
+    universe_requested:
+      symbols.length,
+
+    s0_count:
+      s0Result.s0_count,
+
+    s1_count:
+      s1Result.s1_count,
+
+    s0:
+      s0Result.s0,
+
+    s1:
+      s1Result.s1,
+
+    yahoo_errors:
+      (
+        s0Result.yahoo_errors ||
+        0
+      ) +
+      (
+        s1Result.yahoo_errors ||
+        0
+      )
+  };
+}
+
+
+/* =========================================================
+   MCP SERVER
+========================================================= */
+
+function createMcpServer() {
+
+  const server =
+    new McpServer(
+      {
+        name:
+          "yahoo-scan-mcp",
+
+        version:
+          APP_VERSION
+      }
+    );
+
+
+  /* -------------------------------------------------------
+     ping
+  ------------------------------------------------------- */
+
+  server.tool(
     "ping",
 
-    {
-      description:
-        "Health check du Yahoo Scan MCP.",
-
-      inputSchema:
-        z.object({})
-    },
+    {},
 
     async () => ({
-
-      content: [{
-
-        type:
-          "text",
-
-        text:
-          JSON.stringify({
-
-            ok:
-              true,
-
-            service:
-              "yahoo-scan-mcp",
-
-            version:
-              APP_VERSION,
-
-            timestamp:
-              nowIso()
-          })
-      }]
-    })
-  );
-
-
-  server.registerTool(
-    "get_status",
-
-    {
-      description:
-        "Retourne l'état du MCP et du scanner.",
-
-      inputSchema:
-        z.object({})
-    },
-
-    async () => ({
-
-      content: [{
-
-        type:
-          "text",
-
-        text:
-          JSON.stringify({
-
-            ok:
-              true,
-
-            version:
-              APP_VERSION,
-
-            stage:
-              scanState.stage,
-
-            asof:
-              scanState.asof,
-
-            elapsed_ms:
-              scanState.elapsed_ms,
-
-            symbols_requested:
-              scanState.symbols_requested,
-
-            s0_count:
-              scanState.s0?.length ||
-              0,
-
-            s1_count:
-              scanState.s1?.length ||
-              0,
-
-            lots_count:
-              scanState.lots?.length ||
-              0,
-
-            universe_file:
-              scanState.universe_file,
-
-            tool_count:
-              TOOL_NAMES.length,
-
-            registered_tools:
-              TOOL_NAMES,
-
-            transport:
-              "StreamableHTTP stateless",
-
-            errors:
-              scanState.errors
-          })
-      }]
-    })
-  );
-
-
-  server.registerTool(
-    "diagnose_filesystem",
-
-    {
-      description:
-        "Diagnostic du filesystem Railway.",
-
-      inputSchema:
-        z.object({})
-    },
-
-    async () => {
-
-      const diagnostic =
-        await filesystemDiagnostic();
-
-      return {
-
-        content: [{
-
-          type:
-            "text",
+      content: [
+        {
+          type: "text",
 
           text:
             JSON.stringify(
               {
-                ok:
-                  true,
+                ok: true,
+
+                pong: true,
 
                 version:
                   APP_VERSION,
 
-                ...diagnostic
-              },
-              null,
-              2
+                time:
+                  nowIso()
+              }
             )
-        }]
+        }
+      ]
+    })
+  );
+
+
+  /* -------------------------------------------------------
+     get_status
+  ------------------------------------------------------- */
+
+  server.tool(
+    "get_status",
+
+    {},
+
+    async () => ({
+      content: [
+        {
+          type: "text",
+
+          text:
+            JSON.stringify(
+              {
+                ok: true,
+
+                version:
+                  APP_VERSION,
+
+                state:
+                  scanState
+              }
+            )
+        }
+      ]
+    })
+  );
+
+
+  /* -------------------------------------------------------
+     diagnose_filesystem
+  ------------------------------------------------------- */
+
+  server.tool(
+    "diagnose_filesystem",
+
+    {},
+
+    async () => {
+
+      const files = [
+
+        UNIVERSE_FILE,
+
+        S0_CACHE_FILE,
+
+        S1_CACHE_FILE
+      ];
+
+      const output =
+        files.map(
+          file => ({
+
+            file,
+
+            exists:
+              fs.existsSync(
+                file
+              ),
+
+            size:
+              fs.existsSync(
+                file
+              )
+                ? fs.statSync(
+                    file
+                  ).size
+                : 0
+          })
+        );
+
+      return {
+        content: [
+          {
+            type: "text",
+
+            text:
+              JSON.stringify(
+                {
+                  ok: true,
+
+                  cwd:
+                    process.cwd(),
+
+                  files:
+                    output
+                },
+                null,
+                2
+              )
+          }
+        ]
       };
     }
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     get_universe
+  ------------------------------------------------------- */
+
+  server.tool(
     "get_universe",
 
     {
-      description:
-        "Charge et retourne universe_s0.txt.",
-
-      inputSchema:
-        z.object({})
+      limit:
+        z.number()
+          .int()
+          .positive()
+          .optional()
     },
 
-    async () => {
+    async ({
+      limit
+    }) => {
 
-      try {
+      const symbols =
+        readUniverse(
+          limit
+        );
 
-        const universe =
-          await loadUniverse();
+      return {
 
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  true,
-
-                count:
-                  universe.length,
-
-                file:
-                  scanState.universe_file,
-
-                symbols:
-                  universe
-              })
-          }]
-        };
-
-      } catch (err) {
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  false,
-
-                error:
-                  err.message
-              })
-          }]
-        };
-      }
-    }
-  );
-
-
-  server.registerTool(
-    "yahoo_ws_test",
-
-    {
-      description:
-        "Teste la connexion Yahoo WebSocket.",
-
-      inputSchema:
-        z.object({})
-    },
-
-    async () => {
-
-      try {
-
-        const result =
-          await runYahooWSTest();
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
+        content: [
+          {
+            type: "text",
 
             text:
               JSON.stringify(
-                result
+                {
+                  ok: true,
+
+                  count:
+                    symbols.length,
+
+                  symbols
+                }
               )
-          }]
-        };
-
-      } catch (err) {
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  false,
-
-                error:
-                  err.message
-              })
-          }]
-        };
-      }
+          }
+        ]
+      };
     }
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     yahoo_spark_test
+     NOTE:
+     name preserved for compatibility.
+     Internally uses Yahoo Chart OHLCV.
+  ------------------------------------------------------- */
+
+  server.tool(
     "yahoo_spark_test",
 
     {
-      description:
-        "Diagnostic direct de Yahoo Spark depuis Railway.",
+      symbol:
+        z.string(),
 
-      inputSchema:
-        z.object({
+      range:
+        z.string()
+          .optional(),
 
-          symbol:
-            z.string()
-              .optional(),
-
-          range:
-            z.string()
-              .optional(),
-
-          interval:
-            z.string()
-              .optional()
-        })
+      interval:
+        z.string()
+          .optional()
     },
 
     async ({
       symbol,
-      range,
-      interval
+      range = "5d",
+      interval = "5m"
     }) => {
+
+      const started =
+        Date.now();
 
       try {
 
         const result =
-          await runYahooSparkTest(
-            symbol ||
-              "AAPL",
+          await yahooChart(
+            symbol
+              .trim()
+              .toUpperCase(),
 
-            range ||
-              "5d",
+            range,
 
-            interval ||
-              "5m"
+            interval
+          );
+
+        const bars =
+          extractBars(
+            result
+          );
+
+        const raw =
+          result
+            ?.response?.[0] ||
+          {};
+
+        const quote =
+          raw
+            ?.indicators
+            ?.quote?.[0] ||
+          {};
+
+        const quoteKeys =
+          Object.keys(
+            quote
+          );
+
+        const validVolume =
+          bars.filter(
+            bar =>
+              Number.isFinite(
+                bar.volume
+              ) &&
+              bar.volume > 0
           );
 
         return {
 
-          content: [{
+          content: [
+            {
+              type: "text",
 
-            type:
-              "text",
+              text:
+                JSON.stringify(
+                  {
 
-            text:
-              JSON.stringify(
-                result,
-                null,
-                2
-              )
-          }]
+                    ok: true,
+
+                    source:
+                      "Yahoo Chart OHLCV",
+
+                    symbol:
+                      symbol
+                        .trim()
+                        .toUpperCase(),
+
+                    range,
+
+                    interval,
+
+                    elapsed_ms:
+                      Date.now() -
+                      started,
+
+                    result_count:
+                      Array.isArray(
+                        result.response
+                      )
+                        ? result
+                            .response
+                            .length
+                        : 0,
+
+                    response_keys:
+                      Object.keys(
+                        raw
+                      ),
+
+                    quote_keys:
+                      quoteKeys,
+
+                    timestamp_count:
+                      Array.isArray(
+                        raw.timestamp
+                      )
+                        ? raw
+                            .timestamp
+                            .length
+                        : 0,
+
+                    extracted_bar_count:
+                      bars.length,
+
+                    valid_volume_count:
+                      validVolume.length,
+
+                    sample:
+                      bars.slice(
+                        -5
+                      ),
+
+                    yahoo_errors: 0
+                  },
+
+                  null,
+
+                  2
+                )
+            }
+          ]
         };
 
-      } catch (err) {
+      } catch (error) {
 
         return {
 
-          content: [{
+          content: [
+            {
+              type: "text",
 
-            type:
-              "text",
+              text:
+                JSON.stringify(
+                  {
 
-            text:
-              JSON.stringify({
+                    ok: false,
 
-                ok:
-                  false,
+                    source:
+                      "Yahoo Chart OHLCV",
 
-                error:
-                  err.message
-              })
-          }]
+                    symbol,
+
+                    error:
+                      String(
+                        error?.message ||
+                        error
+                      ),
+
+                    elapsed_ms:
+                      Date.now() -
+                      started
+                  },
+
+                  null,
+
+                  2
+                )
+            }
+          ]
         };
       }
     }
   );
 
 
-  server.registerTool(
-    "yahoo_s0_prepare",
+  /* -------------------------------------------------------
+     yahoo_ws_test
+  ------------------------------------------------------- */
+
+  server.tool(
+    "yahoo_ws_test",
 
     {
-      description:
-        "Prépare l'univers S0 et matérialise les données historiques.",
-
-      inputSchema:
-        z.object({
-
-          symbols:
-            z.array(
-              z.string()
-            )
-            .optional()
-        })
+      symbols:
+        z.array(
+          z.string()
+        )
     },
 
     async ({
       symbols
     }) => {
 
-      try {
-
-        const result =
-          await runS0Prepare(
-            symbols
-          );
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify(
-                result
-              )
-          }]
-        };
-
-      } catch (err) {
-
-        scanState.stage =
-          "S0_ERROR";
-
-        scanState.errors.push(
-          err.message
+      const normalized =
+        symbols.map(
+          s =>
+            String(s)
+              .trim()
+              .toUpperCase()
         );
 
+      try {
+
+        const ws =
+          new YahooWS();
+
+        if (
+          typeof ws.connect ===
+          "function"
+        ) {
+          await ws.connect();
+        }
+
+        if (
+          typeof ws.subscribe ===
+          "function"
+        ) {
+          await ws.subscribe(
+            normalized
+          );
+        }
+
+        let status = null;
+
+        if (
+          typeof ws.getStatus ===
+          "function"
+        ) {
+          status =
+            await ws.getStatus();
+        }
+
+        if (
+          typeof ws.close ===
+          "function"
+        ) {
+          await ws.close();
+        }
+
         return {
 
-          content: [{
+          content: [
+            {
+              type: "text",
 
-            type:
-              "text",
+              text:
+                JSON.stringify(
+                  {
 
-            text:
-              JSON.stringify({
+                    ok: true,
 
-                ok:
-                  false,
+                    symbols:
+                      normalized,
 
-                stage:
-                  "S0_ERROR",
+                    status
+                  },
 
-                version:
-                  APP_VERSION,
+                  null,
 
-                error:
-                  err.message
-              })
-          }]
+                  2
+                )
+            }
+          ]
+        };
+
+      } catch (error) {
+
+        return {
+
+          content: [
+            {
+              type: "text",
+
+              text:
+                JSON.stringify(
+                  {
+
+                    ok: false,
+
+                    symbols:
+                      normalized,
+
+                    error:
+                      String(
+                        error?.message ||
+                        error
+                      )
+                  },
+
+                  null,
+
+                  2
+                )
+            }
+          ]
         };
       }
     }
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     yahoo_s0_prepare
+  ------------------------------------------------------- */
+
+  server.tool(
+    "yahoo_s0_prepare",
+
+    {
+      symbols:
+        z.array(
+          z.string()
+        ).optional(),
+
+      limit:
+        z.number()
+          .int()
+          .positive()
+          .optional()
+    },
+
+    async ({
+      symbols,
+      limit
+    }) => {
+
+      const universe =
+        Array.isArray(symbols)
+          ? symbols
+              .map(
+                s =>
+                  String(s)
+                    .trim()
+                    .toUpperCase()
+              )
+              .filter(Boolean)
+          : readUniverse(
+              limit
+            );
+
+      return {
+
+        content: [
+          {
+            type: "text",
+
+            text:
+              JSON.stringify(
+                await runS0(
+                  universe
+                ),
+
+                null,
+
+                2
+              )
+          }
+        ]
+      };
+    }
+  );
+
+
+  /* -------------------------------------------------------
+     yahoo_s1_scan
+  ------------------------------------------------------- */
+
+  server.tool(
     "yahoo_s1_scan",
 
     {
-      description:
-        "Exécute S1 sur l'univers S0 matérialisé.",
+      symbols:
+        z.array(
+          z.string()
+        ).optional(),
 
-      inputSchema:
-        z.object({
-
-          limit:
-            z.number()
-              .optional(),
-
-          s1_limit:
-            z.number()
-              .optional()
-        })
+      limit:
+        z.number()
+          .int()
+          .positive()
+          .optional()
     },
 
     async ({
-      limit,
-      s1_limit
+      symbols,
+      limit
     }) => {
 
-      try {
+      let universe;
 
-        const result =
-          await runS1Scan({
+      if (
+        Array.isArray(symbols)
+      ) {
 
-            limit,
+        universe =
+          symbols
+            .map(
+              s =>
+                String(s)
+                  .trim()
+                  .toUpperCase()
+            )
+            .filter(Boolean);
 
-            s1_limit
-          });
+      } else {
 
-        return {
+        const s0Cache =
+          readJson(
+            S0_CACHE_FILE
+          );
 
-          content: [{
+        if (
+          !validCache(
+            s0Cache
+          )
+        ) {
+          throw new Error(
+            "Valid S0 cache required"
+          );
+        }
 
-            type:
-              "text",
+        universe =
+          s0Cache.s0
+            .map(
+              r =>
+                r.symbol
+            );
+
+        if (
+          Number.isInteger(limit) &&
+          limit > 0
+        ) {
+          universe =
+            universe.slice(
+              0,
+              limit
+            );
+        }
+      }
+
+      return {
+
+        content: [
+          {
+            type: "text",
 
             text:
               JSON.stringify(
-                result
+                await runS1(
+                  universe
+                ),
+
+                null,
+
+                2
               )
-          }]
-        };
-
-      } catch (err) {
-
-        scanState.stage =
-          "S1_ERROR";
-
-        scanState.errors.push(
-          err.message
-        );
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  false,
-
-                stage:
-                  "S1_ERROR",
-
-                version:
-                  APP_VERSION,
-
-                error:
-                  err.message
-              })
-          }]
-        };
-      }
+          }
+        ]
+      };
     }
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     yahoo_sf_scan
+  ------------------------------------------------------- */
+
+  server.tool(
     "yahoo_sf_scan",
 
     {
-      description:
-        "Rafraîchit les lots S1 et s'arrête au premier Winner Gate.",
+      symbols:
+        z.array(
+          z.string()
+        ).optional(),
 
-      inputSchema:
-        z.object({
+      minPriceVsVWAP:
+        z.number()
+          .optional(),
 
-          start_lot:
-            z.number()
-              .optional(),
+      minAccel5M:
+        z.number()
+          .optional(),
 
-          max_lots:
-            z.number()
-              .optional(),
-
-          minPriceVsVWAP:
-            z.number()
-              .optional(),
-
-          minAccel5M:
-            z.number()
-              .optional(),
-
-          minVol15M:
-            z.number()
-              .optional()
-        })
+      minVol15M:
+        z.number()
+          .optional()
     },
 
     async ({
-      start_lot,
-      max_lots,
+      symbols,
+
       minPriceVsVWAP,
+
       minAccel5M,
+
       minVol15M
     }) => {
 
-      try {
+      const result =
+        await runSF(
+          symbols,
 
-        const result =
-          await runSFScan({
-
-            start_lot,
-
-            max_lots,
-
+          {
             minPriceVsVWAP,
 
             minAccel5M,
 
             minVol15M
-          });
+          }
+        );
 
-        return {
+      return {
 
-          content: [{
-
-            type:
-              "text",
+        content: [
+          {
+            type: "text",
 
             text:
               JSON.stringify(
-                result
+                result,
+
+                null,
+
+                2
               )
-          }]
-        };
-
-      } catch (err) {
-
-        scanState.stage =
-          "SF_ERROR";
-
-        scanState.errors.push(
-          err.message
-        );
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  false,
-
-                stage:
-                  "SF_ERROR",
-
-                version:
-                  APP_VERSION,
-
-                error:
-                  err.message
-              })
-          }]
-        };
-      }
+          }
+        ]
+      };
     }
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     get_scan_state
+  ------------------------------------------------------- */
+
+  server.tool(
     "get_scan_state",
 
-    {
-      description:
-        "Retourne l'état complet du scan.",
-
-      inputSchema:
-        z.object({})
-    },
+    {},
 
     async () => ({
 
-      content: [{
+      content: [
+        {
+          type: "text",
 
-        type:
-          "text",
+          text:
+            JSON.stringify(
+              {
+                ok: true,
 
-        text:
-          JSON.stringify(
-            scanState,
-            null,
-            2
-          )
-      }]
+                state:
+                  scanState
+              },
+
+              null,
+
+              2
+            )
+        }
+      ]
+
     })
   );
 
 
-  server.registerTool(
+  /* -------------------------------------------------------
+     yahoo_s0_s1_scan
+  ------------------------------------------------------- */
+
+  server.tool(
     "yahoo_s0_s1_scan",
 
     {
-      description:
-        "Compatibilité : exécute S0 puis S1.",
+      symbols:
+        z.array(
+          z.string()
+        ).optional(),
 
-      inputSchema:
-        z.object({
-
-          symbols:
-            z.array(
-              z.string()
-            )
-            .optional(),
-
-          s1_limit:
-            z.number()
-              .optional()
-        })
+      limit:
+        z.number()
+          .int()
+          .positive()
+          .optional()
     },
 
     async ({
       symbols,
-      s1_limit
+      limit
     }) => {
 
-      try {
+      const universe =
+        Array.isArray(symbols)
+          ? symbols
+              .map(
+                s =>
+                  String(s)
+                    .trim()
+                    .toUpperCase()
+              )
+              .filter(Boolean)
+          : readUniverse(
+              limit
+            );
 
-        const s0 =
-          await runS0Prepare(
-            symbols
-          );
+      return {
 
-        const s1 =
-          await runS1Scan({
-            s1_limit
-          });
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
-
-            text:
-              JSON.stringify({
-
-                ok:
-                  true,
-
-                stage:
-                  "S0_S1",
-
-                s0,
-
-                s1
-              })
-          }]
-        };
-
-      } catch (err) {
-
-        return {
-
-          content: [{
-
-            type:
-              "text",
+        content: [
+          {
+            type: "text",
 
             text:
-              JSON.stringify({
+              JSON.stringify(
+                await runS0S1(
+                  universe
+                ),
 
-                ok:
-                  false,
+                null,
 
-                stage:
-                  "S0_S1_ERROR",
-
-                error:
-                  err.message
-              })
-          }]
-        };
-      }
+                2
+              )
+          }
+        ]
+      };
     }
   );
-}
 
-
-/*
-========================================================
- MCP SERVER FACTORY
-========================================================
-*/
-
-function createMcpServer() {
-
-  const server =
-    new McpServer({
-
-      name:
-        "yahoo-scan-mcp",
-
-      version:
-        APP_VERSION
-    });
-
-  registerTools(
-    server
-  );
 
   return server;
 }
 
 
-/*
-========================================================
- HTTP SERVER
-========================================================
-*/
+/* =========================================================
+   EXPRESS / MCP
+========================================================= */
 
-const httpServer =
-  http.createServer(
-    async (
-      req,
-      res
-    ) => {
+const app =
+  express();
 
-      /*
-       ROOT
-      */
+app.use(
+  express.json({
+    limit: "10mb"
+  })
+);
 
-      if (
-        req.method === "GET" &&
-        req.url === "/"
-      ) {
 
-        res.writeHead(
-          200,
+/* ---------------------------------------------------------
+   Health
+--------------------------------------------------------- */
+
+app.get(
+  "/",
+  (_req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      service:
+        "yahoo-scan-mcp",
+
+      version:
+        APP_VERSION,
+
+      transport:
+        "streamable-http",
+
+      time:
+        nowIso()
+    });
+  }
+);
+
+
+/* ---------------------------------------------------------
+   MCP endpoint
+--------------------------------------------------------- */
+
+app.post(
+  "/mcp",
+
+  async (
+    req,
+    res
+  ) => {
+
+    let server = null;
+    let transport = null;
+
+    try {
+
+      server =
+        createMcpServer();
+
+      transport =
+        new StreamableHTTPServerTransport(
           {
-            "Content-Type":
-              "application/json"
+            sessionIdGenerator:
+              undefined,
+
+            enableJsonResponse:
+              true
           }
         );
 
-        res.end(
-          JSON.stringify({
+      await server.connect(
+        transport
+      );
 
-            ok:
-              true,
+      await transport.handleRequest(
+        req,
+        res,
+        req.body
+      );
 
-            service:
-              "yahoo-scan-mcp",
+    } catch (error) {
 
-            version:
-              APP_VERSION,
+      console.error(
+        "[MCP ERROR]",
+        error
+      );
 
-            transport:
-              "StreamableHTTP stateless",
+      if (!res.headersSent) {
 
-            tool_count:
-              TOOL_NAMES.length,
+        res
+          .status(500)
+          .json({
 
-            registered_tools:
-              TOOL_NAMES
-          })
-        );
+            ok: false,
 
-        return;
-      }
-
-
-      /*
-       HEALTH
-      */
-
-      if (
-        req.method === "GET" &&
-        req.url === "/health"
-      ) {
-
-        res.writeHead(
-          200,
-          {
-            "Content-Type":
-              "application/json"
-          }
-        );
-
-        res.end(
-          JSON.stringify({
-
-            ok:
-              true,
-
-            service:
-              "yahoo-scan-mcp",
-
-            version:
-              APP_VERSION,
-
-            stage:
-              scanState.stage,
-
-            tool_count:
-              TOOL_NAMES.length,
-
-            registered_tools:
-              TOOL_NAMES
-          })
-        );
-
-        return;
-      }
-
-
-      /*
-       DEBUG TOOLS
-      */
-
-      if (
-        req.method === "GET" &&
-        req.url === "/debug-tools"
-      ) {
-
-        res.writeHead(
-          200,
-          {
-            "Content-Type":
-              "application/json"
-          }
-        );
-
-        res.end(
-          JSON.stringify({
-
-            ok:
-              true,
-
-            version:
-              APP_VERSION,
-
-            tool_count:
-              TOOL_NAMES.length,
-
-            registered_tools:
-              TOOL_NAMES
-          })
-        );
-
-        return;
-      }
-
-
-      /*
-       MCP
-      */
-
-      if (
-        req.url === "/mcp" &&
-        req.method === "POST"
-      ) {
-
-        try {
-
-          const bodyChunks =
-            [];
-
-          for await (
-            const chunk of req
-          ) {
-
-            bodyChunks.push(
-              chunk
-            );
-          }
-
-          const body =
-            Buffer
-              .concat(
-                bodyChunks
+            error:
+              String(
+                error?.message ||
+                error
               )
-              .toString(
-                "utf8"
-              );
-
-          const parsed =
-            body
-              ? JSON.parse(
-                  body
-                )
-              : undefined;
-
-          /*
-           Stateless :
-           nouveau serveur + transport
-           pour chaque requête.
-          */
-
-          const server =
-            createMcpServer();
-
-          const transport =
-            new StreamableHTTPServerTransport({
-
-              sessionIdGenerator:
-                undefined,
-
-              enableJsonResponse:
-                true
-            });
-
-          await server.connect(
-            transport
-          );
-
-          await transport.handleRequest(
-            req,
-            res,
-            parsed
-          );
-
-        } catch (err) {
-
-          console.error(
-            "[MCP ERROR]",
-            err
-          );
-
-          if (
-            !res.headersSent
-          ) {
-
-            res.writeHead(
-              500,
-              {
-                "Content-Type":
-                  "application/json"
-              }
-            );
-
-            res.end(
-              JSON.stringify({
-
-                ok:
-                  false,
-
-                error:
-                  err.message
-              })
-            );
-          }
-        }
-
-        return;
+          });
       }
 
+    } finally {
 
-      /*
-       404
-      */
+      try {
 
-      res.writeHead(
-        404,
-        {
-          "Content-Type":
-            "application/json"
+        if (
+          transport &&
+          typeof transport.close ===
+          "function"
+        ) {
+          await transport.close();
         }
-      );
 
-      res.end(
-        JSON.stringify({
+      } catch {}
 
-          ok:
-            false,
+      try {
 
-          error:
-            "Not found"
-        })
-      );
+        if (
+          server &&
+          typeof server.close ===
+          "function"
+        ) {
+          await server.close();
+        }
+
+      } catch {}
     }
-  );
+  }
+);
 
 
-/*
-========================================================
- START
-========================================================
-*/
+/* ---------------------------------------------------------
+   GET /mcp
+--------------------------------------------------------- */
 
-httpServer.listen(
+app.get(
+  "/mcp",
+  (_req, res) => {
+
+    res
+      .status(405)
+      .json({
+
+        ok: false,
+
+        error:
+          "GET /mcp is not supported. Use POST."
+      });
+  }
+);
+
+
+/* ---------------------------------------------------------
+   404
+--------------------------------------------------------- */
+
+app.use(
+  (_req, res) => {
+
+    res
+      .status(404)
+      .json({
+
+        ok: false,
+
+        error:
+          "Not found"
+      });
+  }
+);
+
+
+/* =========================================================
+   START
+========================================================= */
+
+app.listen(
   PORT,
   "0.0.0.0",
   () => {
+
+    console.log(
+      `[yahoo-scan-mcp] v${APP_VERSION} started`
+    );
 
     console.log(
       `[yahoo-scan-mcp] HTTP server listening on ${PORT}`
     );
 
     console.log(
-      `[yahoo-scan-mcp] version ${APP_VERSION}`
+      `[yahoo-scan-mcp] MCP endpoint: /mcp`
     );
 
     console.log(
-      `[yahoo-scan-mcp] cwd=${CWD}`
+      `[yahoo-scan-mcp] Data source: Yahoo Chart OHLCV`
     );
 
     console.log(
-      `[yahoo-scan-mcp] app_dir=${APP_DIR}`
+      `[yahoo-scan-mcp] Universe: ${UNIVERSE_FILE}`
     );
-
-    console.log(
-      `[yahoo-scan-mcp] tools=${TOOL_NAMES.length}`
-    );
-
-    console.log(
-      `[yahoo-scan-mcp] registered_tools=${TOOL_NAMES.join(",")}`
-    );
-
-    console.log(
-      "[yahoo-scan-mcp] universe loading deferred until yahoo_s0_prepare"
-    );
-
-    restoreCaches()
-      .then(() => {
-
-        console.log(
-          "[yahoo-scan-mcp] caches restored"
-        );
-
-      })
-      .catch(err => {
-
-        console.error(
-          "[yahoo-scan-mcp] cache restore warning:",
-          err.message
-        );
-      });
   }
 );
