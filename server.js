@@ -1735,25 +1735,115 @@ function buildRvol15mBaseline(
 
     const valid =
       values.filter(
-        Number.isFinite
-      );
+function buildRvol15mBaseline(
+  completedSessions
+) {
+  const slotValues = new Map();
 
-    if (
-      !valid.length
-    ) {
+  for (const session of completedSessions) {
+    if (!Array.isArray(session) || !session.length) {
       continue;
     }
 
-    baseline[key] =
+    /*
+    --------------------------------------------------------
+    Agrégation des volumes par créneau 15 min
+    --------------------------------------------------------
+    */
+
+    const slotVolumes = new Map();
+
+    for (const bar of session) {
+      if (!bar || !Number.isFinite(bar.ts)) {
+        continue;
+      }
+
+      const key = nyTimeKey(bar.ts);
+
+      if (!key) {
+        continue;
+      }
+
+      const volume = Number(bar.volume);
+
+      /*
+      IMPORTANT :
+      - volume doit être numérique
+      - volume = 0 est ignoré
+      - on ne crée jamais de baseline artificielle à 0
+      */
+
+      if (
+        !Number.isFinite(volume) ||
+        volume <= 0
+      ) {
+        continue;
+      }
+
+      slotVolumes.set(
+        key,
+        (slotVolumes.get(key) || 0) + volume
+      );
+    }
+
+    /*
+    --------------------------------------------------------
+    Stockage de la valeur du créneau pour cette session
+    --------------------------------------------------------
+    */
+
+    for (const [key, volume] of slotVolumes) {
+      if (
+        !Number.isFinite(volume) ||
+        volume <= 0
+      ) {
+        continue;
+      }
+
+      if (!slotValues.has(key)) {
+        slotValues.set(key, []);
+      }
+
+      slotValues.get(key).push(volume);
+    }
+  }
+
+  /*
+  --------------------------------------------------------
+  Moyenne historique par créneau
+  --------------------------------------------------------
+  */
+
+  const baseline = {};
+
+  for (const [key, values] of slotValues) {
+    const valid =
+      values.filter(
+        value =>
+          Number.isFinite(value) &&
+          value > 0
+      );
+
+    if (!valid.length) {
+      continue;
+    }
+
+    const sum =
       valid.reduce(
-        (
-          sum,
-          value
-        ) =>
-          sum + value,
+        (total, value) =>
+          total + value,
         0
-      ) /
-      valid.length;
+      );
+
+    const average =
+      sum / valid.length;
+
+    if (
+      Number.isFinite(average) &&
+      average > 0
+    ) {
+      baseline[key] = average;
+    }
   }
 
   return baseline;
