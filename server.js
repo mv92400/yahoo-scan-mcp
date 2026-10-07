@@ -1,7 +1,7 @@
 /*
 ========================================================
  Yahoo Scan MCP
- Version 1.6.1
+ Version 1.6.2
 
  PRINCIPES
  - Railway démarre même si universe_s0.txt manque.
@@ -10,8 +10,9 @@
  - Tous les tools utilisent registerTool().
  - Yahoo WS conservé.
  - Yahoo Spark diagnostiquable directement depuis Railway.
- - Aucune modification des critères S0/S1 sans validation
-   de la réponse réelle de Yahoo.
+ - CORRECTION 1.6.2 :
+   Yahoo Spark retourne result[].response.timestamp
+   et result[].response.indicators.
 ========================================================
 */
 
@@ -37,7 +38,7 @@ const PORT =
   Number(process.env.PORT || 8080);
 
 const APP_VERSION =
-  "1.6.1";
+  "1.6.2";
 
 const __filename =
   fileURLToPath(import.meta.url);
@@ -102,45 +103,19 @@ const TOOL_NAMES = [
 
 const scanState = {
   ok: true,
-
-  version:
-    APP_VERSION,
-
-  stage:
-    "IDLE",
-
-  asof:
-    null,
-
-  elapsed_ms:
-    0,
-
-  symbols_requested:
-    0,
-
-  source:
-    null,
-
-  s0:
-    [],
-
-  s1:
-    [],
-
-  lots:
-    [],
-
-  errors:
-    [],
-
-  universe_file:
-    null,
-
-  started_at:
-    null,
-
-  finished_at:
-    null
+  version: APP_VERSION,
+  stage: "IDLE",
+  asof: null,
+  elapsed_ms: 0,
+  symbols_requested: 0,
+  source: null,
+  s0: [],
+  s1: [],
+  lots: [],
+  errors: [],
+  universe_file: null,
+  started_at: null,
+  finished_at: null
 };
 
 
@@ -150,14 +125,9 @@ const scanState = {
 ========================================================
 */
 
-let universeCache =
-  null;
-
-let s0Cache =
-  null;
-
-let s1Cache =
-  null;
+let universeCache = null;
+let s0Cache = null;
+let s1Cache = null;
 
 
 /*
@@ -441,9 +411,7 @@ async function loadUniverse() {
 ========================================================
 */
 
-async function cachePath(
-  filename
-) {
+function cachePath(filename) {
 
   return path.join(
     APP_DIR,
@@ -458,7 +426,7 @@ async function saveJson(
 ) {
 
   const filenamePath =
-    await cachePath(
+    cachePath(
       filename
     );
 
@@ -481,7 +449,7 @@ async function readJsonIfExists(
 ) {
 
   const filenamePath =
-    await cachePath(
+    cachePath(
       filename
     );
 
@@ -557,8 +525,7 @@ async function restoreCaches() {
 
 async function fetchWithTimeout(
   url,
-  timeoutMs =
-    REQUEST_TIMEOUT_MS
+  timeoutMs = REQUEST_TIMEOUT_MS
 ) {
 
   const controller =
@@ -566,8 +533,7 @@ async function fetchWithTimeout(
 
   const timer =
     setTimeout(
-      () =>
-        controller.abort(),
+      () => controller.abort(),
       timeoutMs
     );
 
@@ -851,12 +817,6 @@ async function yahooSpark(
           item;
       }
 
-      /*
-       Important:
-       les symboles sans résultat Yahoo sont
-       explicitement conservés comme erreurs.
-      */
-
       const returned =
         new Set(
           spark
@@ -917,277 +877,23 @@ async function yahooSpark(
 
 /*
 ========================================================
- YAHOO SPARK DIAGNOSTIC
+ BAR EXTRACTION — CORRECTED 1.6.2
 ========================================================
 
- Teste UNE requête réelle depuis Railway.
-
- Ne retourne pas le body complet.
-========================================================
-*/
-
-async function runYahooSparkTest(
-  symbol = "AAPL",
-  range = "5d",
-  interval = "5m"
-) {
-
-  const started =
-    Date.now();
-
-  const requestedSymbol =
-    String(
-      symbol || "AAPL"
-    )
-      .trim()
-      .toUpperCase();
-
-  const url =
-    "https://query1.finance.yahoo.com/v7/finance/spark" +
-    `?symbols=${encodeURIComponent(
-      requestedSymbol
-    )}` +
-    `&range=${encodeURIComponent(
-      range
-    )}` +
-    `&interval=${encodeURIComponent(
-      interval
-    )}` +
-    "&indicators=quote,close" +
-    "&includeTimestamps=true" +
-    "&includePrePost=false";
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      REQUEST_TIMEOUT_MS
-    );
-
-  try {
-
-    const response =
-      await fetch(
-        url,
-        {
-          method:
-            "GET",
-
-          headers: {
-
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-              "AppleWebKit/537.36 Chrome/140 Safari/537.36",
-
-            "Accept":
-              "application/json"
-          },
-
-          signal:
-            controller.signal
-        }
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      );
-
-    const body =
-      await response.text();
-
-    let parsed =
-      null;
-
-    let jsonError =
-      null;
-
-    try {
-
-      parsed =
-        JSON.parse(
-          body
-        );
-
-    } catch (err) {
-
-      jsonError =
-        err.message;
-    }
-
-    const spark =
-      parsed?.spark ||
-      null;
-
-    const result =
-      spark?.result;
-
-    const first =
-      Array.isArray(result) &&
-      result.length
-        ? result[0]
-        : null;
-
-    const bars =
-      first
-        ? extractBars(first)
-        : [];
-
-    const quote =
-      first
-        ?.indicators
-        ?.quote
-        ?.[0] ||
-      null;
-
-    return {
-
-      ok:
-        response.ok,
-
-      version:
-        APP_VERSION,
-
-      symbol:
-        requestedSymbol,
-
-      range,
-
-      interval,
-
-      elapsed_ms:
-        Date.now() -
-        started,
-
-      http_status:
-        response.status,
-
-      content_type:
-        contentType,
-
-      body_length:
-        body.length,
-
-      json_parse_ok:
-        Boolean(parsed),
-
-      json_error:
-        jsonError,
-
-      top_level_keys:
-        parsed
-          ? Object.keys(parsed)
-          : [],
-
-      spark_present:
-        Boolean(spark),
-
-      spark_keys:
-        spark
-          ? Object.keys(spark)
-          : [],
-
-      result_is_array:
-        Array.isArray(result),
-
-      result_count:
-        Array.isArray(result)
-          ? result.length
-          : 0,
-
-      first_result_keys:
-        first
-          ? Object.keys(first)
-          : [],
-
-      first_result_symbol:
-        first?.symbol ||
-        null,
-
-      timestamp_count:
-        Array.isArray(
-          first?.timestamp
-        )
-          ? first.timestamp.length
-          : 0,
-
-      extracted_bar_count:
-        bars.length,
-
-      quote_keys:
-        quote
-          ? Object.keys(quote)
-          : [],
-
-      error:
-        response.ok
-          ? null
-          : `Yahoo HTTP ${response.status}`,
-
-      body_preview:
-        response.ok
-          ? null
-          : body.slice(
-              0,
-              500
-            )
-    };
-
-  } catch (err) {
-
-    return {
-
-      ok:
-        false,
-
-      version:
-        APP_VERSION,
-
-      symbol:
-        requestedSymbol,
-
-      range,
-
-      interval,
-
-      elapsed_ms:
-        Date.now() -
-        started,
-
-      error:
-        err.message,
-
-      error_name:
-        err.name,
-
-      http_status:
-        err.status ||
-        null,
-
-      content_type:
-        err.contentType ||
-        null,
-
-      body_preview:
-        err.bodyPreview ||
-        null
-    };
-
-  } finally {
-
-    clearTimeout(
-      timer
-    );
-  }
-}
-
-
-/*
-========================================================
- BAR EXTRACTION
+ Yahoo Spark actuel :
+
+ result[] = {
+   symbol: "AAPL",
+   response: {
+     timestamp: [...],
+     indicators: {
+       quote: [...]
+     }
+   }
+ }
+
+ Certaines réponses peuvent toutefois fournir directement
+ timestamp/indicators. Les deux formats sont acceptés.
 ========================================================
 */
 
@@ -1197,36 +903,64 @@ function extractBars(item) {
     return [];
   }
 
+  const response =
+    item.response ||
+    item;
+
   const timestamps =
-    item.timestamp ||
-    [];
+    Array.isArray(
+      response.timestamp
+    )
+      ? response.timestamp
+      : [];
 
   const quote =
-    item.indicators
+    response.indicators
       ?.quote?.[0] ||
     {};
 
   const closes =
-    quote.close ||
-    item.indicators
-      ?.close?.[0]?.close ||
-    [];
+    Array.isArray(
+      quote.close
+    )
+      ? quote.close
+      : (
+          Array.isArray(
+            response.indicators
+              ?.close?.[0]?.close
+          )
+            ? response.indicators
+                .close[0].close
+            : []
+        );
 
   const opens =
-    quote.open ||
-    [];
+    Array.isArray(
+      quote.open
+    )
+      ? quote.open
+      : [];
 
   const highs =
-    quote.high ||
-    [];
+    Array.isArray(
+      quote.high
+    )
+      ? quote.high
+      : [];
 
   const lows =
-    quote.low ||
-    [];
+    Array.isArray(
+      quote.low
+    )
+      ? quote.low
+      : [];
 
   const volumes =
-    quote.volume ||
-    [];
+    Array.isArray(
+      quote.volume
+    )
+      ? quote.volume
+      : [];
 
   const bars =
     [];
@@ -1305,6 +1039,292 @@ function extractBars(item) {
   }
 
   return bars;
+}
+
+
+/*
+========================================================
+ YAHOO SPARK DIAGNOSTIC — CORRECTED
+========================================================
+*/
+
+async function runYahooSparkTest(
+  symbol = "AAPL",
+  range = "5d",
+  interval = "5m"
+) {
+
+  const started =
+    Date.now();
+
+  const requestedSymbol =
+    String(
+      symbol || "AAPL"
+    )
+      .trim()
+      .toUpperCase();
+
+  const url =
+    "https://query1.finance.yahoo.com/v7/finance/spark" +
+    `?symbols=${encodeURIComponent(
+      requestedSymbol
+    )}` +
+    `&range=${encodeURIComponent(
+      range
+    )}` +
+    `&interval=${encodeURIComponent(
+      interval
+    )}` +
+    "&indicators=quote,close" +
+    "&includeTimestamps=true" +
+    "&includePrePost=false";
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      REQUEST_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        url,
+        {
+          method:
+            "GET",
+
+          headers: {
+
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+              "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+
+            "Accept":
+              "application/json"
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const contentType =
+      response.headers.get(
+        "content-type"
+      );
+
+    const body =
+      await response.text();
+
+    let parsed =
+      null;
+
+    let jsonError =
+      null;
+
+    try {
+
+      parsed =
+        JSON.parse(
+          body
+        );
+
+    } catch (err) {
+
+      jsonError =
+        err.message;
+    }
+
+    const spark =
+      parsed?.spark ||
+      null;
+
+    const result =
+      spark?.result;
+
+    const first =
+      Array.isArray(result) &&
+      result.length
+        ? result[0]
+        : null;
+
+    /*
+     CORRECTION :
+     Yahoo place les données dans first.response.
+    */
+
+    const firstResponse =
+      first?.response ||
+      first ||
+      null;
+
+    const bars =
+      first
+        ? extractBars(first)
+        : [];
+
+    const quote =
+      firstResponse
+        ?.indicators
+        ?.quote
+        ?.[0] ||
+      null;
+
+    return {
+
+      ok:
+        response.ok,
+
+      version:
+        APP_VERSION,
+
+      symbol:
+        requestedSymbol,
+
+      range,
+
+      interval,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      http_status:
+        response.status,
+
+      content_type:
+        contentType,
+
+      body_length:
+        body.length,
+
+      json_parse_ok:
+        Boolean(parsed),
+
+      json_error:
+        jsonError,
+
+      top_level_keys:
+        parsed
+          ? Object.keys(parsed)
+          : [],
+
+      spark_present:
+        Boolean(spark),
+
+      spark_keys:
+        spark
+          ? Object.keys(spark)
+          : [],
+
+      result_is_array:
+        Array.isArray(result),
+
+      result_count:
+        Array.isArray(result)
+          ? result.length
+          : 0,
+
+      first_result_keys:
+        first
+          ? Object.keys(first)
+          : [],
+
+      first_result_symbol:
+        first?.symbol ||
+        null,
+
+      response_present:
+        Boolean(
+          first?.response
+        ),
+
+      response_keys:
+        firstResponse
+          ? Object.keys(
+              firstResponse
+            )
+          : [],
+
+      timestamp_count:
+        Array.isArray(
+          firstResponse?.timestamp
+        )
+          ? firstResponse.timestamp.length
+          : 0,
+
+      extracted_bar_count:
+        bars.length,
+
+      quote_keys:
+        quote
+          ? Object.keys(quote)
+          : [],
+
+      error:
+        response.ok
+          ? null
+          : `Yahoo HTTP ${response.status}`,
+
+      body_preview:
+        response.ok
+          ? null
+          : body.slice(
+              0,
+              500
+            )
+    };
+
+  } catch (err) {
+
+    return {
+
+      ok:
+        false,
+
+      version:
+        APP_VERSION,
+
+      symbol:
+        requestedSymbol,
+
+      range,
+
+      interval,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        err.message,
+
+      error_name:
+        err.name,
+
+      http_status:
+        err.status ||
+        null,
+
+      content_type:
+        err.contentType ||
+        null,
+
+      body_preview:
+        err.bodyPreview ||
+        null
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+  }
 }
 
 
@@ -3113,10 +3133,6 @@ function registerTools(
   server
 ) {
 
-  /*
-   PING
-  */
-
   server.registerTool(
     "ping",
 
@@ -3154,10 +3170,6 @@ function registerTools(
     })
   );
 
-
-  /*
-   STATUS
-  */
 
   server.registerTool(
     "get_status",
@@ -3230,10 +3242,6 @@ function registerTools(
   );
 
 
-  /*
-   FILESYSTEM
-  */
-
   server.registerTool(
     "diagnose_filesystem",
 
@@ -3260,7 +3268,6 @@ function registerTools(
           text:
             JSON.stringify(
               {
-
                 ok:
                   true,
 
@@ -3269,7 +3276,6 @@ function registerTools(
 
                 ...diagnostic
               },
-
               null,
               2
             )
@@ -3278,10 +3284,6 @@ function registerTools(
     }
   );
 
-
-  /*
-   UNIVERSE
-  */
 
   server.registerTool(
     "get_universe",
@@ -3351,10 +3353,6 @@ function registerTools(
   );
 
 
-  /*
-   WS TEST
-  */
-
   server.registerTool(
     "yahoo_ws_test",
 
@@ -3412,16 +3410,12 @@ function registerTools(
   );
 
 
-  /*
-   YAHOO SPARK TEST
-  */
-
   server.registerTool(
     "yahoo_spark_test",
 
     {
       description:
-        "Diagnostic direct de Yahoo Spark depuis Railway. Teste une seule action sans modifier le scan.",
+        "Diagnostic direct de Yahoo Spark depuis Railway.",
 
       inputSchema:
         z.object({
@@ -3500,10 +3494,6 @@ function registerTools(
     }
   );
 
-
-  /*
-   S0
-  */
 
   server.registerTool(
     "yahoo_s0_prepare",
@@ -3585,10 +3575,6 @@ function registerTools(
     }
   );
 
-
-  /*
-   S1
-  */
 
   server.registerTool(
     "yahoo_s1_scan",
@@ -3676,10 +3662,6 @@ function registerTools(
     }
   );
 
-
-  /*
-   SF
-  */
 
   server.registerTool(
     "yahoo_sf_scan",
@@ -3789,10 +3771,6 @@ function registerTools(
   );
 
 
-  /*
-   SCAN STATE
-  */
-
   server.registerTool(
     "get_scan_state",
 
@@ -3821,10 +3799,6 @@ function registerTools(
     })
   );
 
-
-  /*
-   COMPATIBILITY
-  */
 
   server.registerTool(
     "yahoo_s0_s1_scan",
@@ -4122,7 +4096,7 @@ const httpServer =
               : undefined;
 
           /*
-           Stateless:
+           Stateless :
            nouveau serveur + transport
            pour chaque requête.
           */
