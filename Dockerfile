@@ -7,6 +7,7 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY server.js ./
+COPY universe_s0.txt ./
 COPY src ./src
 
 ENV NODE_ENV=production
