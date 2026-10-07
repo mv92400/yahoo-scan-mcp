@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
@@ -9,13 +8,13 @@ import { readFile } from "node:fs/promises";
 import { YahooWS } from "./src/yahoo-ws.js";
 
 /*
---------------------------------------------------------
+========================================================
 CONFIG
---------------------------------------------------------
+========================================================
 */
 
 const PORT = Number(process.env.PORT || 8080);
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.2.1";
 
 const UNIVERSE_FILE =
   new URL("./universe_s0.txt", import.meta.url);
@@ -23,10 +22,11 @@ const UNIVERSE_FILE =
 const log = (...args) =>
   console.error("[yahoo-scan-mcp]", ...args);
 
+
 /*
---------------------------------------------------------
+========================================================
 HELPERS
---------------------------------------------------------
+========================================================
 */
 
 function sleep(ms) {
@@ -34,13 +34,13 @@ function sleep(ms) {
 }
 
 function chunk(array, size) {
-  const out = [];
+  const result = [];
 
   for (let i = 0; i < array.length; i += size) {
-    out.push(array.slice(i, i + size));
+    result.push(array.slice(i, i + size));
   }
 
-  return out;
+  return result;
 }
 
 function cleanNumber(value) {
@@ -54,16 +54,21 @@ function normalizeSymbols(input) {
   return [
     ...new Set(
       input
-        .map(x => String(x || "").trim().toUpperCase())
+        .map(x =>
+          String(x || "")
+            .trim()
+            .toUpperCase()
+        )
         .filter(Boolean)
     )
   ];
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 UNIVERSE
---------------------------------------------------------
+========================================================
 */
 
 let universeCache = null;
@@ -74,7 +79,11 @@ async function loadUniverse() {
     return universeCache;
   }
 
-  const raw = await readFile(UNIVERSE_FILE, "utf8");
+  const raw =
+    await readFile(
+      UNIVERSE_FILE,
+      "utf8"
+    );
 
   const symbols = [];
 
@@ -84,19 +93,11 @@ async function loadUniverse() {
     if (!clean) continue;
     if (clean.startsWith("#")) continue;
 
-    /*
-      Accept:
-
-      GRAB
-      GRAB,3.07
-      GRAB;3.07
-      GRAB 3.07
-    */
-
-    const symbol = clean
-      .split(/[,\s;]+/)[0]
-      .trim()
-      .toUpperCase();
+    const symbol =
+      clean
+        .split(/[,\s;]+/)[0]
+        .trim()
+        .toUpperCase();
 
     if (!symbol) continue;
 
@@ -113,10 +114,11 @@ async function loadUniverse() {
   return universeCache;
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 SCAN STATE
---------------------------------------------------------
+========================================================
 */
 
 const scanState = {
@@ -141,10 +143,11 @@ const scanState = {
   universe_loaded_at: null
 };
 
+
 /*
---------------------------------------------------------
+========================================================
 YAHOO SPARK
---------------------------------------------------------
+========================================================
 */
 
 async function yahooSpark(
@@ -152,11 +155,13 @@ async function yahooSpark(
   range = "5d",
   interval = "5m"
 ) {
-  const batches = chunk(symbols, 20);
+  const batches =
+    chunk(symbols, 20);
 
   const all = [];
 
   for (const batch of batches) {
+
     const querySymbols =
       batch
         .map(s => encodeURIComponent(s))
@@ -174,8 +179,14 @@ async function yahooSpark(
     let success = false;
     let lastError = null;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (
+      let attempt = 1;
+      attempt <= 3;
+      attempt++
+    ) {
+
       try {
+
         const controller =
           new AbortController();
 
@@ -186,17 +197,20 @@ async function yahooSpark(
           );
 
         const response =
-          await fetch(url, {
-            method: "GET",
+          await fetch(
+            url,
+            {
+              method: "GET",
 
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0"
-            },
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0"
+              },
 
-            signal:
-              controller.signal
-          });
+              signal:
+                controller.signal
+            }
+          );
 
         clearTimeout(timer);
 
@@ -210,17 +224,21 @@ async function yahooSpark(
           await response.json();
 
         for (const symbol of batch) {
+
           const data =
             json?.spark?.result?.find(
               x =>
-                String(x?.symbol || "")
-                  .toUpperCase() === symbol
+                String(
+                  x?.symbol || ""
+                ).toUpperCase() === symbol
             );
 
           if (!data) {
+
             all.push({
               symbol,
-              error: "Yahoo symbol missing"
+              error:
+                "Yahoo symbol missing"
             });
 
             continue;
@@ -236,18 +254,24 @@ async function yahooSpark(
         break;
 
       } catch (error) {
+
         lastError = error;
 
         if (attempt < 3) {
-          await sleep(500 * attempt);
+          await sleep(
+            500 * attempt
+          );
         }
       }
     }
 
     if (!success) {
+
       for (const symbol of batch) {
+
         all.push({
           symbol,
+
           error:
             lastError?.message ||
             "Yahoo request failed"
@@ -259,13 +283,15 @@ async function yahooSpark(
   return all;
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 EXTRACT BARS
---------------------------------------------------------
+========================================================
 */
 
 function extractBars(data) {
+
   const timestamps =
     data?.timestamp || [];
 
@@ -289,24 +315,41 @@ function extractBars(data) {
 
   const bars = [];
 
-  for (let i = 0; i < timestamps.length; i++) {
+  for (
+    let i = 0;
+    i < timestamps.length;
+    i++
+  ) {
+
     const timestamp =
-      cleanNumber(timestamps[i]);
+      cleanNumber(
+        timestamps[i]
+      );
 
     const open =
-      cleanNumber(opens[i]);
+      cleanNumber(
+        opens[i]
+      );
 
     const high =
-      cleanNumber(highs[i]);
+      cleanNumber(
+        highs[i]
+      );
 
     const low =
-      cleanNumber(lows[i]);
+      cleanNumber(
+        lows[i]
+      );
 
     const close =
-      cleanNumber(closes[i]);
+      cleanNumber(
+        closes[i]
+      );
 
     const volume =
-      cleanNumber(volumes[i]);
+      cleanNumber(
+        volumes[i]
+      );
 
     if (
       timestamp == null ||
@@ -328,39 +371,52 @@ function extractBars(data) {
   return bars;
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 SESSION KEY
---------------------------------------------------------
+========================================================
 */
 
 function sessionKey(timestamp) {
+
   const d =
-    new Date(timestamp * 1000);
+    new Date(
+      timestamp * 1000
+    );
 
   return [
     d.getUTCFullYear(),
-    String(d.getUTCMonth() + 1)
-      .padStart(2, "0"),
-    String(d.getUTCDate())
-      .padStart(2, "0")
+
+    String(
+      d.getUTCMonth() + 1
+    ).padStart(2, "0"),
+
+    String(
+      d.getUTCDate()
+    ).padStart(2, "0")
   ].join("-");
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 VWAP
---------------------------------------------------------
+========================================================
 */
 
 function calculateVWAP(bars) {
+
   let pv = 0;
   let volume = 0;
 
   for (const bar of bars) {
+
     if (
       bar.close == null ||
-      !Number.isFinite(bar.volume)
+      !Number.isFinite(
+        bar.volume
+      )
     ) {
       continue;
     }
@@ -372,8 +428,11 @@ function calculateVWAP(bars) {
         bar.close
       ) / 3;
 
-    pv += typical * bar.volume;
-    volume += bar.volume;
+    pv +=
+      typical * bar.volume;
+
+    volume +=
+      bar.volume;
   }
 
   if (volume <= 0) {
@@ -383,30 +442,34 @@ function calculateVWAP(bars) {
   return pv / volume;
 }
 
+
 /*
---------------------------------------------------------
-S1 CALCULATION
---------------------------------------------------------
+========================================================
+S1
+========================================================
 */
 
-function calculateS1(symbol, bars) {
-  if (!Array.isArray(bars)) {
-    return null;
-  }
+function calculateS1(
+  symbol,
+  bars
+) {
 
-  if (bars.length < 4) {
+  if (
+    !Array.isArray(bars) ||
+    bars.length < 4
+  ) {
     return null;
   }
 
   const sorted =
     [...bars].sort(
       (a, b) =>
-        a.timestamp - b.timestamp
+        a.timestamp -
+        b.timestamp
     );
 
   /*
-    Drop the last bar because it can still
-    be incomplete when Yahoo is queried.
+  Last bar can still be incomplete.
   */
 
   const completed =
@@ -417,13 +480,19 @@ function calculateS1(symbol, bars) {
   }
 
   const current =
-    completed[completed.length - 1];
+    completed[
+      completed.length - 1
+    ];
 
   const previous =
-    completed[completed.length - 2];
+    completed[
+      completed.length - 2
+    ];
 
   const previous2 =
-    completed[completed.length - 3];
+    completed[
+      completed.length - 3
+    ];
 
   if (
     !current ||
@@ -433,31 +502,36 @@ function calculateS1(symbol, bars) {
     return null;
   }
 
+
   /*
   ------------------------------------------------------
-  VOLUME 15M
+  VOL15M
   ------------------------------------------------------
   */
 
   const last3 =
     completed.slice(-3);
 
-  const vol15m =
+  const Vol15M =
     last3.reduce(
       (sum, bar) =>
         sum + (bar.volume || 0),
       0
     );
 
+
   /*
   ------------------------------------------------------
-  ACCEL 5M
+  ACCEL5M
   ------------------------------------------------------
   */
 
   const previous3 =
     completed.slice(
-      Math.max(0, completed.length - 4),
+      Math.max(
+        0,
+        completed.length - 4
+      ),
       completed.length - 1
     );
 
@@ -465,30 +539,29 @@ function calculateS1(symbol, bars) {
     previous3.length
       ? previous3.reduce(
           (sum, bar) =>
-            sum + (bar.volume || 0),
+            sum +
+            (bar.volume || 0),
           0
         ) / previous3.length
       : 0;
 
-  const accel5m =
+  const Accel5M =
     previous3Mean > 0
-      ? current.volume / previous3Mean
+      ? current.volume /
+        previous3Mean
       : null;
+
 
   /*
   ------------------------------------------------------
-  RVOL 15M
-  ------------------------------------------------------
-  Historical same-time-of-day baseline.
-
-  We compare today's last 15m volume against
-  previous sessions around the same intraday
-  position.
+  RVOL15M
   ------------------------------------------------------
   */
 
   const currentSession =
-    sessionKey(current.timestamp);
+    sessionKey(
+      current.timestamp
+    );
 
   const currentIndex =
     completed.findIndex(
@@ -499,28 +572,27 @@ function calculateS1(symbol, bars) {
 
   const historical = [];
 
-  /*
-    Approximate same-time-of-day windows
-    using 5m bars from preceding sessions.
-  */
-
   for (
     let i = 0;
     i < completed.length;
     i++
   ) {
+
     const bar =
       completed[i];
 
     if (
-      sessionKey(bar.timestamp) ===
-      currentSession
+      sessionKey(
+        bar.timestamp
+      ) === currentSession
     ) {
       continue;
     }
 
     const distance =
-      Math.abs(i - currentIndex);
+      Math.abs(
+        i - currentIndex
+      );
 
     if (distance <= 2) {
       historical.push(
@@ -531,20 +603,26 @@ function calculateS1(symbol, bars) {
 
   let baseline = 0;
 
-  if (historical.length > 0) {
+  if (
+    historical.length > 0
+  ) {
+
     baseline =
       historical.reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / historical.length;
+      ) /
+      historical.length;
 
     baseline *= 3;
   }
 
-  const rvol15m =
+  const RVOL15M =
     baseline > 0
-      ? vol15m / baseline
+      ? Vol15M / baseline
       : null;
+
 
   /*
   ------------------------------------------------------
@@ -552,38 +630,38 @@ function calculateS1(symbol, bars) {
   ------------------------------------------------------
   */
 
-  const vwap =
-    calculateVWAP(completed);
+  const VWAP =
+    calculateVWAP(
+      completed
+    );
 
   const priceVsVWAP =
-    vwap &&
+    VWAP &&
     current.close != null
-      ? (
-          current.close / vwap
-        ) - 1
+      ? current.close / VWAP - 1
       : null;
+
 
   /*
   ------------------------------------------------------
-  J-1 / J-2
+  J1 / J2
   ------------------------------------------------------
   */
 
-  const j1 =
+  const J1 =
     previous.close > 0
-      ? (
-          current.close /
-          previous.close
-        ) - 1
+      ? current.close /
+          previous.close -
+        1
       : null;
 
-  const j2 =
+  const J2 =
     previous2.close > 0
-      ? (
-          previous.close /
-          previous2.close
-        ) - 1
+      ? previous.close /
+          previous2.close -
+        1
       : null;
+
 
   /*
   ------------------------------------------------------
@@ -591,31 +669,28 @@ function calculateS1(symbol, bars) {
   ------------------------------------------------------
   */
 
-  const hod =
-    Math.max(
-      ...completed
-        .map(x => x.high)
-        .filter(
-          x =>
-            x != null &&
-            Number.isFinite(x)
-        )
-    );
+  const highs =
+    completed
+      .map(x => x.high)
+      .filter(
+        x =>
+          x != null &&
+          Number.isFinite(x)
+      );
 
-  const hodDistance =
-    hod > 0
-      ? (
-          current.close / hod
-        ) - 1
+  const HOD =
+    highs.length
+      ? Math.max(...highs)
       : null;
 
-  /*
-  ------------------------------------------------------
-  RESULT
-  ------------------------------------------------------
-  */
+  const hodDistance =
+    HOD > 0
+      ? current.close / HOD - 1
+      : null;
+
 
   return {
+
     symbol,
 
     timestamp:
@@ -624,40 +699,35 @@ function calculateS1(symbol, bars) {
     price:
       current.close,
 
-    Vol15M:
-      vol15m,
+    Vol15M,
 
-    RVOL15M:
-      rvol15m,
+    RVOL15M,
 
-    Accel5M:
-      accel5m,
+    Accel5M,
 
-    VWAP:
-      vwap,
+    VWAP,
 
     priceVsVWAP,
 
-    J1:
-      j1,
+    J1,
 
-    J2:
-      j2,
+    J2,
 
-    HOD:
-      hod,
+    HOD,
 
     hodDistance
   };
 }
 
+
 /*
---------------------------------------------------------
-ORDINARY STOCK FILTER
---------------------------------------------------------
+========================================================
+ORDINARY STOCK
+========================================================
 */
 
 function isOrdinaryStock(data) {
+
   if (!data) {
     return false;
   }
@@ -702,6 +772,7 @@ function isOrdinaryStock(data) {
     ).toUpperCase();
 
   if (exchange) {
+
     const allowed = [
       "NMS",
       "NGM",
@@ -716,7 +787,9 @@ function isOrdinaryStock(data) {
     ];
 
     if (
-      !allowed.includes(exchange)
+      !allowed.includes(
+        exchange
+      )
     ) {
       return false;
     }
@@ -725,13 +798,15 @@ function isOrdinaryStock(data) {
   return true;
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 CURRENT PRICE
---------------------------------------------------------
+========================================================
 */
 
 function getCurrentPrice(data) {
+
   const meta =
     data?.meta || {};
 
@@ -746,10 +821,11 @@ function getCurrentPrice(data) {
   );
 }
 
+
 /*
---------------------------------------------------------
-WEBSOCKET TEST LOCK
---------------------------------------------------------
+========================================================
+WEBSOCKET TEST
+========================================================
 */
 
 let wsTestRunning = false;
@@ -758,6 +834,7 @@ async function runYahooWSTest(
   symbols,
   seconds
 ) {
+
   if (wsTestRunning) {
     throw new Error(
       "Yahoo WebSocket test already running"
@@ -775,6 +852,7 @@ async function runYahooWSTest(
     });
 
   try {
+
     await yahoo.connect();
 
     await yahoo.subscribe(
@@ -786,7 +864,8 @@ async function runYahooWSTest(
     );
 
     const status =
-      typeof yahoo.status === "function"
+      typeof yahoo.status ===
+      "function"
         ? yahoo.status()
         : null;
 
@@ -796,25 +875,32 @@ async function runYahooWSTest(
       typeof yahoo.getLatest ===
       "function"
     ) {
+
       ticks =
         await yahoo.getLatest();
+
     } else if (
       yahoo.latest
     ) {
+
       ticks =
         yahoo.latest;
+
     } else if (
       yahoo.recent_ticks
     ) {
+
       ticks =
         yahoo.recent_ticks;
     }
 
     return {
+
       ok: true,
 
       elapsed_ms:
-        Date.now() - started,
+        Date.now() -
+        started,
 
       status,
 
@@ -822,30 +908,34 @@ async function runYahooWSTest(
     };
 
   } finally {
+
     try {
+
       if (
         typeof yahoo.close ===
         "function"
       ) {
         await yahoo.close();
       }
+
     } catch {}
 
     wsTestRunning = false;
   }
 }
 
+
 /*
---------------------------------------------------------
-SHARED SCAN TOOLS
---------------------------------------------------------
+========================================================
+REGISTER TOOLS
+========================================================
 */
 
 function registerTools(server) {
 
   /*
   ------------------------------------------------------
-  ping
+  PING
   ------------------------------------------------------
   */
 
@@ -874,9 +964,10 @@ function registerTools(server) {
     })
   );
 
+
   /*
   ------------------------------------------------------
-  get_status
+  STATUS
   ------------------------------------------------------
   */
 
@@ -885,16 +976,6 @@ function registerTools(server) {
     "Return MCP and scanner status.",
     {},
     async () => {
-
-      const yahooStatus = {
-        connected: false,
-
-        mode:
-          "on-demand",
-
-        note:
-          "Yahoo WebSocket is created by yahoo_ws_test"
-      };
 
       return {
         content: [{
@@ -910,8 +991,15 @@ function registerTools(server) {
               version:
                 APP_VERSION,
 
-              yahoo:
-                yahooStatus,
+              yahoo: {
+                connected: false,
+
+                mode:
+                  "on-demand",
+
+                note:
+                  "Yahoo WebSocket is created by yahoo_ws_test"
+              },
 
               scan:
                 scanState
@@ -921,9 +1009,10 @@ function registerTools(server) {
     }
   );
 
+
   /*
   ------------------------------------------------------
-  get_universe
+  UNIVERSE
   ------------------------------------------------------
   */
 
@@ -931,12 +1020,13 @@ function registerTools(server) {
     "get_universe",
     "Return the materialized S0 universe.",
     {
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(2500)
-        .optional()
+      limit:
+        z
+          .number()
+          .int()
+          .min(1)
+          .max(2500)
+          .optional()
     },
 
     async ({ limit }) => {
@@ -950,7 +1040,8 @@ function registerTools(server) {
       const selected =
         universe.slice(
           0,
-          limit || universe.length
+          limit ||
+          universe.length
         );
 
       return {
@@ -975,15 +1066,16 @@ function registerTools(server) {
     }
   );
 
+
   /*
   ------------------------------------------------------
-  yahoo_ws_test
+  YAHOO WS TEST
   ------------------------------------------------------
   */
 
   server.tool(
     "yahoo_ws_test",
-    "Test Yahoo WebSocket connectivity with live symbols.",
+    "Test Yahoo WebSocket connectivity.",
     {
       symbols:
         z
@@ -1023,19 +1115,18 @@ function registerTools(server) {
           duration
         );
 
-      /*
-        Keep only requested symbols.
-      */
-
-      const filteredTicks = {};
+      const filteredTicks =
+        {};
 
       for (
         const symbol of requested
       ) {
+
         if (
           result.ticks &&
           result.ticks[symbol]
         ) {
+
           filteredTicks[symbol] =
             result.ticks[symbol];
         }
@@ -1069,15 +1160,16 @@ function registerTools(server) {
     }
   );
 
+
   /*
   ------------------------------------------------------
-  yahoo_s0_s1_scan
+  S0 / S1 SCAN
   ------------------------------------------------------
   */
 
   server.tool(
     "yahoo_s0_s1_scan",
-    "Run the Yahoo S0/S1 scanner.",
+    "Run Yahoo S0/S1 scanner.",
     {
       symbols:
         z
@@ -1106,7 +1198,6 @@ function registerTools(server) {
         "S0_S1";
 
       scanState.errors = [];
-
       scanState.s0 = [];
       scanState.s1 = [];
       scanState.lots = [];
@@ -1117,11 +1208,14 @@ function registerTools(server) {
         Array.isArray(symbols) &&
         symbols.length
       ) {
+
         list =
           normalizeSymbols(
             symbols
           );
+
       } else {
+
         list =
           await loadUniverse();
 
@@ -1131,6 +1225,7 @@ function registerTools(server) {
 
       scanState.symbols_requested =
         list.length;
+
 
       /*
       ----------------------------------------------------
@@ -1145,6 +1240,7 @@ function registerTools(server) {
           "5m"
         );
 
+
       /*
       ----------------------------------------------------
       S0
@@ -1158,6 +1254,7 @@ function registerTools(server) {
       ) {
 
         if (item.error) {
+
           scanState.errors.push({
             symbol:
               item.symbol,
@@ -1176,17 +1273,17 @@ function registerTools(server) {
           item.data;
 
         if (
-          !isOrdinaryStock(data)
+          !isOrdinaryStock(
+            data
+          )
         ) {
           continue;
         }
 
         const price =
-          getCurrentPrice(data);
-
-        /*
-          Strict <$5 universe.
-        */
+          getCurrentPrice(
+            data
+          );
 
         if (
           price == null ||
@@ -1206,6 +1303,7 @@ function registerTools(server) {
 
       scanState.s0 =
         s0;
+
 
       /*
       ----------------------------------------------------
@@ -1249,6 +1347,7 @@ function registerTools(server) {
           metrics
         );
       }
+
 
       /*
       ----------------------------------------------------
@@ -1308,11 +1407,13 @@ function registerTools(server) {
         }
       );
 
+
       const limited =
         s1.slice(
           0,
           s1_limit || 50
         );
+
 
       /*
       ----------------------------------------------------
@@ -1341,6 +1442,13 @@ function registerTools(server) {
 
       scanState.ok =
         true;
+
+
+      /*
+      ----------------------------------------------------
+      RESULT
+      ----------------------------------------------------
+      */
 
       return {
         content: [{
@@ -1378,22 +1486,22 @@ function registerTools(server) {
 
               errors:
                 scanState.errors
-
             })
         }]
       };
     }
   );
 
+
   /*
   ------------------------------------------------------
-  get_scan_state
+  SCAN STATE
   ------------------------------------------------------
   */
 
   server.tool(
     "get_scan_state",
-    "Return the latest scanner state.",
+    "Return latest scanner state.",
     {},
     async () => ({
       content: [{
@@ -1408,21 +1516,21 @@ function registerTools(server) {
   );
 }
 
+
 /*
---------------------------------------------------------
-MCP SERVER FACTORY
---------------------------------------------------------
+========================================================
+MCP SESSION STORE
+========================================================
+*/
 
-IMPORTANT:
+const sessions =
+  new Map();
 
-A new McpServer is created for every MCP session.
 
-This avoids the previous problem where one McpServer
-was permanently connected to one transport and the
-second request caused:
-
-"Server already initialized"
---------------------------------------------------------
+/*
+========================================================
+CREATE SERVER
+========================================================
 */
 
 function createMcpServer() {
@@ -1443,57 +1551,80 @@ function createMcpServer() {
   return server;
 }
 
-/*
---------------------------------------------------------
-SESSION STORE
---------------------------------------------------------
-*/
-
-const sessions =
-  new Map();
 
 /*
---------------------------------------------------------
-READ JSON BODY
---------------------------------------------------------
+========================================================
+CREATE TRANSPORT
+========================================================
 */
 
-async function readJsonBody(req) {
+function createTransport() {
 
-  const chunks = [];
+  let transport;
 
-  for await (
-    const chunk of req
-  ) {
-    chunks.push(
-      Buffer.isBuffer(chunk)
-        ? chunk
-        : Buffer.from(chunk)
-    );
-  }
+  transport =
+    new StreamableHTTPServerTransport({
 
-  if (!chunks.length) {
-    return undefined;
-  }
+      sessionIdGenerator:
+        () => randomUUID(),
 
-  const raw =
-    Buffer.concat(chunks)
-      .toString("utf8");
+      enableJsonResponse:
+        true,
 
-  if (!raw.trim()) {
-    return undefined;
-  }
+      onsessioninitialized:
+        sessionId => {
 
-  return JSON.parse(raw);
+          sessions.set(
+            sessionId,
+            {
+              transport
+            }
+          );
+
+          log(
+            `MCP session initialized: ${sessionId}`
+          );
+        }
+    });
+
+  transport.onerror =
+    error => {
+
+      log(
+        "MCP transport error:",
+        error
+      );
+    };
+
+  transport.onclose =
+    () => {
+
+      const sessionId =
+        transport.sessionId;
+
+      if (sessionId) {
+
+        sessions.delete(
+          sessionId
+        );
+
+        log(
+          `MCP session closed: ${sessionId}`
+        );
+      }
+    };
+
+  return transport;
 }
 
+
 /*
---------------------------------------------------------
-MCP REQUEST HANDLER
---------------------------------------------------------
+========================================================
+MCP HTTP HANDLER
+========================================================
 */
 
-async function handleMcpRequest(
+async function handleMcp(
   req,
   res
 ) {
@@ -1505,7 +1636,7 @@ async function handleMcpRequest(
 
   /*
   ------------------------------------------------------
-  Existing session
+  EXISTING SESSION
   ------------------------------------------------------
   */
 
@@ -1519,153 +1650,69 @@ async function handleMcpRequest(
         sessionId
       );
 
-    let body;
+    log(
+      `MCP request -> session ${sessionId}`
+    );
 
-    if (
-      req.method === "POST"
-    ) {
-      body =
-        await readJsonBody(
-          req
-        );
-    }
+    /*
+      IMPORTANT:
+      No manual body parsing here.
+      The SDK transport reads the request.
+    */
 
     await session.transport.handleRequest(
       req,
-      res,
-      body
+      res
     );
 
     return;
   }
 
-  /*
-  ------------------------------------------------------
-  New session
-  ------------------------------------------------------
-  */
-
-  if (
-    !sessionId &&
-    req.method === "POST"
-  ) {
-
-    const body =
-      await readJsonBody(
-        req
-      );
-
-    if (
-      isInitializeRequest(
-        body
-      )
-    ) {
-
-      let transport;
-
-      transport =
-        new StreamableHTTPServerTransport({
-          sessionIdGenerator:
-            () => randomUUID(),
-
-          enableJsonResponse:
-            true,
-
-          onsessioninitialized:
-            id => {
-
-              sessions.set(
-                id,
-                {
-                  transport
-                }
-              );
-
-              log(
-                `MCP session initialized: ${id}`
-              );
-            }
-        });
-
-      transport.onclose =
-        () => {
-
-          const id =
-            transport.sessionId;
-
-          if (id) {
-            sessions.delete(
-              id
-            );
-
-            log(
-              `MCP session closed: ${id}`
-            );
-          }
-        };
-
-      const server =
-        createMcpServer();
-
-      await server.connect(
-        transport
-      );
-
-      await transport.handleRequest(
-        req,
-        res,
-        body
-      );
-
-      return;
-    }
-  }
 
   /*
   ------------------------------------------------------
-  Unknown session
+  NEW SESSION
   ------------------------------------------------------
   */
 
-  if (sessionId) {
+  if (!sessionId) {
 
-    res.writeHead(
-      404,
-      {
-        "Content-Type":
-          "application/json"
-      }
+    /*
+      The Streamable HTTP transport itself
+      handles the initialize request.
+    */
+
+    const transport =
+      createTransport();
+
+    const server =
+      createMcpServer();
+
+    await server.connect(
+      transport
     );
 
-    res.end(
-      JSON.stringify({
-        jsonrpc:
-          "2.0",
+    log(
+      `MCP new connection: ${req.method} ${req.url}`
+    );
 
-        error: {
-          code:
-            -32001,
-
-          message:
-            "Session not found"
-        },
-
-        id:
-          null
-      })
+    await transport.handleRequest(
+      req,
+      res
     );
 
     return;
   }
 
+
   /*
   ------------------------------------------------------
-  Missing session
+  UNKNOWN SESSION
   ------------------------------------------------------
   */
 
   res.writeHead(
-    400,
+    404,
     {
       "Content-Type":
         "application/json"
@@ -1679,10 +1726,10 @@ async function handleMcpRequest(
 
       error: {
         code:
-          -32000,
+          -32001,
 
         message:
-          "Bad Request: MCP session ID required"
+          "MCP session not found"
       },
 
       id:
@@ -1691,10 +1738,11 @@ async function handleMcpRequest(
   );
 }
 
+
 /*
---------------------------------------------------------
+========================================================
 HTTP SERVER
---------------------------------------------------------
+========================================================
 */
 
 const httpServer =
@@ -1705,7 +1753,7 @@ const httpServer =
 
         /*
         --------------------------------------------------
-        CORS / basic headers
+        CORS
         --------------------------------------------------
         */
 
@@ -1723,6 +1771,7 @@ const httpServer =
           "Access-Control-Expose-Headers",
           "MCP-Session-Id"
         );
+
 
         /*
         --------------------------------------------------
@@ -1742,6 +1791,7 @@ const httpServer =
 
           return;
         }
+
 
         /*
         --------------------------------------------------
@@ -1764,6 +1814,7 @@ const httpServer =
 
           res.end(
             JSON.stringify({
+
               ok: true,
 
               service:
@@ -1774,11 +1825,13 @@ const httpServer =
 
               sessions:
                 sessions.size
+
             })
           );
 
           return;
         }
+
 
         /*
         --------------------------------------------------
@@ -1790,13 +1843,14 @@ const httpServer =
           req.url === "/mcp"
         ) {
 
-          await handleMcpRequest(
+          await handleMcp(
             req,
             res
           );
 
           return;
         }
+
 
         /*
         --------------------------------------------------
@@ -1814,10 +1868,12 @@ const httpServer =
 
         res.end(
           JSON.stringify({
+
             ok: false,
 
             error:
               "Not found"
+
           })
         );
 
@@ -1842,11 +1898,13 @@ const httpServer =
 
           res.end(
             JSON.stringify({
+
               ok: false,
 
               error:
                 error?.message ||
                 String(error)
+
             })
           );
         }
@@ -1854,10 +1912,11 @@ const httpServer =
     }
   );
 
+
 /*
---------------------------------------------------------
+========================================================
 START
---------------------------------------------------------
+========================================================
 */
 
 httpServer.listen(
