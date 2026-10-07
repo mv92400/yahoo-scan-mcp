@@ -1,40 +1,50 @@
 /*
  * ============================================================
  * YAHOO SCAN MCP
- * Version 1.3.0
+ * Version 1.3.1
  *
  * Architecture:
  *
- *   universe_s0.txt
+ * universe_s0.txt
  *        ↓
- *   UNIVERSE
+ * UNIVERSE
  *        ↓
- *   Yahoo Spark 5d / 5m
+ * Yahoo Spark 5d / 5m
  *        ↓
- *   S0 = ordinary stocks + price < $5
+ * S0 = ordinary stocks + price < $5
  *        ↓
- *   S1 metrics
+ * S1 metrics
  *        ↓
- *   Ranking
+ * Ranking
  *        ↓
- *   Lots of 20
+ * Lots of 20
  *
- * Existing files intentionally preserved:
+ * Existing files:
  *   ./universe_s0.txt
  *   ./src/yahoo-ws.js
  *
- * No fabricated market data.
  * ============================================================
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
+import {
+  McpServer
+} from "@modelcontextprotocol/sdk/server/mcp.js";
+
+import {
+  StreamableHTTPServerTransport
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+
+import {
+  z
+} from "zod";
+
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import { YahooWS } from "./src/yahoo-ws.js";
+import {
+  YahooWS
+} from "./src/yahoo-ws.js";
 
 
 /* ============================================================
@@ -42,16 +52,20 @@ import { YahooWS } from "./src/yahoo-ws.js";
  * ============================================================
  */
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT =
+  Number(process.env.PORT || 8080);
 
-const APP_VERSION = "1.3.0";
+const APP_VERSION =
+  "1.3.1";
 
-const SERVICE_NAME = "yahoo-scan-mcp";
+const SERVICE_NAME =
+  "yahoo-scan-mcp";
 
-const UNIVERSE_FILE = new URL(
-  "./universe_s0.txt",
-  import.meta.url
-);
+const UNIVERSE_FILE =
+  new URL(
+    "./universe_s0.txt",
+    import.meta.url
+  );
 
 const YAHOO_SPARK_URL =
   "https://query1.finance.yahoo.com/v7/finance/spark";
@@ -63,11 +77,17 @@ const YAHOO_SPARK_URL =
  */
 
 function log(...args) {
-  console.log(`[${SERVICE_NAME}]`, ...args);
+  console.log(
+    `[${SERVICE_NAME}]`,
+    ...args
+  );
 }
 
 function logError(...args) {
-  console.error(`[${SERVICE_NAME}]`, ...args);
+  console.error(
+    `[${SERVICE_NAME}]`,
+    ...args
+  );
 }
 
 
@@ -87,34 +107,46 @@ let universeLoadedAt = null;
  */
 
 const scanState = {
+
   ok: true,
 
-  version: APP_VERSION,
+  version:
+    APP_VERSION,
 
-  stage: "IDLE",
+  stage:
+    "IDLE",
 
-  asof: null,
+  asof:
+    null,
 
-  elapsed_ms: 0,
+  elapsed_ms:
+    0,
 
-  symbols_requested: 0,
+  symbols_requested:
+    0,
 
-  source: "Yahoo",
+  source:
+    "Yahoo",
 
-  s0: [],
+  s0:
+    [],
 
-  s1: [],
+  s1:
+    [],
 
-  lots: [],
+  lots:
+    [],
 
-  errors: [],
+  errors:
+    [],
 
-  universe_loaded_at: null
+  universe_loaded_at:
+    null
 };
 
 
 /* ============================================================
- * LOAD MATERIALIZED UNIVERSE
+ * LOAD UNIVERSE
  * ============================================================
  */
 
@@ -124,35 +156,33 @@ async function loadUniverse() {
     return universeCache;
   }
 
-  const raw = await readFile(
-    UNIVERSE_FILE,
-    "utf8"
-  );
+  const raw =
+    await readFile(
+      UNIVERSE_FILE,
+      "utf8"
+    );
 
   const symbols = [];
 
-  const seen = new Set();
+  const seen =
+    new Set();
 
-  for (const line of raw.split(/\r?\n/)) {
+  for (
+    const line of raw.split(/\r?\n/)
+  ) {
 
-    const clean = line.trim();
+    const clean =
+      line.trim();
 
     if (!clean) {
       continue;
     }
 
-    if (clean.startsWith("#")) {
+    if (
+      clean.startsWith("#")
+    ) {
       continue;
     }
-
-    /*
-     * Accept:
-     *
-     * AAPL
-     * AAPL anything
-     *
-     * Only the first token is used.
-     */
 
     const symbol =
       clean
@@ -164,7 +194,9 @@ async function loadUniverse() {
       continue;
     }
 
-    if (seen.has(symbol)) {
+    if (
+      seen.has(symbol)
+    ) {
       continue;
     }
 
@@ -173,7 +205,8 @@ async function loadUniverse() {
     symbols.push(symbol);
   }
 
-  universeCache = symbols;
+  universeCache =
+    symbols;
 
   universeLoadedAt =
     new Date().toISOString();
@@ -186,21 +219,23 @@ async function loadUniverse() {
 
 
 /* ============================================================
- * GENERIC HELPERS
+ * HELPERS
  * ============================================================
  */
 
 function sleep(ms) {
 
-  return new Promise(resolve => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
 }
 
 
 function finiteNumber(value) {
 
-  const n = Number(value);
+  const n =
+    Number(value);
 
   return Number.isFinite(n)
     ? n
@@ -210,8 +245,11 @@ function finiteNumber(value) {
 
 function safeRatio(a, b) {
 
-  const x = finiteNumber(a);
-  const y = finiteNumber(b);
+  const x =
+    finiteNumber(a);
+
+  const y =
+    finiteNumber(b);
 
   if (
     x === null ||
@@ -227,9 +265,12 @@ function safeRatio(a, b) {
 
 function mean(values) {
 
-  const valid = values
-    .map(Number)
-    .filter(Number.isFinite);
+  const valid =
+    values
+      .map(Number)
+      .filter(
+        Number.isFinite
+      );
 
   if (!valid.length) {
     return null;
@@ -237,7 +278,8 @@ function mean(values) {
 
   return (
     valid.reduce(
-      (sum, value) => sum + value,
+      (sum, value) =>
+        sum + value,
       0
     ) / valid.length
   );
@@ -247,58 +289,68 @@ function mean(values) {
 /* ============================================================
  * ORDINARY STOCK FILTER
  * ============================================================
- *
- * We intentionally reject obvious non-equity instruments.
- * The universe is already expected to be NASDAQ-oriented,
- * but the runtime filter remains defensive.
- * ============================================================
  */
 
-function isOrdinaryStock(symbol, quote) {
+function isOrdinaryStock(
+  symbol,
+  quote
+) {
 
   if (!symbol) {
     return false;
   }
 
   const upper =
-    String(symbol).toUpperCase();
-
-  /*
-   * Obvious non-stock symbols.
-   */
+    String(symbol)
+      .toUpperCase();
 
   const rejectedPatterns = [
-    /\^/,          // indices
-    /=F$/,         // FX
-    /-USD$/,       // crypto
-    /USD$/,        // crypto / FX variants
-    /\.FI$/,       // futures / misc
+
+    /\^/,
+
+    /=F$/,
+
+    /-USD$/,
+
+    /USD$/,
+
+    /\.FI$/,
+
     /\.CBT$/,
+
     /\.CME$/,
+
     /\.NYB$/,
+
     /\.COM$/,
+
     /\.CC$/,
+
     /\.TO$/,
+
     /\.V$/,
+
     /\.L$/,
+
     /\.DE$/,
+
     /\.PA$/,
+
     /\.MI$/,
+
     /\.AS$/,
+
     /\.SW$/
   ];
 
   if (
     rejectedPatterns.some(
-      regex => regex.test(upper)
+      regex =>
+        regex.test(upper)
     )
   ) {
     return false;
   }
-
-  /*
-   * Yahoo quote metadata, when available.
-   */
 
   const quoteType =
     quote?.quoteType ||
@@ -306,7 +358,8 @@ function isOrdinaryStock(symbol, quote) {
     "";
 
   const qt =
-    String(quoteType).toUpperCase();
+    String(quoteType)
+      .toUpperCase();
 
   if (
     qt &&
@@ -336,7 +389,12 @@ async function yahooSpark(
   const unique = [
     ...new Set(
       symbols
-        .map(s => String(s).trim().toUpperCase())
+        .map(
+          s =>
+            String(s)
+              .trim()
+              .toUpperCase()
+        )
         .filter(Boolean)
     )
   ];
@@ -348,19 +406,28 @@ async function yahooSpark(
     i < unique.length;
     i += 20
   ) {
+
     batches.push(
-      unique.slice(i, i + 20)
+      unique.slice(
+        i,
+        i + 20
+      )
     );
   }
 
-  const output = new Map();
+  const output =
+    new Map();
 
   const errors = [];
 
-  for (const batch of batches) {
+  for (
+    const batch of batches
+  ) {
 
     const url =
-      new URL(YAHOO_SPARK_URL);
+      new URL(
+        YAHOO_SPARK_URL
+      );
 
     url.searchParams.set(
       "symbols",
@@ -392,9 +459,11 @@ async function yahooSpark(
       "false"
     );
 
-    let success = false;
+    let success =
+      false;
 
-    let lastError = null;
+    let lastError =
+      null;
 
     for (
       let attempt = 1;
@@ -407,7 +476,8 @@ async function yahooSpark(
 
       const timeout =
         setTimeout(
-          () => controller.abort(),
+          () =>
+            controller.abort(),
           20000
         );
 
@@ -417,7 +487,8 @@ async function yahooSpark(
           await fetch(
             url,
             {
-              method: "GET",
+              method:
+                "GET",
 
               headers: {
                 "User-Agent":
@@ -436,7 +507,9 @@ async function yahooSpark(
             }
           );
 
-        if (!response.ok) {
+        if (
+          !response.ok
+        ) {
 
           throw new Error(
             `Yahoo HTTP ${response.status}`
@@ -449,17 +522,22 @@ async function yahooSpark(
         const result =
           data?.spark?.result;
 
-        if (!Array.isArray(result)) {
+        if (
+          !Array.isArray(result)
+        ) {
 
           throw new Error(
             "Yahoo response missing spark.result"
           );
         }
 
-        for (const item of result) {
+        for (
+          const item of result
+        ) {
 
           const symbol =
-            item?.symbol?.toUpperCase();
+            item?.symbol
+              ?.toUpperCase();
 
           if (!symbol) {
             continue;
@@ -471,15 +549,20 @@ async function yahooSpark(
           );
         }
 
-        success = true;
+        success =
+          true;
 
         break;
 
       } catch (error) {
 
-        lastError = error;
+        lastError =
+          error;
 
-        if (attempt < 3) {
+        if (
+          attempt < 3
+        ) {
+
           await sleep(
             400 * attempt
           );
@@ -487,14 +570,19 @@ async function yahooSpark(
 
       } finally {
 
-        clearTimeout(timeout);
+        clearTimeout(
+          timeout
+        );
       }
     }
 
     if (!success) {
 
       errors.push({
-        symbols: batch,
+
+        symbols:
+          batch,
+
         error:
           lastError?.message ||
           "Yahoo request failed"
@@ -503,7 +591,9 @@ async function yahooSpark(
   }
 
   return {
-    data: output,
+    data:
+      output,
+
     errors
   };
 }
@@ -523,9 +613,7 @@ function extractBars(item) {
     item?.indicators?.quote?.[0];
 
   const closes =
-    item?.indicators?.quote?.[0]?.close ||
-    item?.indicators?.close?.[0]?.close ||
-    [];
+    quote?.close || [];
 
   const opens =
     quote?.open || [];
@@ -541,23 +629,26 @@ function extractBars(item) {
 
   const bars = [];
 
-  const length =
-    timestamps.length;
-
   for (
     let i = 0;
-    i < length;
+    i < timestamps.length;
     i++
   ) {
 
     const timestamp =
-      Number(timestamps[i]);
+      Number(
+        timestamps[i]
+      );
 
     const close =
-      finiteNumber(closes[i]);
+      finiteNumber(
+        closes[i]
+      );
 
     const volume =
-      finiteNumber(volumes[i]);
+      finiteNumber(
+        volumes[i]
+      );
 
     if (
       !Number.isFinite(timestamp) ||
@@ -568,16 +659,23 @@ function extractBars(item) {
     }
 
     bars.push({
+
       timestamp,
 
       open:
-        finiteNumber(opens[i]),
+        finiteNumber(
+          opens[i]
+        ),
 
       high:
-        finiteNumber(highs[i]),
+        finiteNumber(
+          highs[i]
+        ),
 
       low:
-        finiteNumber(lows[i]),
+        finiteNumber(
+          lows[i]
+        ),
 
       close,
 
@@ -587,7 +685,8 @@ function extractBars(item) {
 
   bars.sort(
     (a, b) =>
-      a.timestamp - b.timestamp
+      a.timestamp -
+      b.timestamp
   );
 
   return bars;
@@ -599,17 +698,9 @@ function extractBars(item) {
  * ============================================================
  */
 
-function sessionKey(timestamp) {
-
-  const date =
-    new Date(timestamp * 1000);
-
-  /*
-   * Yahoo timestamps are UTC.
-   *
-   * We use the NY market date by formatting
-   * in America/New_York.
-   */
+function sessionKey(
+  timestamp
+) {
 
   return new Intl.DateTimeFormat(
     "en-CA",
@@ -617,13 +708,20 @@ function sessionKey(timestamp) {
       timeZone:
         "America/New_York",
 
-      year: "numeric",
+      year:
+        "numeric",
 
-      month: "2-digit",
+      month:
+        "2-digit",
 
-      day: "2-digit"
+      day:
+        "2-digit"
     }
-  ).format(date);
+  ).format(
+    new Date(
+      timestamp * 1000
+    )
+  );
 }
 
 
@@ -632,13 +730,17 @@ function sessionKey(timestamp) {
  * ============================================================
  */
 
-function calculateVWAP(bars) {
+function calculateVWAP(
+  bars
+) {
 
   let cumulativePV = 0;
 
   let cumulativeVolume = 0;
 
-  for (const bar of bars) {
+  for (
+    const bar of bars
+  ) {
 
     if (
       bar.high === null ||
@@ -678,7 +780,7 @@ function calculateVWAP(bars) {
 
 
 /* ============================================================
- * S1 CALCULATION
+ * S1
  * ============================================================
  */
 
@@ -687,39 +789,49 @@ function calculateS1(
   bars
 ) {
 
-  if (!Array.isArray(bars)) {
+  if (
+    !Array.isArray(bars)
+  ) {
+    return null;
+  }
+
+  if (
+    bars.length < 4
+  ) {
     return null;
   }
 
   /*
-   * We need enough completed candles.
-   */
-
-  if (bars.length < 4) {
-    return null;
-  }
-
-  /*
-   * Last Yahoo candle can be incomplete.
-   *
-   * We deliberately exclude it.
+   * Exclude potentially incomplete
+   * last Yahoo candle.
    */
 
   const completed =
-    bars.slice(0, -1);
+    bars.slice(
+      0,
+      -1
+    );
 
-  if (completed.length < 4) {
+  if (
+    completed.length < 4
+  ) {
     return null;
   }
 
   const current =
-    completed[completed.length - 1];
+    completed[
+      completed.length - 1
+    ];
 
   const previous =
-    completed[completed.length - 2];
+    completed[
+      completed.length - 2
+    ];
 
   const previous2 =
-    completed[completed.length - 3];
+    completed[
+      completed.length - 3
+    ];
 
   if (
     !current ||
@@ -730,7 +842,7 @@ function calculateS1(
   }
 
   /*
-   * Last 15 minutes = 3 completed 5m bars.
+   * Last 15 minutes.
    */
 
   const last3 =
@@ -741,17 +853,15 @@ function calculateS1(
       (sum, bar) =>
         sum +
         (
-          finiteNumber(bar.volume) ||
-          0
+          finiteNumber(
+            bar.volume
+          ) || 0
         ),
       0
     );
 
   /*
-   * Acceleration:
-   *
-   * current 5m volume /
-   * mean of preceding 3 completed 5m volumes
+   * Acceleration.
    */
 
   const preceding3 =
@@ -766,7 +876,8 @@ function calculateS1(
   const baseline5m =
     mean(
       preceding3.map(
-        bar => bar.volume
+        bar =>
+          bar.volume
       )
     );
 
@@ -777,7 +888,7 @@ function calculateS1(
     );
 
   /*
-   * Current NY session.
+   * Current session.
    */
 
   const currentSession =
@@ -794,7 +905,7 @@ function calculateS1(
     );
 
   /*
-   * VWAP only on the current session.
+   * VWAP.
    */
 
   const vwap =
@@ -811,19 +922,25 @@ function calculateS1(
       : null;
 
   /*
-   * J-1 / J-2 volume.
+   * Historical sessions.
    */
 
-  const sessions = new Map();
+  const sessions =
+    new Map();
 
-  for (const bar of completed) {
+  for (
+    const bar of completed
+  ) {
 
     const key =
       sessionKey(
         bar.timestamp
       );
 
-    if (!sessions.has(key)) {
+    if (
+      !sessions.has(key)
+    ) {
+
       sessions.set(
         key,
         []
@@ -840,54 +957,49 @@ function calculateS1(
       .sort()
       .reverse();
 
-  const previousSessionKey =
+  const j1Key =
     sessionKeys[1];
 
-  const previous2SessionKey =
+  const j2Key =
     sessionKeys[2];
 
-  const previousSessionBars =
-    previousSessionKey
-      ? sessions.get(
-          previousSessionKey
-        ) || []
+  const j1Bars =
+    j1Key
+      ? sessions.get(j1Key) || []
       : [];
 
-  const previous2SessionBars =
-    previous2SessionKey
-      ? sessions.get(
-          previous2SessionKey
-        ) || []
+  const j2Bars =
+    j2Key
+      ? sessions.get(j2Key) || []
       : [];
 
   const j1 =
-    previousSessionBars.reduce(
+    j1Bars.reduce(
       (sum, bar) =>
         sum +
         (
-          finiteNumber(bar.volume) ||
-          0
+          finiteNumber(
+            bar.volume
+          ) || 0
         ),
       0
     );
 
   const j2 =
-    previous2SessionBars.reduce(
+    j2Bars.reduce(
       (sum, bar) =>
         sum +
         (
-          finiteNumber(bar.volume) ||
-          0
+          finiteNumber(
+            bar.volume
+          ) || 0
         ),
       0
     );
 
   /*
-   * Intraday RVOL.
-   *
-   * Compare the current 15m volume
-   * with equivalent 15m windows from
-   * prior sessions.
+   * RVOL 15m against equivalent
+   * intraday windows from prior sessions.
    */
 
   const currentIndex =
@@ -897,7 +1009,8 @@ function calculateS1(
         current.timestamp
     );
 
-  let rvol15m = null;
+  let rvol15m =
+    null;
 
   if (
     currentIndex >= 2
@@ -905,10 +1018,7 @@ function calculateS1(
 
     const currentWindow =
       currentSessionBars.slice(
-        Math.max(
-          0,
-          currentIndex - 2
-        ),
+        currentIndex - 2,
         currentIndex + 1
       );
 
@@ -917,36 +1027,34 @@ function calculateS1(
         (sum, bar) =>
           sum +
           (
-            finiteNumber(bar.volume) ||
-            0
+            finiteNumber(
+              bar.volume
+            ) || 0
           ),
         0
       );
 
-    const priorSessionVolumes = [];
+    const historicalVolumes =
+      [];
 
-    const priorKeys =
-      sessionKeys.slice(
+    for (
+      const key of sessionKeys.slice(
         1,
         3
-      );
+      )
+    ) {
 
-    for (const key of priorKeys) {
-
-      const sessionBars =
+      const historicalBars =
         sessions.get(key) || [];
 
       if (
-        sessionBars.length >
+        historicalBars.length >
         currentIndex
       ) {
 
         const comparable =
-          sessionBars.slice(
-            Math.max(
-              0,
-              currentIndex - 2
-            ),
+          historicalBars.slice(
+            currentIndex - 2,
             currentIndex + 1
           );
 
@@ -962,8 +1070,10 @@ function calculateS1(
             0
           );
 
-        if (volume > 0) {
-          priorSessionVolumes.push(
+        if (
+          volume > 0
+        ) {
+          historicalVolumes.push(
             volume
           );
         }
@@ -972,7 +1082,7 @@ function calculateS1(
 
     const baseline =
       mean(
-        priorSessionVolumes
+        historicalVolumes
       );
 
     if (
@@ -995,9 +1105,13 @@ function calculateS1(
       (max, bar) => {
 
         const high =
-          finiteNumber(bar.high);
+          finiteNumber(
+            bar.high
+          );
 
-        if (high === null) {
+        if (
+          high === null
+        ) {
           return max;
         }
 
@@ -1018,20 +1132,16 @@ function calculateS1(
       : null;
 
   /*
-   * Last 5m change.
+   * 5m changes.
    */
 
-  const change5m =
+  const change5mRaw =
     safeRatio(
       current.close,
       previous.close
     );
 
-  /*
-   * Previous 5m change.
-   */
-
-  const previousChange5m =
+  const previousChange5mRaw =
     safeRatio(
       previous.close,
       previous2.close
@@ -1073,13 +1183,13 @@ function calculateS1(
     hodDistance,
 
     change5m:
-      change5m !== null
-        ? change5m - 1
+      change5mRaw !== null
+        ? change5mRaw - 1
         : null,
 
     previousChange5m:
-      previousChange5m !== null
-        ? previousChange5m - 1
+      previousChange5mRaw !== null
+        ? previousChange5mRaw - 1
         : null,
 
     bars:
@@ -1093,7 +1203,9 @@ function calculateS1(
  * ============================================================
  */
 
-function getCurrentPrice(item) {
+function getCurrentPrice(
+  item
+) {
 
   const meta =
     item?.meta;
@@ -1109,21 +1221,12 @@ function getCurrentPrice(item) {
     return regularMarketPrice;
   }
 
-  const chartPreviousClose =
-    finiteNumber(
-      meta?.chartPreviousClose
-    );
-
-  if (
-    chartPreviousClose !== null
-  ) {
-    return chartPreviousClose;
-  }
-
   const bars =
     extractBars(item);
 
-  if (bars.length) {
+  if (
+    bars.length
+  ) {
 
     return bars[
       bars.length - 1
@@ -1135,7 +1238,7 @@ function getCurrentPrice(item) {
 
 
 /* ============================================================
- * LOT FORMATION
+ * LOTS
  * ============================================================
  */
 
@@ -1153,6 +1256,7 @@ function makeLots(
   ) {
 
     lots.push({
+
       lot:
         lots.length + 1,
 
@@ -1164,9 +1268,13 @@ function makeLots(
 
       symbols:
         rows
-          .slice(i, i + size)
+          .slice(
+            i,
+            i + size
+          )
           .map(
-            row => row.symbol
+            row =>
+              row.symbol
           )
     });
   }
@@ -1176,7 +1284,7 @@ function makeLots(
 
 
 /* ============================================================
- * YAHOO WS TEST
+ * YAHOO WEBSOCKET TEST
  * ============================================================
  */
 
@@ -1202,20 +1310,19 @@ async function runYahooWSTest() {
       symbols
     );
 
-    /*
-     * Give Yahoo enough time to send
-     * live messages.
-     */
-
-    await sleep(10000);
+    await sleep(
+      10000
+    );
 
     const status =
-      typeof ws.getStatus === "function"
+      typeof ws.getStatus ===
+      "function"
         ? ws.getStatus()
         : null;
 
     const latest =
-      typeof ws.getLatest === "function"
+      typeof ws.getLatest ===
+      "function"
         ? ws.getLatest()
         : null;
 
@@ -1252,7 +1359,8 @@ async function runYahooWSTest() {
       latest,
 
       elapsed_ms:
-        Date.now() - started
+        Date.now() -
+        started
     };
 
   } finally {
@@ -1260,8 +1368,10 @@ async function runYahooWSTest() {
     try {
 
       if (
-        typeof ws.close === "function"
+        typeof ws.close ===
+        "function"
       ) {
+
         await ws.close();
       }
 
@@ -1278,7 +1388,7 @@ async function runYahooWSTest() {
 
 
 /* ============================================================
- * MAIN S0 / S1 SCAN
+ * S0 / S1 SCAN
  * ============================================================
  */
 
@@ -1290,7 +1400,8 @@ async function runS0S1Scan({
   const started =
     Date.now();
 
-  scanState.ok = true;
+  scanState.ok =
+    true;
 
   scanState.version =
     APP_VERSION;
@@ -1307,17 +1418,17 @@ async function runS0S1Scan({
   scanState.symbols_requested =
     0;
 
-  scanState.s0 = [];
+  scanState.s0 =
+    [];
 
-  scanState.s1 = [];
+  scanState.s1 =
+    [];
 
-  scanState.lots = [];
+  scanState.lots =
+    [];
 
-  scanState.errors = [];
-
-  /*
-   * Validate limit.
-   */
+  scanState.errors =
+    [];
 
   const limit =
     Math.min(
@@ -1327,10 +1438,6 @@ async function runS0S1Scan({
         Number(s1_limit) || 50
       )
     );
-
-  /*
-   * Universe.
-   */
 
   const requested =
     Array.isArray(symbols) &&
@@ -1353,7 +1460,7 @@ async function runS0S1Scan({
     requested.length;
 
   /*
-   * Yahoo data.
+   * Yahoo.
    */
 
   scanState.stage =
@@ -1479,55 +1586,50 @@ async function runS0S1Scan({
 
   /*
    * Ranking.
-   *
-   * Primary:
-   *   RVOL15M
-   *
-   * Secondary:
-   *   Accel5M
-   *
-   * Tertiary:
-   *   priceVsVWAP
-   *
-   * Nulls are always last.
    */
 
   s1.sort(
     (a, b) => {
 
       const ar =
-        a.RVOL15M ?? -Infinity;
+        a.RVOL15M ??
+        -Infinity;
 
       const br =
-        b.RVOL15M ?? -Infinity;
+        b.RVOL15M ??
+        -Infinity;
 
-      if (br !== ar) {
+      if (
+        br !== ar
+      ) {
         return br - ar;
       }
 
       const aa =
-        a.Accel5M ?? -Infinity;
+        a.Accel5M ??
+        -Infinity;
 
       const ba =
-        b.Accel5M ?? -Infinity;
+        b.Accel5M ??
+        -Infinity;
 
-      if (ba !== aa) {
+      if (
+        ba !== aa
+      ) {
         return ba - aa;
       }
 
       const av =
-        a.priceVsVWAP ?? -Infinity;
+        a.priceVsVWAP ??
+        -Infinity;
 
       const bv =
-        b.priceVsVWAP ?? -Infinity;
+        b.priceVsVWAP ??
+        -Infinity;
 
       return bv - av;
     }
   );
-
-  /*
-   * Keep only requested ranking depth.
-   */
 
   const ranked =
     s1.slice(
@@ -1551,15 +1653,12 @@ async function runS0S1Scan({
       20
     );
 
-  /*
-   * Complete.
-   */
-
   scanState.stage =
     "S0_S1";
 
   scanState.elapsed_ms =
-    Date.now() - started;
+    Date.now() -
+    started;
 
   return {
 
@@ -1598,122 +1697,89 @@ async function runS0S1Scan({
 
 
 /* ============================================================
- * TOOL REGISTRATION
+ * MCP TOOLS
  * ============================================================
  */
 
-function registerTools(server) {
-
-  /*
-   * ----------------------------------------------------------
-   * PING
-   * ----------------------------------------------------------
-   */
+function registerTools(
+  server
+) {
 
   server.tool(
-
     "ping",
-
     "Check that Yahoo Scan MCP is alive.",
-
     {},
+    async () => ({
+      content: [
+        {
+          type: "text",
 
-    async () => {
+          text:
+            JSON.stringify({
 
-      return {
+              ok: true,
 
-        content: [
-          {
-            type: "text",
+              service:
+                SERVICE_NAME,
 
-            text:
-              JSON.stringify({
-                ok: true,
+              version:
+                APP_VERSION,
 
-                service:
-                  SERVICE_NAME,
-
-                version:
-                  APP_VERSION,
-
-                timestamp:
-                  new Date().toISOString()
-              })
-          }
-        ]
-      };
-    }
+              timestamp:
+                new Date()
+                  .toISOString()
+            })
+        }
+      ]
+    })
   );
 
 
-  /*
-   * ----------------------------------------------------------
-   * GET STATUS
-   * ----------------------------------------------------------
-   */
-
   server.tool(
-
     "get_status",
-
     "Return server, Yahoo and scan status.",
-
     {},
+    async () => ({
+      content: [
+        {
+          type: "text",
 
-    async () => {
+          text:
+            JSON.stringify({
 
-      return {
+              ok: true,
 
-        content: [
-          {
-            type: "text",
+              service:
+                SERVICE_NAME,
 
-            text:
-              JSON.stringify({
+              version:
+                APP_VERSION,
 
-                ok: true,
+              yahoo: {
 
-                service:
-                  SERVICE_NAME,
+                connected:
+                  false,
 
-                version:
-                  APP_VERSION,
+                mode:
+                  "on-demand",
 
-                yahoo: {
-                  connected: false,
+                note:
+                  "Yahoo WebSocket is created by yahoo_ws_test."
+              },
 
-                  mode:
-                    "on-demand",
-
-                  note:
-                    "Yahoo WebSocket is created by yahoo_ws_test."
-                },
-
-                scan:
-                  scanState
-
-              })
-          }
-        ]
-      };
-    }
+              scan:
+                scanState
+            })
+        }
+      ]
+    })
   );
 
 
-  /*
-   * ----------------------------------------------------------
-   * GET UNIVERSE
-   * ----------------------------------------------------------
-   */
-
   server.tool(
-
     "get_universe",
-
-    "Return the materialized S0 universe loaded from universe_s0.txt.",
-
+    "Return the materialized S0 universe.",
     {},
-
     async () => {
 
       try {
@@ -1743,7 +1809,6 @@ function registerTools(server) {
 
                   symbols:
                     universe
-
                 })
             }
           ]
@@ -1765,32 +1830,22 @@ function registerTools(server) {
                   error:
                     error?.message ||
                     String(error)
-
                 })
             }
           ],
 
-          isError: true
+          isError:
+            true
         };
       }
     }
   );
 
 
-  /*
-   * ----------------------------------------------------------
-   * YAHOO WS TEST
-   * ----------------------------------------------------------
-   */
-
   server.tool(
-
     "yahoo_ws_test",
-
-    "Test the Yahoo WebSocket using AAPL, MSFT and NVDA.",
-
+    "Test the Yahoo WebSocket.",
     {},
-
     async () => {
 
       try {
@@ -1805,7 +1860,9 @@ function registerTools(server) {
               type: "text",
 
               text:
-                JSON.stringify(result)
+                JSON.stringify(
+                  result
+                )
             }
           ]
         };
@@ -1826,36 +1883,29 @@ function registerTools(server) {
                   error:
                     error?.message ||
                     String(error)
-
                 })
             }
           ],
 
-          isError: true
+          isError:
+            true
         };
       }
     }
   );
 
 
-  /*
-   * ----------------------------------------------------------
-   * S0 / S1 SCAN
-   * ----------------------------------------------------------
-   */
-
   server.tool(
 
     "yahoo_s0_s1_scan",
 
-    "Run the Yahoo S0/S1 scan. If symbols are omitted, the materialized universe_s0.txt is used.",
+    "Run S0/S1 using universe_s0.txt unless symbols are supplied.",
 
     {
       symbols:
         z.array(
           z.string()
-        )
-        .optional(),
+        ).optional(),
 
       s1_limit:
         z.number()
@@ -1874,6 +1924,7 @@ function registerTools(server) {
 
         const result =
           await runS0S1Scan({
+
             symbols:
               symbols ?? null,
 
@@ -1888,27 +1939,26 @@ function registerTools(server) {
               type: "text",
 
               text:
-                JSON.stringify(result)
+                JSON.stringify(
+                  result
+                )
             }
           ]
         };
 
       } catch (error) {
 
-        scanState.ok = false;
+        scanState.ok =
+          false;
 
         scanState.stage =
           "ERROR";
-
-        scanState.elapsed_ms =
-          0;
 
         scanState.errors.push({
 
           error:
             error?.message ||
             String(error)
-
         });
 
         return {
@@ -1928,48 +1978,34 @@ function registerTools(server) {
                   error:
                     error?.message ||
                     String(error)
-
                 })
             }
           ],
 
-          isError: true
+          isError:
+            true
         };
       }
     }
   );
 
 
-  /*
-   * ----------------------------------------------------------
-   * GET SCAN STATE
-   * ----------------------------------------------------------
-   */
-
   server.tool(
-
     "get_scan_state",
-
-    "Return the complete current S0/S1 scan state.",
-
+    "Return the current scan state.",
     {},
+    async () => ({
+      content: [
+        {
+          type: "text",
 
-    async () => {
-
-      return {
-
-        content: [
-          {
-            type: "text",
-
-            text:
-              JSON.stringify(
-                scanState
-              )
-          }
-        ]
-      };
-    }
+          text:
+            JSON.stringify(
+              scanState
+            )
+        }
+      ]
+    })
   );
 
 
@@ -2002,7 +2038,6 @@ function createMcpServer() {
 
       version:
         APP_VERSION
-
     });
 
   registerTools(
@@ -2014,7 +2049,7 @@ function createMcpServer() {
 
 
 /* ============================================================
- * SESSION STORE
+ * MCP SESSION STORE
  * ============================================================
  */
 
@@ -2023,7 +2058,7 @@ const sessions =
 
 
 /* ============================================================
- * CREATE TRANSPORT
+ * TRANSPORT
  * ============================================================
  */
 
@@ -2032,17 +2067,8 @@ function createTransport() {
   const transport =
     new StreamableHTTPServerTransport({
 
-      /*
-       * Stateful MCP sessions.
-       */
-
       sessionIdGenerator:
         () => randomUUID(),
-
-      /*
-       * Normal JSON responses for ordinary
-       * request/response tool calls.
-       */
 
       enableJsonResponse:
         true,
@@ -2066,11 +2092,6 @@ function createTransport() {
 
   transport.onerror =
     error => {
-
-      /*
-       * Expected protocol negotiation errors
-       * are logged, never swallowed.
-       */
 
       logError(
         "MCP transport error:",
@@ -2102,7 +2123,7 @@ function createTransport() {
 
 
 /* ============================================================
- * HTTP HELPERS
+ * CORS
  * ============================================================
  */
 
@@ -2136,13 +2157,20 @@ function setCors(res) {
 }
 
 
+/* ============================================================
+ * JSON RESPONSE
+ * ============================================================
+ */
+
 function sendJson(
   res,
   status,
   body
 ) {
 
-  if (!res.headersSent) {
+  if (
+    !res.headersSent
+  ) {
 
     res.statusCode =
       status;
@@ -2160,7 +2188,7 @@ function sendJson(
 
 
 /* ============================================================
- * MCP HTTP HANDLER
+ * MCP REQUEST
  * ============================================================
  */
 
@@ -2171,23 +2199,51 @@ async function handleMcp(
 
   /*
    * ----------------------------------------------------------
-   * IMPORTANT:
+   * CRITICAL COMPATIBILITY FIX
    *
-   * Do NOT manually parse the MCP body.
+   * Some MCP clients do not advertise
+   * text/event-stream although the Streamable
+   * HTTP transport validates its presence.
    *
-   * StreamableHTTPServerTransport owns MCP request parsing.
+   * We do not alter the JSON-RPC payload.
+   *
+   * We only make the Accept header compatible
+   * with the MCP transport.
    * ----------------------------------------------------------
+   */
+
+  const originalAccept =
+    String(
+      req.headers.accept || ""
+    );
+
+  if (
+    !originalAccept
+      .toLowerCase()
+      .includes(
+        "text/event-stream"
+      )
+  ) {
+
+    req.headers.accept =
+      originalAccept
+        ? `${originalAccept}, text/event-stream`
+        : "application/json, text/event-stream";
+
+    log(
+      "Normalized MCP Accept header"
+    );
+  }
+
+
+  /*
+   * Existing session.
    */
 
   const sessionId =
     req.headers[
       "mcp-session-id"
     ];
-
-
-  /*
-   * Existing session.
-   */
 
   if (sessionId) {
 
@@ -2206,6 +2262,7 @@ async function handleMcp(
             "2.0",
 
           error: {
+
             code:
               -32000,
 
@@ -2233,102 +2290,10 @@ async function handleMcp(
 
 
   /*
-   * New session.
+   * New MCP session.
    *
-   * We only create a new MCP server for
-   * an initialization request.
+   * Do NOT manually parse the request body.
    */
-
-  const contentType =
-    String(
-      req.headers[
-        "content-type"
-      ] || ""
-    ).toLowerCase();
-
-  const method =
-    String(
-      req.method || ""
-    ).toUpperCase();
-
-  /*
-   * GET without an existing session is not
-   * a valid way to initialize a stateful MCP
-   * session.
-   */
-
-  if (
-    method === "GET"
-  ) {
-
-    sendJson(
-      res,
-      400,
-      {
-        jsonrpc:
-          "2.0",
-
-        error: {
-          code:
-            -32000,
-
-          message:
-            "MCP session ID required"
-        },
-
-        id:
-          null
-      }
-    );
-
-    return;
-  }
-
-  /*
-   * A POST without a session is allowed only
-   * for initialization.
-   *
-   * We deliberately let the MCP transport
-   * validate the JSON-RPC initialize request.
-   */
-
-  if (
-    method !== "POST"
-  ) {
-
-    sendJson(
-      res,
-      405,
-      {
-        error:
-          "Method Not Allowed"
-      }
-    );
-
-    return;
-  }
-
-  /*
-   * MCP requests must be JSON.
-   */
-
-  if (
-    !contentType.includes(
-      "application/json"
-    )
-  ) {
-
-    sendJson(
-      res,
-      415,
-      {
-        error:
-          "Content-Type must be application/json"
-      }
-    );
-
-    return;
-  }
 
   const transport =
     createTransport();
@@ -2336,19 +2301,9 @@ async function handleMcp(
   const server =
     createMcpServer();
 
-  /*
-   * Connect exactly once.
-   */
-
   await server.connect(
     transport
   );
-
-  /*
-   * Transport handles the request.
-   *
-   * No manual body parsing.
-   */
 
   await transport.handleRequest(
     req,
@@ -2369,7 +2324,7 @@ const httpServer =
       setCors(res);
 
       /*
-       * CORS preflight.
+       * CORS.
        */
 
       if (
@@ -2388,14 +2343,15 @@ const httpServer =
       const url =
         new URL(
           req.url || "/",
-          `http://${req.headers.host || "localhost"}`
+          `http://${
+            req.headers.host ||
+            "localhost"
+          }`
         );
 
 
       /*
-       * ------------------------------------------------------
        * ROOT
-       * ------------------------------------------------------
        */
 
       if (
@@ -2406,6 +2362,7 @@ const httpServer =
           res,
           200,
           {
+
             ok: true,
 
             service:
@@ -2430,9 +2387,7 @@ const httpServer =
 
 
       /*
-       * ------------------------------------------------------
        * HEALTH
-       * ------------------------------------------------------
        */
 
       if (
@@ -2444,6 +2399,7 @@ const httpServer =
           res,
           200,
           {
+
             ok: true,
 
             service:
@@ -2472,13 +2428,12 @@ const httpServer =
 
 
       /*
-       * ------------------------------------------------------
        * MCP
-       * ------------------------------------------------------
        */
 
       if (
-        url.pathname === "/mcp"
+        url.pathname ===
+        "/mcp"
       ) {
 
         try {
@@ -2503,10 +2458,12 @@ const httpServer =
               res,
               500,
               {
+
                 jsonrpc:
                   "2.0",
 
                 error: {
+
                   code:
                     -32603,
 
@@ -2533,15 +2490,14 @@ const httpServer =
 
 
       /*
-       * ------------------------------------------------------
        * 404
-       * ------------------------------------------------------
        */
 
       sendJson(
         res,
         404,
         {
+
           ok: false,
 
           error:
@@ -2553,7 +2509,7 @@ const httpServer =
 
 
 /* ============================================================
- * SERVER ERROR
+ * HTTP ERROR
  * ============================================================
  */
 
@@ -2588,18 +2544,18 @@ httpServer.listen(
     );
 
     log(
-      `MCP endpoint: /mcp`
+      "MCP endpoint: /mcp"
     );
 
     log(
-      `Health endpoint: /health`
+      "Health endpoint: /health"
     );
   }
 );
 
 
 /* ============================================================
- * GRACEFUL SHUTDOWN
+ * SHUTDOWN
  * ============================================================
  */
 
@@ -2650,10 +2606,12 @@ async function shutdown(
 
 process.on(
   "SIGTERM",
-  () => shutdown("SIGTERM")
+  () =>
+    shutdown("SIGTERM")
 );
 
 process.on(
   "SIGINT",
-  () => shutdown("SIGINT")
+  () =>
+    shutdown("SIGINT")
 );
