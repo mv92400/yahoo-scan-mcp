@@ -1,16 +1,39 @@
 /*
 ============================================================
  Yahoo Scan MCP
- Version 1.7.1
+ Version 1.8.0
 ============================================================
-- Yahoo Chart OHLCV
-- S0 historique 15m
-- S1 intraday 5m
-- RVOL15M
+Architecture :
+
+S0
+- Universe NASDAQ / ordinary stocks
+- Price < $5
+- Historique 15m
+- J-1 / J-2 FILTER EXCLUSIVELY HERE
+- RVOL15M historical baseline
+- Materialized S0
+
+S1
+- Intraday 5m
+- Dynamic as-of
 - VWAP
+- RVOL15M
 - Accel5M
 - HOD / HOD distance
-- Streamable HTTP stateless
+- STRICT BLOCKING FILTER
+- NO J-1 / J-2 FILTER
+- Anti-leak validation
+- Materialized S1
+
+SF
+- Works ONLY from validated S1
+- Revalidates configured intraday thresholds
+- Strict blocking filter
+- Winner Gate
+
+Transport
+- Streamable HTTP
+- Stateless
 - 11 MCP tools
 ============================================================
 */
@@ -27,7 +50,7 @@ import { z } from "zod";
    CONFIG
 ========================================================= */
 
-const APP_VERSION = "1.7.1";
+const APP_VERSION = "1.8.0";
 
 const PORT =
   Number(process.env.PORT || 8080);
@@ -42,6 +65,33 @@ const S0_INTERVAL = "15m";
 
 const S1_RANGE = "1d";
 const S1_INTERVAL = "5m";
+
+/*
+------------------------------------------------------------
+STRATEGY THRESHOLDS
+------------------------------------------------------------
+
+IMPORTANT:
+Do not modify these without a strategy re-validation.
+
+J-1 / J-2:
+maximum absolute session performance = 5%
+
+S1:
+Price vs VWAP >= -1%
+RVOL15M >= 1.30
+Accel5M >= 20%
+
+SF:
+defaults remain identical to the tested architecture.
+------------------------------------------------------------
+*/
+
+const MAX_J1_J2_PCT = 5;
+
+const S1_MIN_PRICE_VS_VWAP_PCT = -1;
+const S1_MIN_RVOL15M = 1.30;
+const S1_MIN_ACCEL5M = 20;
 
 const MIN_S0_HISTORICAL_SESSIONS = 5;
 const MIN_S0_VALID_VOLUME_BARS = 20;
@@ -121,6 +171,7 @@ const scanState = {
 
   last_error:
     null
+
 };
 
 
@@ -163,7 +214,10 @@ function median(values) {
 
   const arr =
     values
-      .filter(Number.isFinite)
+      .filter(
+        value =>
+          Number.isFinite(value)
+      )
       .sort(
         (a, b) =>
           a - b
@@ -876,12 +930,18 @@ function getSessionBars(
 
 
 function getCurrentSessionBars(
-  bars
+  bars,
+  asofMs = Date.now()
 ) {
 
   const sessions =
     getSessionBars(
       bars
+        .filter(
+          bar =>
+            bar.ts <=
+            asofMs + 1000
+        )
     );
 
   const dates =
@@ -1067,6 +1127,41 @@ function buildRvol15mBaseline(
 
 
 /* =========================================================
+   S0 J-1 / J-2 FILTER
+========================================================= */
+
+function passesS0HistoricalFilter(
+  j1Pct,
+  j2Pct
+) {
+
+  if (
+    !Number.isFinite(j1Pct) ||
+    !Number.isFinite(j2Pct)
+  ) {
+    return false;
+  }
+
+  if (
+    Math.abs(j1Pct) >
+    MAX_J1_J2_PCT
+  ) {
+    return false;
+  }
+
+  if (
+    Math.abs(j2Pct) >
+    MAX_J1_J2_PCT
+  ) {
+    return false;
+  }
+
+  return true;
+
+}
+
+
+/* =========================================================
    S0
 ========================================================= */
 
@@ -1196,6 +1291,33 @@ function calculateS0(
     return null;
   }
 
+  const j1Pct =
+    sessionPerformance(
+      previous
+    );
+
+  const j2Pct =
+    sessionPerformance(
+      previous2
+    );
+
+  /*
+  ----------------------------------------------------------
+  IMPORTANT:
+  J-1 / J-2 are filtered HERE.
+  They do NOT belong to S1.
+  ----------------------------------------------------------
+  */
+
+  if (
+    !passesS0HistoricalFilter(
+      j1Pct,
+      j2Pct
+    )
+  ) {
+    return null;
+  }
+
   const rvol15mBaseline =
     buildRvol15mBaseline(
       completedSessions
@@ -1216,14 +1338,10 @@ function calculateS0(
     price,
 
     j1_pct:
-      sessionPerformance(
-        previous
-      ),
+      j1Pct,
 
     j2_pct:
-      sessionPerformance(
-        previous2
-      ),
+      j2Pct,
 
     historical_sessions:
       completedSessions.length,
@@ -1310,7 +1428,8 @@ function calculateVWAP(
 function calculateS1(
   symbol,
   item,
-  s0Record
+  s0Record,
+  asofMs
 ) {
 
   if (!s0Record) {
@@ -1322,20 +1441,40 @@ function calculateS1(
       item
     );
 
-  const currentSession =
-    getCurrentSessionBars(
-      bars
+  /*
+  ----------------------------------------------------------
+  FUTURE DATA PROTECTION
+  ----------------------------------------------------------
+  Never use a candle after the requested/current as-of.
+  ----------------------------------------------------------
+  */
+
+  const eligibleBars =
+    bars.filter(
+      bar =>
+        bar.ts <=
+        asofMs + 1000
     );
 
-  const now =
-    Date.now();
+  const currentSession =
+    getCurrentSessionBars(
+      eligibleBars,
+      asofMs
+    );
+
+  /*
+  Yahoo 5m candle:
+  A candle ending after as-of must not be used.
+  ----------------------------------------------------------
+  */
 
   const completed =
     currentSession.filter(
       bar =>
         bar.ts +
         5 * 60 * 1000
-        <= now + 1000
+        <=
+        asofMs + 1000
     );
 
   if (
@@ -1515,6 +1654,14 @@ function calculateS1(
         ) * 100
       : null;
 
+  /*
+  ----------------------------------------------------------
+  IMPORTANT:
+  No J-1 / J-2 filtering here.
+  They have already been filtered by S0.
+  ----------------------------------------------------------
+  */
+
   return {
 
     symbol,
@@ -1523,6 +1670,11 @@ function calculateS1(
 
     ts:
       last.ts,
+
+    asof:
+      new Date(
+        asofMs
+      ).toISOString(),
 
     session_date:
       nyDateKey(
@@ -1553,15 +1705,120 @@ function calculateS1(
       change5m,
 
     change10m_pct:
-      change10m,
-
-    j1_pct:
-      s0Record.j1_pct,
-
-    j2_pct:
-      s0Record.j2_pct
+      change10m
 
   };
+
+}
+
+
+/* =========================================================
+   S1 STRICT FILTER
+========================================================= */
+
+function passesS1Filters(
+  record
+) {
+
+  if (!record) {
+    return false;
+  }
+
+  /*
+  ----------------------------------------------------------
+  1. PRICE VS VWAP
+  ----------------------------------------------------------
+  */
+
+  if (
+    !Number.isFinite(
+      record.price_vs_vwap_pct
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    record.price_vs_vwap_pct <
+    S1_MIN_PRICE_VS_VWAP_PCT
+  ) {
+    return false;
+  }
+
+  /*
+  ----------------------------------------------------------
+  2. RVOL15M
+  ----------------------------------------------------------
+  */
+
+  if (
+    !Number.isFinite(
+      record.rvol15m
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    record.rvol15m <
+    S1_MIN_RVOL15M
+  ) {
+    return false;
+  }
+
+  /*
+  ----------------------------------------------------------
+  3. ACCEL5M
+  ----------------------------------------------------------
+  */
+
+  if (
+    !Number.isFinite(
+      record.accel5m
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    record.accel5m <
+    S1_MIN_ACCEL5M
+  ) {
+    return false;
+  }
+
+  return true;
+
+}
+
+
+/* =========================================================
+   S1 ANTI-LEAK VALIDATION
+========================================================= */
+
+function validateS1NoLeak(
+  records
+) {
+
+  for (
+    const record of records
+  ) {
+
+    if (
+      !passesS1Filters(
+        record
+      )
+    ) {
+
+      throw new Error(
+        `S1 FILTER LEAK DETECTED: ${record.symbol}`
+      );
+
+    }
+
+  }
+
+  return true;
 
 }
 
@@ -1676,21 +1933,21 @@ function winnerGate(
       options.minPriceVsVWAP
     )
       ? options.minPriceVsVWAP
-      : -1;
+      : S1_MIN_PRICE_VS_VWAP_PCT;
 
   const minAccel5M =
     Number.isFinite(
       options.minAccel5M
     )
       ? options.minAccel5M
-      : 1;
+      : S1_MIN_ACCEL5M;
 
-  const minVol15M =
+  const minRvol15M =
     Number.isFinite(
       options.minVol15M
     )
       ? options.minVol15M
-      : 0;
+      : S1_MIN_RVOL15M;
 
   for (
     const record of records
@@ -1699,12 +1956,7 @@ function winnerGate(
     if (
       !Number.isFinite(
         record.price_vs_vwap_pct
-      )
-    ) {
-      continue;
-    }
-
-    if (
+      ) ||
       record.price_vs_vwap_pct <
       minPriceVsVWAP
     ) {
@@ -1723,10 +1975,10 @@ function winnerGate(
 
     if (
       !Number.isFinite(
-        record.volume15m
+        record.rvol15m
       ) ||
-      record.volume15m <
-      minVol15M
+      record.rvol15m <
+      minRvol15M
     ) {
       continue;
     }
@@ -2148,6 +2400,18 @@ async function runS1(
   const started =
     Date.now();
 
+  /*
+  ----------------------------------------------------------
+  IMPORTANT:
+  Capture the S1 as-of BEFORE downloading data.
+  This prevents different symbols from being evaluated
+  against different "now" values.
+  ----------------------------------------------------------
+  */
+
+  const s1AsOfMs =
+    Date.now();
+
   try {
 
     const {
@@ -2162,6 +2426,9 @@ async function runS1(
 
     const s1 = [];
 
+    let rejected =
+      0;
+
     for (
       const symbol of filtered
     ) {
@@ -2170,11 +2437,23 @@ async function runS1(
         calculateS1(
           symbol,
           results[symbol],
-          s0Map.get(symbol)
+          s0Map.get(symbol),
+          s1AsOfMs
         );
 
-      if (record) {
+      if (
+        record &&
+        passesS1Filters(
+          record
+        )
+      ) {
+
         s1.push(record);
+
+      } else {
+
+        rejected++;
+
       }
 
     }
@@ -2183,6 +2462,19 @@ async function runS1(
       rankS1(
         s1
       );
+
+    /*
+    ----------------------------------------------------------
+    FINAL SAFETY CHECK
+    ----------------------------------------------------------
+    If even one invalid record reaches this point,
+    the entire S1 scan fails instead of returning bad data.
+    ----------------------------------------------------------
+    */
+
+    validateS1NoLeak(
+      ranked
+    );
 
     scanState.s1 =
       ranked;
@@ -2212,6 +2504,17 @@ async function runS1(
         created_at:
           nowIso(),
 
+        asof:
+          new Date(
+            s1AsOfMs
+          ).toISOString(),
+
+        input_count:
+          filtered.length,
+
+        rejected_count:
+          rejected,
+
         s1:
           ranked
       }
@@ -2226,13 +2529,21 @@ async function runS1(
         "S1",
 
       asof:
-        scanState.asof,
+        new Date(
+          s1AsOfMs
+        ).toISOString(),
 
       elapsed_ms:
         scanState.elapsed_ms,
 
       universe_requested:
         filtered.length,
+
+      s1_input_count:
+        filtered.length,
+
+      s1_rejected_count:
+        rejected,
 
       s1_count:
         ranked.length,
@@ -2301,6 +2612,17 @@ async function runSF(
       ? cache.s1
       : [];
 
+  /*
+  ----------------------------------------------------------
+  SAFETY:
+  SF refuses any contaminated S1 cache.
+  ----------------------------------------------------------
+  */
+
+  validateS1NoLeak(
+    records
+  );
+
   if (
     Array.isArray(symbols) &&
     symbols.length
@@ -2323,15 +2645,98 @@ async function runSF(
 
   }
 
+  const minPriceVsVWAP =
+    Number.isFinite(
+      options.minPriceVsVWAP
+    )
+      ? options.minPriceVsVWAP
+      : S1_MIN_PRICE_VS_VWAP_PCT;
+
+  const minAccel5M =
+    Number.isFinite(
+      options.minAccel5M
+    )
+      ? options.minAccel5M
+      : S1_MIN_ACCEL5M;
+
+  const minRvol15M =
+    Number.isFinite(
+      options.minVol15M
+    )
+      ? options.minVol15M
+      : S1_MIN_RVOL15M;
+
+  /*
+  ----------------------------------------------------------
+  SF STRICT FILTER
+  ----------------------------------------------------------
+  */
+
+  const sfFiltered =
+    records.filter(
+      record => {
+
+        if (
+          !Number.isFinite(
+            record.price_vs_vwap_pct
+          ) ||
+          record.price_vs_vwap_pct <
+          minPriceVsVWAP
+        ) {
+          return false;
+        }
+
+        if (
+          !Number.isFinite(
+            record.accel5m
+          ) ||
+          record.accel5m <
+          minAccel5M
+        ) {
+          return false;
+        }
+
+        if (
+          !Number.isFinite(
+            record.rvol15m
+          ) ||
+          record.rvol15m <
+          minRvol15M
+        ) {
+          return false;
+        }
+
+        return true;
+
+      }
+    );
+
+  /*
+  ----------------------------------------------------------
+  SF SAFETY CHECK
+  ----------------------------------------------------------
+  */
+
+  validateS1NoLeak(
+    sfFiltered
+  );
+
   const ranked =
     rankS1(
-      records
+      sfFiltered
     );
 
   const winner =
     winnerGate(
       ranked,
-      options
+      {
+        minPriceVsVWAP,
+
+        minAccel5M,
+
+        minVol15M:
+          minRvol15M
+      }
     );
 
   scanState.sf =
@@ -2360,13 +2765,27 @@ async function runSF(
     asof:
       scanState.asof,
 
+    input_count:
+      records.length,
+
     sf_count:
       ranked.length,
 
     sf:
       ranked,
 
-    winner
+    winner,
+
+    filters: {
+
+      minPriceVsVWAP,
+
+      minAccel5M,
+
+      minRVOL15M:
+        minRvol15M
+
+    }
 
   };
 
@@ -2845,10 +3264,9 @@ function createMcpServer() {
 
   /* -------------------------------------------------------
      6. yahoo_ws_test
-     
+
      IMPORTANT:
      No import of yahoo-ws.js.
-     Prevents the previous default-export error.
   ------------------------------------------------------- */
 
   server.tool(
@@ -3159,11 +3577,6 @@ function createMcpServer() {
   );
 
 
-  /* =======================================================
-     IMPORTANT:
-     createMcpServer MUST return the MCP server.
-  ======================================================= */
-
   return server;
 
 }
@@ -3253,6 +3666,7 @@ app.get(
           nowIso()
 
       }
+
     );
 
   }
