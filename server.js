@@ -1,3 +1,32 @@
+/*
+ * ============================================================
+ * YAHOO SCAN MCP
+ * Version 1.3.0
+ *
+ * Architecture:
+ *
+ *   universe_s0.txt
+ *        ↓
+ *   UNIVERSE
+ *        ↓
+ *   Yahoo Spark 5d / 5m
+ *        ↓
+ *   S0 = ordinary stocks + price < $5
+ *        ↓
+ *   S1 metrics
+ *        ↓
+ *   Ranking
+ *        ↓
+ *   Lots of 20
+ *
+ * Existing files intentionally preserved:
+ *   ./universe_s0.txt
+ *   ./src/yahoo-ws.js
+ *
+ * No fabricated market data.
+ * ============================================================
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -7,127 +36,65 @@ import { readFile } from "node:fs/promises";
 
 import { YahooWS } from "./src/yahoo-ws.js";
 
-/*
-========================================================
-CONFIG
-========================================================
-*/
+
+/* ============================================================
+ * CONFIG
+ * ============================================================
+ */
 
 const PORT = Number(process.env.PORT || 8080);
-const APP_VERSION = "1.2.1";
 
-const UNIVERSE_FILE =
-  new URL("./universe_s0.txt", import.meta.url);
+const APP_VERSION = "1.3.0";
 
-const log = (...args) =>
-  console.error("[yahoo-scan-mcp]", ...args);
+const SERVICE_NAME = "yahoo-scan-mcp";
+
+const UNIVERSE_FILE = new URL(
+  "./universe_s0.txt",
+  import.meta.url
+);
+
+const YAHOO_SPARK_URL =
+  "https://query1.finance.yahoo.com/v7/finance/spark";
 
 
-/*
-========================================================
-HELPERS
-========================================================
-*/
+/* ============================================================
+ * LOGGING
+ * ============================================================
+ */
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function log(...args) {
+  console.log(`[${SERVICE_NAME}]`, ...args);
 }
 
-function chunk(array, size) {
-  const result = [];
-
-  for (let i = 0; i < array.length; i += size) {
-    result.push(array.slice(i, i + size));
-  }
-
-  return result;
-}
-
-function cleanNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function normalizeSymbols(input) {
-  if (!Array.isArray(input)) return [];
-
-  return [
-    ...new Set(
-      input
-        .map(x =>
-          String(x || "")
-            .trim()
-            .toUpperCase()
-        )
-        .filter(Boolean)
-    )
-  ];
+function logError(...args) {
+  console.error(`[${SERVICE_NAME}]`, ...args);
 }
 
 
-/*
-========================================================
-UNIVERSE
-========================================================
-*/
+/* ============================================================
+ * UNIVERSE CACHE
+ * ============================================================
+ */
 
 let universeCache = null;
+
 let universeLoadedAt = null;
 
-async function loadUniverse() {
-  if (universeCache) {
-    return universeCache;
-  }
 
-  const raw =
-    await readFile(
-      UNIVERSE_FILE,
-      "utf8"
-    );
-
-  const symbols = [];
-
-  for (const line of raw.split(/\r?\n/)) {
-    const clean = line.trim();
-
-    if (!clean) continue;
-    if (clean.startsWith("#")) continue;
-
-    const symbol =
-      clean
-        .split(/[,\s;]+/)[0]
-        .trim()
-        .toUpperCase();
-
-    if (!symbol) continue;
-
-    symbols.push(symbol);
-  }
-
-  universeCache = [
-    ...new Set(symbols)
-  ];
-
-  universeLoadedAt =
-    new Date().toISOString();
-
-  return universeCache;
-}
-
-
-/*
-========================================================
-SCAN STATE
-========================================================
-*/
+/* ============================================================
+ * SCAN STATE
+ * ============================================================
+ */
 
 const scanState = {
   ok: true,
+
   version: APP_VERSION,
 
   stage: "IDLE",
 
   asof: null,
+
   elapsed_ms: 0,
 
   symbols_requested: 0,
@@ -135,7 +102,9 @@ const scanState = {
   source: "Yahoo",
 
   s0: [],
+
   s1: [],
+
   lots: [],
 
   errors: [],
@@ -144,39 +113,287 @@ const scanState = {
 };
 
 
-/*
-========================================================
-YAHOO SPARK
-========================================================
-*/
+/* ============================================================
+ * LOAD MATERIALIZED UNIVERSE
+ * ============================================================
+ */
+
+async function loadUniverse() {
+
+  if (universeCache) {
+    return universeCache;
+  }
+
+  const raw = await readFile(
+    UNIVERSE_FILE,
+    "utf8"
+  );
+
+  const symbols = [];
+
+  const seen = new Set();
+
+  for (const line of raw.split(/\r?\n/)) {
+
+    const clean = line.trim();
+
+    if (!clean) {
+      continue;
+    }
+
+    if (clean.startsWith("#")) {
+      continue;
+    }
+
+    /*
+     * Accept:
+     *
+     * AAPL
+     * AAPL anything
+     *
+     * Only the first token is used.
+     */
+
+    const symbol =
+      clean
+        .split(/\s+/)[0]
+        .trim()
+        .toUpperCase();
+
+    if (!symbol) {
+      continue;
+    }
+
+    if (seen.has(symbol)) {
+      continue;
+    }
+
+    seen.add(symbol);
+
+    symbols.push(symbol);
+  }
+
+  universeCache = symbols;
+
+  universeLoadedAt =
+    new Date().toISOString();
+
+  scanState.universe_loaded_at =
+    universeLoadedAt;
+
+  return universeCache;
+}
+
+
+/* ============================================================
+ * GENERIC HELPERS
+ * ============================================================
+ */
+
+function sleep(ms) {
+
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+
+function finiteNumber(value) {
+
+  const n = Number(value);
+
+  return Number.isFinite(n)
+    ? n
+    : null;
+}
+
+
+function safeRatio(a, b) {
+
+  const x = finiteNumber(a);
+  const y = finiteNumber(b);
+
+  if (
+    x === null ||
+    y === null ||
+    y === 0
+  ) {
+    return null;
+  }
+
+  return x / y;
+}
+
+
+function mean(values) {
+
+  const valid = values
+    .map(Number)
+    .filter(Number.isFinite);
+
+  if (!valid.length) {
+    return null;
+  }
+
+  return (
+    valid.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / valid.length
+  );
+}
+
+
+/* ============================================================
+ * ORDINARY STOCK FILTER
+ * ============================================================
+ *
+ * We intentionally reject obvious non-equity instruments.
+ * The universe is already expected to be NASDAQ-oriented,
+ * but the runtime filter remains defensive.
+ * ============================================================
+ */
+
+function isOrdinaryStock(symbol, quote) {
+
+  if (!symbol) {
+    return false;
+  }
+
+  const upper =
+    String(symbol).toUpperCase();
+
+  /*
+   * Obvious non-stock symbols.
+   */
+
+  const rejectedPatterns = [
+    /\^/,          // indices
+    /=F$/,         // FX
+    /-USD$/,       // crypto
+    /USD$/,        // crypto / FX variants
+    /\.FI$/,       // futures / misc
+    /\.CBT$/,
+    /\.CME$/,
+    /\.NYB$/,
+    /\.COM$/,
+    /\.CC$/,
+    /\.TO$/,
+    /\.V$/,
+    /\.L$/,
+    /\.DE$/,
+    /\.PA$/,
+    /\.MI$/,
+    /\.AS$/,
+    /\.SW$/
+  ];
+
+  if (
+    rejectedPatterns.some(
+      regex => regex.test(upper)
+    )
+  ) {
+    return false;
+  }
+
+  /*
+   * Yahoo quote metadata, when available.
+   */
+
+  const quoteType =
+    quote?.quoteType ||
+    quote?.typeDisp ||
+    "";
+
+  const qt =
+    String(quoteType).toUpperCase();
+
+  if (
+    qt &&
+    ![
+      "EQUITY",
+      "STOCK"
+    ].includes(qt)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+
+/* ============================================================
+ * YAHOO SPARK
+ * ============================================================
+ */
 
 async function yahooSpark(
   symbols,
   range = "5d",
   interval = "5m"
 ) {
-  const batches =
-    chunk(symbols, 20);
 
-  const all = [];
+  const unique = [
+    ...new Set(
+      symbols
+        .map(s => String(s).trim().toUpperCase())
+        .filter(Boolean)
+    )
+  ];
+
+  const batches = [];
+
+  for (
+    let i = 0;
+    i < unique.length;
+    i += 20
+  ) {
+    batches.push(
+      unique.slice(i, i + 20)
+    );
+  }
+
+  const output = new Map();
+
+  const errors = [];
 
   for (const batch of batches) {
 
-    const querySymbols =
-      batch
-        .map(s => encodeURIComponent(s))
-        .join(",");
-
     const url =
-      "https://query1.finance.yahoo.com/v7/finance/spark" +
-      `?symbols=${querySymbols}` +
-      `&range=${range}` +
-      `&interval=${interval}` +
-      "&indicators=quote,close" +
-      "&includeTimestamps=true" +
-      "&includePrePost=false";
+      new URL(YAHOO_SPARK_URL);
+
+    url.searchParams.set(
+      "symbols",
+      batch.join(",")
+    );
+
+    url.searchParams.set(
+      "range",
+      range
+    );
+
+    url.searchParams.set(
+      "interval",
+      interval
+    );
+
+    url.searchParams.set(
+      "indicators",
+      "quote,close"
+    );
+
+    url.searchParams.set(
+      "includeTimestamps",
+      "true"
+    );
+
+    url.searchParams.set(
+      "includePrePost",
+      "false"
+    );
 
     let success = false;
+
     let lastError = null;
 
     for (
@@ -185,16 +402,16 @@ async function yahooSpark(
       attempt++
     ) {
 
+      const controller =
+        new AbortController();
+
+      const timeout =
+        setTimeout(
+          () => controller.abort(),
+          20000
+        );
+
       try {
-
-        const controller =
-          new AbortController();
-
-        const timer =
-          setTimeout(
-            () => controller.abort(),
-            20000
-          );
 
         const response =
           await fetch(
@@ -204,7 +421,14 @@ async function yahooSpark(
 
               headers: {
                 "User-Agent":
-                  "Mozilla/5.0"
+                  "Mozilla/5.0 " +
+                  "(Windows NT 10.0; Win64; x64) " +
+                  "AppleWebKit/537.36 " +
+                  "(KHTML, like Gecko) " +
+                  "Chrome/120 Safari/537.36",
+
+                "Accept":
+                  "application/json"
               },
 
               signal:
@@ -212,45 +436,43 @@ async function yahooSpark(
             }
           );
 
-        clearTimeout(timer);
-
         if (!response.ok) {
+
           throw new Error(
             `Yahoo HTTP ${response.status}`
           );
         }
 
-        const json =
+        const data =
           await response.json();
 
-        for (const symbol of batch) {
+        const result =
+          data?.spark?.result;
 
-          const data =
-            json?.spark?.result?.find(
-              x =>
-                String(
-                  x?.symbol || ""
-                ).toUpperCase() === symbol
-            );
+        if (!Array.isArray(result)) {
 
-          if (!data) {
+          throw new Error(
+            "Yahoo response missing spark.result"
+          );
+        }
 
-            all.push({
-              symbol,
-              error:
-                "Yahoo symbol missing"
-            });
+        for (const item of result) {
 
+          const symbol =
+            item?.symbol?.toUpperCase();
+
+          if (!symbol) {
             continue;
           }
 
-          all.push({
+          output.set(
             symbol,
-            data
-          });
+            item
+          );
         }
 
         success = true;
+
         break;
 
       } catch (error) {
@@ -259,240 +481,245 @@ async function yahooSpark(
 
         if (attempt < 3) {
           await sleep(
-            500 * attempt
+            400 * attempt
           );
         }
+
+      } finally {
+
+        clearTimeout(timeout);
       }
     }
 
     if (!success) {
 
-      for (const symbol of batch) {
-
-        all.push({
-          symbol,
-
-          error:
-            lastError?.message ||
-            "Yahoo request failed"
-        });
-      }
+      errors.push({
+        symbols: batch,
+        error:
+          lastError?.message ||
+          "Yahoo request failed"
+      });
     }
   }
 
-  return all;
+  return {
+    data: output,
+    errors
+  };
 }
 
 
-/*
-========================================================
-EXTRACT BARS
-========================================================
-*/
+/* ============================================================
+ * EXTRACT BARS
+ * ============================================================
+ */
 
-function extractBars(data) {
+function extractBars(item) {
 
   const timestamps =
-    data?.timestamp || [];
+    item?.timestamp || [];
 
   const quote =
-    data?.indicators?.quote?.[0] || {};
-
-  const opens =
-    quote.open || [];
-
-  const highs =
-    quote.high || [];
-
-  const lows =
-    quote.low || [];
+    item?.indicators?.quote?.[0];
 
   const closes =
-    quote.close || [];
+    item?.indicators?.quote?.[0]?.close ||
+    item?.indicators?.close?.[0]?.close ||
+    [];
+
+  const opens =
+    quote?.open || [];
+
+  const highs =
+    quote?.high || [];
+
+  const lows =
+    quote?.low || [];
 
   const volumes =
-    quote.volume || [];
+    quote?.volume || [];
 
   const bars = [];
 
+  const length =
+    timestamps.length;
+
   for (
     let i = 0;
-    i < timestamps.length;
+    i < length;
     i++
   ) {
 
     const timestamp =
-      cleanNumber(
-        timestamps[i]
-      );
-
-    const open =
-      cleanNumber(
-        opens[i]
-      );
-
-    const high =
-      cleanNumber(
-        highs[i]
-      );
-
-    const low =
-      cleanNumber(
-        lows[i]
-      );
+      Number(timestamps[i]);
 
     const close =
-      cleanNumber(
-        closes[i]
-      );
+      finiteNumber(closes[i]);
 
     const volume =
-      cleanNumber(
-        volumes[i]
-      );
+      finiteNumber(volumes[i]);
 
     if (
-      timestamp == null ||
-      close == null
+      !Number.isFinite(timestamp) ||
+      close === null ||
+      volume === null
     ) {
       continue;
     }
 
     bars.push({
       timestamp,
-      open,
-      high,
-      low,
+
+      open:
+        finiteNumber(opens[i]),
+
+      high:
+        finiteNumber(highs[i]),
+
+      low:
+        finiteNumber(lows[i]),
+
       close,
-      volume: volume || 0
+
+      volume
     });
   }
+
+  bars.sort(
+    (a, b) =>
+      a.timestamp - b.timestamp
+  );
 
   return bars;
 }
 
 
-/*
-========================================================
-SESSION KEY
-========================================================
-*/
+/* ============================================================
+ * SESSION KEY
+ * ============================================================
+ */
 
 function sessionKey(timestamp) {
 
-  const d =
-    new Date(
-      timestamp * 1000
-    );
+  const date =
+    new Date(timestamp * 1000);
 
-  return [
-    d.getUTCFullYear(),
+  /*
+   * Yahoo timestamps are UTC.
+   *
+   * We use the NY market date by formatting
+   * in America/New_York.
+   */
 
-    String(
-      d.getUTCMonth() + 1
-    ).padStart(2, "0"),
+  return new Intl.DateTimeFormat(
+    "en-CA",
+    {
+      timeZone:
+        "America/New_York",
 
-    String(
-      d.getUTCDate()
-    ).padStart(2, "0")
-  ].join("-");
+      year: "numeric",
+
+      month: "2-digit",
+
+      day: "2-digit"
+    }
+  ).format(date);
 }
 
 
-/*
-========================================================
-VWAP
-========================================================
-*/
+/* ============================================================
+ * VWAP
+ * ============================================================
+ */
 
 function calculateVWAP(bars) {
 
-  let pv = 0;
-  let volume = 0;
+  let cumulativePV = 0;
+
+  let cumulativeVolume = 0;
 
   for (const bar of bars) {
 
     if (
-      bar.close == null ||
-      !Number.isFinite(
-        bar.volume
-      )
+      bar.high === null ||
+      bar.low === null ||
+      bar.close === null ||
+      bar.volume === null
     ) {
       continue;
     }
 
-    const typical =
+    const typicalPrice =
       (
-        (bar.high ?? bar.close) +
-        (bar.low ?? bar.close) +
+        bar.high +
+        bar.low +
         bar.close
       ) / 3;
 
-    pv +=
-      typical * bar.volume;
+    cumulativePV +=
+      typicalPrice *
+      bar.volume;
 
-    volume +=
+    cumulativeVolume +=
       bar.volume;
   }
 
-  if (volume <= 0) {
+  if (
+    cumulativeVolume <= 0
+  ) {
     return null;
   }
 
-  return pv / volume;
+  return (
+    cumulativePV /
+    cumulativeVolume
+  );
 }
 
 
-/*
-========================================================
-S1
-========================================================
-*/
+/* ============================================================
+ * S1 CALCULATION
+ * ============================================================
+ */
 
 function calculateS1(
   symbol,
   bars
 ) {
 
-  if (
-    !Array.isArray(bars) ||
-    bars.length < 4
-  ) {
+  if (!Array.isArray(bars)) {
     return null;
   }
 
-  const sorted =
-    [...bars].sort(
-      (a, b) =>
-        a.timestamp -
-        b.timestamp
-    );
+  /*
+   * We need enough completed candles.
+   */
+
+  if (bars.length < 4) {
+    return null;
+  }
 
   /*
-  Last bar can still be incomplete.
-  */
+   * Last Yahoo candle can be incomplete.
+   *
+   * We deliberately exclude it.
+   */
 
   const completed =
-    sorted.slice(0, -1);
+    bars.slice(0, -1);
 
   if (completed.length < 4) {
     return null;
   }
 
   const current =
-    completed[
-      completed.length - 1
-    ];
+    completed[completed.length - 1];
 
   const previous =
-    completed[
-      completed.length - 2
-    ];
+    completed[completed.length - 2];
 
   const previous2 =
-    completed[
-      completed.length - 3
-    ];
+    completed[completed.length - 3];
 
   if (
     !current ||
@@ -502,192 +729,313 @@ function calculateS1(
     return null;
   }
 
-
   /*
-  ------------------------------------------------------
-  VOL15M
-  ------------------------------------------------------
-  */
+   * Last 15 minutes = 3 completed 5m bars.
+   */
 
   const last3 =
     completed.slice(-3);
 
-  const Vol15M =
+  const vol15m =
     last3.reduce(
       (sum, bar) =>
-        sum + (bar.volume || 0),
+        sum +
+        (
+          finiteNumber(bar.volume) ||
+          0
+        ),
       0
     );
 
-
   /*
-  ------------------------------------------------------
-  ACCEL5M
-  ------------------------------------------------------
-  */
+   * Acceleration:
+   *
+   * current 5m volume /
+   * mean of preceding 3 completed 5m volumes
+   */
 
-  const previous3 =
+  const preceding3 =
     completed.slice(
       Math.max(
         0,
-        completed.length - 4
+        completed.length - 6
       ),
-      completed.length - 1
+      completed.length - 3
     );
 
-  const previous3Mean =
-    previous3.length
-      ? previous3.reduce(
-          (sum, bar) =>
-            sum +
-            (bar.volume || 0),
-          0
-        ) / previous3.length
-      : 0;
+  const baseline5m =
+    mean(
+      preceding3.map(
+        bar => bar.volume
+      )
+    );
 
-  const Accel5M =
-    previous3Mean > 0
-      ? current.volume /
-        previous3Mean
-      : null;
-
+  const accel5m =
+    safeRatio(
+      current.volume,
+      baseline5m
+    );
 
   /*
-  ------------------------------------------------------
-  RVOL15M
-  ------------------------------------------------------
-  */
+   * Current NY session.
+   */
 
   const currentSession =
     sessionKey(
       current.timestamp
     );
 
-  const currentIndex =
-    completed.findIndex(
-      x =>
-        x.timestamp ===
-        current.timestamp
+  const currentSessionBars =
+    completed.filter(
+      bar =>
+        sessionKey(
+          bar.timestamp
+        ) === currentSession
     );
 
-  const historical = [];
-
-  for (
-    let i = 0;
-    i < completed.length;
-    i++
-  ) {
-
-    const bar =
-      completed[i];
-
-    if (
-      sessionKey(
-        bar.timestamp
-      ) === currentSession
-    ) {
-      continue;
-    }
-
-    const distance =
-      Math.abs(
-        i - currentIndex
-      );
-
-    if (distance <= 2) {
-      historical.push(
-        bar.volume || 0
-      );
-    }
-  }
-
-  let baseline = 0;
-
-  if (
-    historical.length > 0
-  ) {
-
-    baseline =
-      historical.reduce(
-        (a, b) =>
-          a + b,
-        0
-      ) /
-      historical.length;
-
-    baseline *= 3;
-  }
-
-  const RVOL15M =
-    baseline > 0
-      ? Vol15M / baseline
-      : null;
-
-
   /*
-  ------------------------------------------------------
-  VWAP
-  ------------------------------------------------------
-  */
+   * VWAP only on the current session.
+   */
 
-  const VWAP =
+  const vwap =
     calculateVWAP(
-      completed
+      currentSessionBars
     );
 
   const priceVsVWAP =
-    VWAP &&
-    current.close != null
-      ? current.close / VWAP - 1
+    vwap !== null
+      ? (
+          current.close /
+          vwap
+        ) - 1
       : null;
-
 
   /*
-  ------------------------------------------------------
-  J1 / J2
-  ------------------------------------------------------
-  */
+   * J-1 / J-2 volume.
+   */
 
-  const J1 =
-    previous.close > 0
-      ? current.close /
-          previous.close -
-        1
-      : null;
+  const sessions = new Map();
 
-  const J2 =
-    previous2.close > 0
-      ? previous.close /
-          previous2.close -
-        1
-      : null;
+  for (const bar of completed) {
 
-
-  /*
-  ------------------------------------------------------
-  HOD
-  ------------------------------------------------------
-  */
-
-  const highs =
-    completed
-      .map(x => x.high)
-      .filter(
-        x =>
-          x != null &&
-          Number.isFinite(x)
+    const key =
+      sessionKey(
+        bar.timestamp
       );
 
-  const HOD =
-    highs.length
-      ? Math.max(...highs)
-      : null;
+    if (!sessions.has(key)) {
+      sessions.set(
+        key,
+        []
+      );
+    }
+
+    sessions
+      .get(key)
+      .push(bar);
+  }
+
+  const sessionKeys =
+    [...sessions.keys()]
+      .sort()
+      .reverse();
+
+  const previousSessionKey =
+    sessionKeys[1];
+
+  const previous2SessionKey =
+    sessionKeys[2];
+
+  const previousSessionBars =
+    previousSessionKey
+      ? sessions.get(
+          previousSessionKey
+        ) || []
+      : [];
+
+  const previous2SessionBars =
+    previous2SessionKey
+      ? sessions.get(
+          previous2SessionKey
+        ) || []
+      : [];
+
+  const j1 =
+    previousSessionBars.reduce(
+      (sum, bar) =>
+        sum +
+        (
+          finiteNumber(bar.volume) ||
+          0
+        ),
+      0
+    );
+
+  const j2 =
+    previous2SessionBars.reduce(
+      (sum, bar) =>
+        sum +
+        (
+          finiteNumber(bar.volume) ||
+          0
+        ),
+      0
+    );
+
+  /*
+   * Intraday RVOL.
+   *
+   * Compare the current 15m volume
+   * with equivalent 15m windows from
+   * prior sessions.
+   */
+
+  const currentIndex =
+    currentSessionBars.findIndex(
+      bar =>
+        bar.timestamp ===
+        current.timestamp
+    );
+
+  let rvol15m = null;
+
+  if (
+    currentIndex >= 2
+  ) {
+
+    const currentWindow =
+      currentSessionBars.slice(
+        Math.max(
+          0,
+          currentIndex - 2
+        ),
+        currentIndex + 1
+      );
+
+    const currentVol =
+      currentWindow.reduce(
+        (sum, bar) =>
+          sum +
+          (
+            finiteNumber(bar.volume) ||
+            0
+          ),
+        0
+      );
+
+    const priorSessionVolumes = [];
+
+    const priorKeys =
+      sessionKeys.slice(
+        1,
+        3
+      );
+
+    for (const key of priorKeys) {
+
+      const sessionBars =
+        sessions.get(key) || [];
+
+      if (
+        sessionBars.length >
+        currentIndex
+      ) {
+
+        const comparable =
+          sessionBars.slice(
+            Math.max(
+              0,
+              currentIndex - 2
+            ),
+            currentIndex + 1
+          );
+
+        const volume =
+          comparable.reduce(
+            (sum, bar) =>
+              sum +
+              (
+                finiteNumber(
+                  bar.volume
+                ) || 0
+              ),
+            0
+          );
+
+        if (volume > 0) {
+          priorSessionVolumes.push(
+            volume
+          );
+        }
+      }
+    }
+
+    const baseline =
+      mean(
+        priorSessionVolumes
+      );
+
+    if (
+      baseline !== null &&
+      baseline > 0
+    ) {
+
+      rvol15m =
+        currentVol /
+        baseline;
+    }
+  }
+
+  /*
+   * HOD.
+   */
+
+  const hod =
+    currentSessionBars.reduce(
+      (max, bar) => {
+
+        const high =
+          finiteNumber(bar.high);
+
+        if (high === null) {
+          return max;
+        }
+
+        return Math.max(
+          max,
+          high
+        );
+      },
+      0
+    );
 
   const hodDistance =
-    HOD > 0
-      ? current.close / HOD - 1
+    hod > 0
+      ? (
+          current.close /
+          hod
+        ) - 1
       : null;
 
+  /*
+   * Last 5m change.
+   */
+
+  const change5m =
+    safeRatio(
+      current.close,
+      previous.close
+    );
+
+  /*
+   * Previous 5m change.
+   */
+
+  const previousChange5m =
+    safeRatio(
+      previous.close,
+      previous2.close
+    );
 
   return {
 
@@ -699,212 +1047,212 @@ function calculateS1(
     price:
       current.close,
 
-    Vol15M,
+    Vol15M:
+      vol15m,
 
-    RVOL15M,
+    RVOL15M:
+      rvol15m,
 
-    Accel5M,
+    Accel5M:
+      accel5m,
 
-    VWAP,
+    VWAP:
+      vwap,
 
     priceVsVWAP,
 
-    J1,
+    J1:
+      j1,
 
-    J2,
+    J2:
+      j2,
 
-    HOD,
+    HOD:
+      hod,
 
-    hodDistance
+    hodDistance,
+
+    change5m:
+      change5m !== null
+        ? change5m - 1
+        : null,
+
+    previousChange5m:
+      previousChange5m !== null
+        ? previousChange5m - 1
+        : null,
+
+    bars:
+      completed.length
   };
 }
 
 
-/*
-========================================================
-ORDINARY STOCK
-========================================================
-*/
+/* ============================================================
+ * CURRENT PRICE
+ * ============================================================
+ */
 
-function isOrdinaryStock(data) {
-
-  if (!data) {
-    return false;
-  }
+function getCurrentPrice(item) {
 
   const meta =
-    data?.meta || {};
+    item?.meta;
 
-  const quoteType =
-    String(
-      meta.quoteType ||
-      meta.instrumentType ||
-      ""
-    ).toUpperCase();
+  const regularMarketPrice =
+    finiteNumber(
+      meta?.regularMarketPrice
+    );
 
   if (
-    quoteType &&
-    quoteType !== "EQUITY"
+    regularMarketPrice !== null
   ) {
-    return false;
+    return regularMarketPrice;
   }
 
-  const name =
-    String(
-      meta.longName ||
-      meta.shortName ||
-      ""
-    ).toUpperCase();
+  const chartPreviousClose =
+    finiteNumber(
+      meta?.chartPreviousClose
+    );
 
   if (
-    name.includes(" ETF") ||
-    name.includes("ETF ") ||
-    name.includes(" FUND") ||
-    name.includes("FUND ")
+    chartPreviousClose !== null
   ) {
-    return false;
+    return chartPreviousClose;
   }
 
-  const exchange =
-    String(
-      meta.exchange ||
-      ""
-    ).toUpperCase();
+  const bars =
+    extractBars(item);
 
-  if (exchange) {
+  if (bars.length) {
 
-    const allowed = [
-      "NMS",
-      "NGM",
-      "NCM",
-      "NAS",
-      "NASDAQ",
-      "NYSE",
-      "NYQ",
-      "ASE",
-      "AMEX",
-      "BATS"
-    ];
-
-    if (
-      !allowed.includes(
-        exchange
-      )
-    ) {
-      return false;
-    }
+    return bars[
+      bars.length - 1
+    ].close;
   }
 
-  return true;
+  return null;
 }
 
 
-/*
-========================================================
-CURRENT PRICE
-========================================================
-*/
+/* ============================================================
+ * LOT FORMATION
+ * ============================================================
+ */
 
-function getCurrentPrice(data) {
-
-  const meta =
-    data?.meta || {};
-
-  return (
-    cleanNumber(
-      meta.regularMarketPrice
-    ) ??
-    cleanNumber(
-      meta.postMarketPrice
-    ) ??
-    null
-  );
-}
-
-
-/*
-========================================================
-WEBSOCKET TEST
-========================================================
-*/
-
-let wsTestRunning = false;
-
-async function runYahooWSTest(
-  symbols,
-  seconds
+function makeLots(
+  rows,
+  size = 20
 ) {
 
-  if (wsTestRunning) {
-    throw new Error(
-      "Yahoo WebSocket test already running"
-    );
+  const lots = [];
+
+  for (
+    let i = 0;
+    i < rows.length;
+    i += size
+  ) {
+
+    lots.push({
+      lot:
+        lots.length + 1,
+
+      count:
+        Math.min(
+          size,
+          rows.length - i
+        ),
+
+      symbols:
+        rows
+          .slice(i, i + size)
+          .map(
+            row => row.symbol
+          )
+    });
   }
 
-  wsTestRunning = true;
+  return lots;
+}
+
+
+/* ============================================================
+ * YAHOO WS TEST
+ * ============================================================
+ */
+
+async function runYahooWSTest() {
+
+  const symbols = [
+    "AAPL",
+    "MSFT",
+    "NVDA"
+  ];
+
+  const ws =
+    new YahooWS();
 
   const started =
     Date.now();
 
-  const yahoo =
-    new YahooWS({
-      log
-    });
-
   try {
 
-    await yahoo.connect();
+    await ws.connect();
 
-    await yahoo.subscribe(
+    await ws.subscribe(
       symbols
     );
 
-    await sleep(
-      seconds * 1000
-    );
+    /*
+     * Give Yahoo enough time to send
+     * live messages.
+     */
+
+    await sleep(10000);
 
     const status =
-      typeof yahoo.status ===
-      "function"
-        ? yahoo.status()
+      typeof ws.getStatus === "function"
+        ? ws.getStatus()
         : null;
 
-    let ticks = {};
-
-    if (
-      typeof yahoo.getLatest ===
-      "function"
-    ) {
-
-      ticks =
-        await yahoo.getLatest();
-
-    } else if (
-      yahoo.latest
-    ) {
-
-      ticks =
-        yahoo.latest;
-
-    } else if (
-      yahoo.recent_ticks
-    ) {
-
-      ticks =
-        yahoo.recent_ticks;
-    }
+    const latest =
+      typeof ws.getLatest === "function"
+        ? ws.getLatest()
+        : null;
 
     return {
 
       ok: true,
 
+      connected:
+        status?.connected ??
+        true,
+
+      subscribed:
+        status?.subscribed ??
+        true,
+
+      symbols,
+
+      messages:
+        status?.messages ??
+        null,
+
+      ticks:
+        status?.ticks ??
+        null,
+
+      errors:
+        status?.errors ??
+        0,
+
+      decode_errors:
+        status?.decode_errors ??
+        0,
+
+      latest,
+
       elapsed_ms:
-        Date.now() -
-        started,
-
-      status,
-
-      ticks
+        Date.now() - started
     };
 
   } finally {
@@ -912,274 +1260,605 @@ async function runYahooWSTest(
     try {
 
       if (
-        typeof yahoo.close ===
-        "function"
+        typeof ws.close === "function"
       ) {
-        await yahoo.close();
+        await ws.close();
       }
 
-    } catch {}
+    } catch (error) {
 
-    wsTestRunning = false;
+      logError(
+        "YahooWS close error:",
+        error?.message ||
+        error
+      );
+    }
   }
 }
 
 
-/*
-========================================================
-REGISTER TOOLS
-========================================================
-*/
+/* ============================================================
+ * MAIN S0 / S1 SCAN
+ * ============================================================
+ */
+
+async function runS0S1Scan({
+  symbols = null,
+  s1_limit = 50
+} = {}) {
+
+  const started =
+    Date.now();
+
+  scanState.ok = true;
+
+  scanState.version =
+    APP_VERSION;
+
+  scanState.stage =
+    "LOADING_UNIVERSE";
+
+  scanState.asof =
+    new Date().toISOString();
+
+  scanState.elapsed_ms =
+    0;
+
+  scanState.symbols_requested =
+    0;
+
+  scanState.s0 = [];
+
+  scanState.s1 = [];
+
+  scanState.lots = [];
+
+  scanState.errors = [];
+
+  /*
+   * Validate limit.
+   */
+
+  const limit =
+    Math.min(
+      200,
+      Math.max(
+        10,
+        Number(s1_limit) || 50
+      )
+    );
+
+  /*
+   * Universe.
+   */
+
+  const requested =
+    Array.isArray(symbols) &&
+    symbols.length
+      ? [
+          ...new Set(
+            symbols
+              .map(
+                s =>
+                  String(s)
+                    .trim()
+                    .toUpperCase()
+              )
+              .filter(Boolean)
+          )
+        ]
+      : await loadUniverse();
+
+  scanState.symbols_requested =
+    requested.length;
+
+  /*
+   * Yahoo data.
+   */
+
+  scanState.stage =
+    "YAHOO_FETCH";
+
+  const yahoo =
+    await yahooSpark(
+      requested,
+      "5d",
+      "5m"
+    );
+
+  scanState.errors.push(
+    ...yahoo.errors
+  );
+
+  /*
+   * S0.
+   */
+
+  scanState.stage =
+    "S0";
+
+  const s0 = [];
+
+  for (
+    const symbol of requested
+  ) {
+
+    const item =
+      yahoo.data.get(symbol);
+
+    if (!item) {
+      continue;
+    }
+
+    const price =
+      getCurrentPrice(item);
+
+    if (
+      price === null ||
+      price <= 0 ||
+      price >= 5
+    ) {
+      continue;
+    }
+
+    const quote =
+      item?.meta || {};
+
+    if (
+      !isOrdinaryStock(
+        symbol,
+        quote
+      )
+    ) {
+      continue;
+    }
+
+    s0.push({
+
+      symbol,
+
+      price,
+
+      exchange:
+        quote.exchangeName ||
+        null,
+
+      currency:
+        quote.currency ||
+        null,
+
+      quoteType:
+        quote.quoteType ||
+        null
+    });
+  }
+
+  scanState.s0 =
+    s0;
+
+  /*
+   * S1.
+   */
+
+  scanState.stage =
+    "S1";
+
+  const s1 = [];
+
+  for (
+    const row of s0
+  ) {
+
+    const item =
+      yahoo.data.get(
+        row.symbol
+      );
+
+    if (!item) {
+      continue;
+    }
+
+    const bars =
+      extractBars(item);
+
+    const metrics =
+      calculateS1(
+        row.symbol,
+        bars
+      );
+
+    if (!metrics) {
+      continue;
+    }
+
+    s1.push({
+      ...row,
+      ...metrics
+    });
+  }
+
+  /*
+   * Ranking.
+   *
+   * Primary:
+   *   RVOL15M
+   *
+   * Secondary:
+   *   Accel5M
+   *
+   * Tertiary:
+   *   priceVsVWAP
+   *
+   * Nulls are always last.
+   */
+
+  s1.sort(
+    (a, b) => {
+
+      const ar =
+        a.RVOL15M ?? -Infinity;
+
+      const br =
+        b.RVOL15M ?? -Infinity;
+
+      if (br !== ar) {
+        return br - ar;
+      }
+
+      const aa =
+        a.Accel5M ?? -Infinity;
+
+      const ba =
+        b.Accel5M ?? -Infinity;
+
+      if (ba !== aa) {
+        return ba - aa;
+      }
+
+      const av =
+        a.priceVsVWAP ?? -Infinity;
+
+      const bv =
+        b.priceVsVWAP ?? -Infinity;
+
+      return bv - av;
+    }
+  );
+
+  /*
+   * Keep only requested ranking depth.
+   */
+
+  const ranked =
+    s1.slice(
+      0,
+      limit
+    );
+
+  scanState.s1 =
+    ranked;
+
+  /*
+   * Lots of 20.
+   */
+
+  scanState.stage =
+    "LOTS";
+
+  scanState.lots =
+    makeLots(
+      ranked,
+      20
+    );
+
+  /*
+   * Complete.
+   */
+
+  scanState.stage =
+    "S0_S1";
+
+  scanState.elapsed_ms =
+    Date.now() - started;
+
+  return {
+
+    ok: true,
+
+    stage:
+      scanState.stage,
+
+    asof:
+      scanState.asof,
+
+    elapsed_ms:
+      scanState.elapsed_ms,
+
+    universe_requested:
+      requested.length,
+
+    s0_count:
+      s0.length,
+
+    s0,
+
+    s1_count:
+      ranked.length,
+
+    s1:
+      ranked,
+
+    lots:
+      scanState.lots,
+
+    errors:
+      scanState.errors
+  };
+}
+
+
+/* ============================================================
+ * TOOL REGISTRATION
+ * ============================================================
+ */
 
 function registerTools(server) {
 
   /*
-  ------------------------------------------------------
-  PING
-  ------------------------------------------------------
-  */
+   * ----------------------------------------------------------
+   * PING
+   * ----------------------------------------------------------
+   */
 
   server.tool(
+
     "ping",
-    "Test Yahoo Scan MCP connectivity.",
+
+    "Check that Yahoo Scan MCP is alive.",
+
     {},
-    async () => ({
-      content: [{
-        type: "text",
 
-        text:
-          JSON.stringify({
-            ok: true,
-
-            service:
-              "yahoo-scan-mcp",
-
-            version:
-              APP_VERSION,
-
-            timestamp:
-              new Date().toISOString()
-          })
-      }]
-    })
-  );
-
-
-  /*
-  ------------------------------------------------------
-  STATUS
-  ------------------------------------------------------
-  */
-
-  server.tool(
-    "get_status",
-    "Return MCP and scanner status.",
-    {},
     async () => {
 
       return {
-        content: [{
-          type: "text",
 
-          text:
-            JSON.stringify({
-              ok: true,
+        content: [
+          {
+            type: "text",
 
-              service:
-                "yahoo-scan-mcp",
+            text:
+              JSON.stringify({
+                ok: true,
 
-              version:
-                APP_VERSION,
+                service:
+                  SERVICE_NAME,
 
-              yahoo: {
-                connected: false,
+                version:
+                  APP_VERSION,
 
-                mode:
-                  "on-demand",
-
-                note:
-                  "Yahoo WebSocket is created by yahoo_ws_test"
-              },
-
-              scan:
-                scanState
-            })
-        }]
+                timestamp:
+                  new Date().toISOString()
+              })
+          }
+        ]
       };
     }
   );
 
 
   /*
-  ------------------------------------------------------
-  UNIVERSE
-  ------------------------------------------------------
-  */
+   * ----------------------------------------------------------
+   * GET STATUS
+   * ----------------------------------------------------------
+   */
 
   server.tool(
+
+    "get_status",
+
+    "Return server, Yahoo and scan status.",
+
+    {},
+
+    async () => {
+
+      return {
+
+        content: [
+          {
+            type: "text",
+
+            text:
+              JSON.stringify({
+
+                ok: true,
+
+                service:
+                  SERVICE_NAME,
+
+                version:
+                  APP_VERSION,
+
+                yahoo: {
+                  connected: false,
+
+                  mode:
+                    "on-demand",
+
+                  note:
+                    "Yahoo WebSocket is created by yahoo_ws_test."
+                },
+
+                scan:
+                  scanState
+
+              })
+          }
+        ]
+      };
+    }
+  );
+
+
+  /*
+   * ----------------------------------------------------------
+   * GET UNIVERSE
+   * ----------------------------------------------------------
+   */
+
+  server.tool(
+
     "get_universe",
-    "Return the materialized S0 universe.",
-    {
-      limit:
-        z
-          .number()
-          .int()
-          .min(1)
-          .max(2500)
-          .optional()
-    },
 
-    async ({ limit }) => {
+    "Return the materialized S0 universe loaded from universe_s0.txt.",
 
-      const universe =
-        await loadUniverse();
+    {},
 
-      scanState.universe_loaded_at =
-        universeLoadedAt;
+    async () => {
 
-      const selected =
-        universe.slice(
-          0,
-          limit ||
-          universe.length
-        );
+      try {
 
-      return {
-        content: [{
-          type: "text",
+        const universe =
+          await loadUniverse();
 
-          text:
-            JSON.stringify({
-              ok: true,
+        return {
 
-              count:
-                universe.length,
+          content: [
+            {
+              type: "text",
 
-              returned:
-                selected.length,
+              text:
+                JSON.stringify({
 
-              universe:
-                selected
-            })
-        }]
-      };
-    }
-  );
+                  ok: true,
 
+                  count:
+                    universe.length,
 
-  /*
-  ------------------------------------------------------
-  YAHOO WS TEST
-  ------------------------------------------------------
-  */
+                  loaded_at:
+                    universeLoadedAt,
 
-  server.tool(
-    "yahoo_ws_test",
-    "Test Yahoo WebSocket connectivity.",
-    {
-      symbols:
-        z
-          .array(z.string())
-          .max(2500)
-          .optional(),
+                  source:
+                    "universe_s0.txt",
 
-      seconds:
-        z
-          .number()
-          .int()
-          .min(5)
-          .max(120)
-          .optional()
-    },
+                  symbols:
+                    universe
 
-    async ({
-      symbols,
-      seconds
-    }) => {
-
-      const requested =
-        normalizeSymbols(
-          symbols || [
-            "AAPL",
-            "MSFT",
-            "NVDA"
+                })
+            }
           ]
-        );
+        };
 
-      const duration =
-        seconds || 10;
+      } catch (error) {
 
-      const result =
-        await runYahooWSTest(
-          requested,
-          duration
-        );
+        return {
 
-      const filteredTicks =
-        {};
+          content: [
+            {
+              type: "text",
 
-      for (
-        const symbol of requested
-      ) {
+              text:
+                JSON.stringify({
 
-        if (
-          result.ticks &&
-          result.ticks[symbol]
-        ) {
+                  ok: false,
 
-          filteredTicks[symbol] =
-            result.ticks[symbol];
-        }
+                  error:
+                    error?.message ||
+                    String(error)
+
+                })
+            }
+          ],
+
+          isError: true
+        };
       }
-
-      return {
-        content: [{
-          type: "text",
-
-          text:
-            JSON.stringify({
-              ok: true,
-
-              symbols:
-                requested,
-
-              seconds:
-                duration,
-
-              elapsed_ms:
-                result.elapsed_ms,
-
-              status:
-                result.status,
-
-              ticks:
-                filteredTicks
-            })
-        }]
-      };
     }
   );
 
 
   /*
-  ------------------------------------------------------
-  S0 / S1 SCAN
-  ------------------------------------------------------
-  */
+   * ----------------------------------------------------------
+   * YAHOO WS TEST
+   * ----------------------------------------------------------
+   */
 
   server.tool(
+
+    "yahoo_ws_test",
+
+    "Test the Yahoo WebSocket using AAPL, MSFT and NVDA.",
+
+    {},
+
+    async () => {
+
+      try {
+
+        const result =
+          await runYahooWSTest();
+
+        return {
+
+          content: [
+            {
+              type: "text",
+
+              text:
+                JSON.stringify(result)
+            }
+          ]
+        };
+
+      } catch (error) {
+
+        return {
+
+          content: [
+            {
+              type: "text",
+
+              text:
+                JSON.stringify({
+
+                  ok: false,
+
+                  error:
+                    error?.message ||
+                    String(error)
+
+                })
+            }
+          ],
+
+          isError: true
+        };
+      }
+    }
+  );
+
+
+  /*
+   * ----------------------------------------------------------
+   * S0 / S1 SCAN
+   * ----------------------------------------------------------
+   */
+
+  server.tool(
+
     "yahoo_s0_s1_scan",
-    "Run Yahoo S0/S1 scanner.",
+
+    "Run the Yahoo S0/S1 scan. If symbols are omitted, the materialized universe_s0.txt is used.",
+
     {
       symbols:
-        z
-          .array(z.string())
-          .max(2500)
-          .optional(),
+        z.array(
+          z.string()
+        )
+        .optional(),
 
       s1_limit:
-        z
-          .number()
+        z.number()
           .int()
           .min(10)
           .max(200)
@@ -1191,357 +1870,139 @@ function registerTools(server) {
       s1_limit
     }) => {
 
-      const started =
-        Date.now();
+      try {
 
-      scanState.stage =
-        "S0_S1";
+        const result =
+          await runS0S1Scan({
+            symbols:
+              symbols ?? null,
 
-      scanState.errors = [];
-      scanState.s0 = [];
-      scanState.s1 = [];
-      scanState.lots = [];
-
-      let list;
-
-      if (
-        Array.isArray(symbols) &&
-        symbols.length
-      ) {
-
-        list =
-          normalizeSymbols(
-            symbols
-          );
-
-      } else {
-
-        list =
-          await loadUniverse();
-
-        scanState.universe_loaded_at =
-          universeLoadedAt;
-      }
-
-      scanState.symbols_requested =
-        list.length;
-
-
-      /*
-      ----------------------------------------------------
-      YAHOO DATA
-      ----------------------------------------------------
-      */
-
-      const yahooData =
-        await yahooSpark(
-          list,
-          "5d",
-          "5m"
-        );
-
-
-      /*
-      ----------------------------------------------------
-      S0
-      ----------------------------------------------------
-      */
-
-      const s0 = [];
-
-      for (
-        const item of yahooData
-      ) {
-
-        if (item.error) {
-
-          scanState.errors.push({
-            symbol:
-              item.symbol,
-
-            stage:
-              "S0",
-
-            error:
-              item.error
+            s1_limit:
+              s1_limit ?? 50
           });
 
-          continue;
-        }
+        return {
 
-        const data =
-          item.data;
+          content: [
+            {
+              type: "text",
 
-        if (
-          !isOrdinaryStock(
-            data
-          )
-        ) {
-          continue;
-        }
+              text:
+                JSON.stringify(result)
+            }
+          ]
+        };
 
-        const price =
-          getCurrentPrice(
-            data
-          );
+      } catch (error) {
 
-        if (
-          price == null ||
-          price <= 0 ||
-          price >= 5
-        ) {
-          continue;
-        }
+        scanState.ok = false;
 
-        s0.push({
-          symbol:
-            item.symbol,
+        scanState.stage =
+          "ERROR";
 
-          price
+        scanState.elapsed_ms =
+          0;
+
+        scanState.errors.push({
+
+          error:
+            error?.message ||
+            String(error)
+
         });
+
+        return {
+
+          content: [
+            {
+              type: "text",
+
+              text:
+                JSON.stringify({
+
+                  ok: false,
+
+                  stage:
+                    "ERROR",
+
+                  error:
+                    error?.message ||
+                    String(error)
+
+                })
+            }
+          ],
+
+          isError: true
+        };
       }
-
-      scanState.s0 =
-        s0;
-
-
-      /*
-      ----------------------------------------------------
-      S1
-      ----------------------------------------------------
-      */
-
-      const s1 = [];
-
-      for (
-        const candidate of s0
-      ) {
-
-        const item =
-          yahooData.find(
-            x =>
-              x.symbol ===
-              candidate.symbol
-          );
-
-        if (!item?.data) {
-          continue;
-        }
-
-        const bars =
-          extractBars(
-            item.data
-          );
-
-        const metrics =
-          calculateS1(
-            candidate.symbol,
-            bars
-          );
-
-        if (!metrics) {
-          continue;
-        }
-
-        s1.push(
-          metrics
-        );
-      }
-
-
-      /*
-      ----------------------------------------------------
-      RANKING
-      ----------------------------------------------------
-      */
-
-      s1.sort(
-        (a, b) => {
-
-          const rvolA =
-            a.RVOL15M ??
-            -Infinity;
-
-          const rvolB =
-            b.RVOL15M ??
-            -Infinity;
-
-          if (
-            rvolB !== rvolA
-          ) {
-            return (
-              rvolB -
-              rvolA
-            );
-          }
-
-          const accelA =
-            a.Accel5M ??
-            -Infinity;
-
-          const accelB =
-            b.Accel5M ??
-            -Infinity;
-
-          if (
-            accelB !== accelA
-          ) {
-            return (
-              accelB -
-              accelA
-            );
-          }
-
-          const vwapA =
-            a.priceVsVWAP ??
-            -Infinity;
-
-          const vwapB =
-            b.priceVsVWAP ??
-            -Infinity;
-
-          return (
-            vwapB -
-            vwapA
-          );
-        }
-      );
-
-
-      const limited =
-        s1.slice(
-          0,
-          s1_limit || 50
-        );
-
-
-      /*
-      ----------------------------------------------------
-      LOTS OF 20
-      ----------------------------------------------------
-      */
-
-      const lots =
-        chunk(
-          limited,
-          20
-        );
-
-      scanState.s1 =
-        limited;
-
-      scanState.lots =
-        lots;
-
-      scanState.elapsed_ms =
-        Date.now() -
-        started;
-
-      scanState.asof =
-        new Date().toISOString();
-
-      scanState.ok =
-        true;
-
-
-      /*
-      ----------------------------------------------------
-      RESULT
-      ----------------------------------------------------
-      */
-
-      return {
-        content: [{
-          type: "text",
-
-          text:
-            JSON.stringify({
-
-              ok: true,
-
-              stage:
-                "S0_S1",
-
-              asof:
-                scanState.asof,
-
-              elapsed_ms:
-                scanState.elapsed_ms,
-
-              universe_requested:
-                list.length,
-
-              s0_count:
-                s0.length,
-
-              s0,
-
-              s1_count:
-                limited.length,
-
-              s1:
-                limited,
-
-              lots,
-
-              errors:
-                scanState.errors
-            })
-        }]
-      };
     }
   );
 
 
   /*
-  ------------------------------------------------------
-  SCAN STATE
-  ------------------------------------------------------
-  */
+   * ----------------------------------------------------------
+   * GET SCAN STATE
+   * ----------------------------------------------------------
+   */
 
   server.tool(
-    "get_scan_state",
-    "Return latest scanner state.",
-    {},
-    async () => ({
-      content: [{
-        type: "text",
 
-        text:
-          JSON.stringify(
-            scanState
-          )
-      }]
-    })
+    "get_scan_state",
+
+    "Return the complete current S0/S1 scan state.",
+
+    {},
+
+    async () => {
+
+      return {
+
+        content: [
+          {
+            type: "text",
+
+            text:
+              JSON.stringify(
+                scanState
+              )
+          }
+        ]
+      };
+    }
+  );
+
+
+  log(
+    "Tools registered:",
+    [
+      "ping",
+      "get_status",
+      "get_universe",
+      "yahoo_ws_test",
+      "yahoo_s0_s1_scan",
+      "get_scan_state"
+    ].join(", ")
   );
 }
 
 
-/*
-========================================================
-MCP SESSION STORE
-========================================================
-*/
-
-const sessions =
-  new Map();
-
-
-/*
-========================================================
-CREATE SERVER
-========================================================
-*/
+/* ============================================================
+ * MCP SERVER FACTORY
+ * ============================================================
+ */
 
 function createMcpServer() {
 
   const server =
     new McpServer({
+
       name:
-        "yahoo-scan-mcp",
+        SERVICE_NAME,
 
       version:
         APP_VERSION
+
     });
 
   registerTools(
@@ -1552,21 +2013,36 @@ function createMcpServer() {
 }
 
 
-/*
-========================================================
-CREATE TRANSPORT
-========================================================
-*/
+/* ============================================================
+ * SESSION STORE
+ * ============================================================
+ */
+
+const sessions =
+  new Map();
+
+
+/* ============================================================
+ * CREATE TRANSPORT
+ * ============================================================
+ */
 
 function createTransport() {
 
-  let transport;
-
-  transport =
+  const transport =
     new StreamableHTTPServerTransport({
+
+      /*
+       * Stateful MCP sessions.
+       */
 
       sessionIdGenerator:
         () => randomUUID(),
+
+      /*
+       * Normal JSON responses for ordinary
+       * request/response tool calls.
+       */
 
       enableJsonResponse:
         true,
@@ -1582,7 +2058,8 @@ function createTransport() {
           );
 
           log(
-            `MCP session initialized: ${sessionId}`
+            "MCP session initialized:",
+            sessionId
           );
         }
     });
@@ -1590,7 +2067,12 @@ function createTransport() {
   transport.onerror =
     error => {
 
-      log(
+      /*
+       * Expected protocol negotiation errors
+       * are logged, never swallowed.
+       */
+
+      logError(
         "MCP transport error:",
         error
       );
@@ -1609,7 +2091,8 @@ function createTransport() {
         );
 
         log(
-          `MCP session closed: ${sessionId}`
+          "MCP session closed:",
+          sessionId
         );
       }
     };
@@ -1618,311 +2101,487 @@ function createTransport() {
 }
 
 
-/*
-========================================================
-MCP HTTP HANDLER
-========================================================
-*/
+/* ============================================================
+ * HTTP HELPERS
+ * ============================================================
+ */
+
+function setCors(res) {
+
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,DELETE,OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    [
+      "Content-Type",
+      "Accept",
+      "MCP-Session-Id",
+      "MCP-Protocol-Version",
+      "Last-Event-ID"
+    ].join(", ")
+  );
+
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "MCP-Session-Id"
+  );
+}
+
+
+function sendJson(
+  res,
+  status,
+  body
+) {
+
+  if (!res.headersSent) {
+
+    res.statusCode =
+      status;
+
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+  }
+
+  res.end(
+    JSON.stringify(body)
+  );
+}
+
+
+/* ============================================================
+ * MCP HTTP HANDLER
+ * ============================================================
+ */
 
 async function handleMcp(
   req,
   res
 ) {
 
+  /*
+   * ----------------------------------------------------------
+   * IMPORTANT:
+   *
+   * Do NOT manually parse the MCP body.
+   *
+   * StreamableHTTPServerTransport owns MCP request parsing.
+   * ----------------------------------------------------------
+   */
+
   const sessionId =
     req.headers[
       "mcp-session-id"
     ];
 
-  /*
-  ------------------------------------------------------
-  EXISTING SESSION
-  ------------------------------------------------------
-  */
 
-  if (
-    sessionId &&
-    sessions.has(sessionId)
-  ) {
+  /*
+   * Existing session.
+   */
+
+  if (sessionId) {
 
     const session =
       sessions.get(
-        sessionId
+        String(sessionId)
       );
 
-    log(
-      `MCP request -> session ${sessionId}`
-    );
+    if (!session) {
 
-    /*
-      IMPORTANT:
-      No manual body parsing here.
-      The SDK transport reads the request.
-    */
+      sendJson(
+        res,
+        404,
+        {
+          jsonrpc:
+            "2.0",
 
-    await session.transport.handleRequest(
-      req,
-      res
-    );
+          error: {
+            code:
+              -32000,
 
-    return;
-  }
+            message:
+              "Unknown MCP session ID"
+          },
 
+          id:
+            null
+        }
+      );
 
-  /*
-  ------------------------------------------------------
-  NEW SESSION
-  ------------------------------------------------------
-  */
-
-  if (!sessionId) {
-
-    /*
-      The Streamable HTTP transport itself
-      handles the initialize request.
-    */
-
-    const transport =
-      createTransport();
-
-    const server =
-      createMcpServer();
-
-    await server.connect(
-      transport
-    );
-
-    log(
-      `MCP new connection: ${req.method} ${req.url}`
-    );
-
-    await transport.handleRequest(
-      req,
-      res
-    );
-
-    return;
-  }
-
-
-  /*
-  ------------------------------------------------------
-  UNKNOWN SESSION
-  ------------------------------------------------------
-  */
-
-  res.writeHead(
-    404,
-    {
-      "Content-Type":
-        "application/json"
+      return;
     }
+
+    await session
+      .transport
+      .handleRequest(
+        req,
+        res
+      );
+
+    return;
+  }
+
+
+  /*
+   * New session.
+   *
+   * We only create a new MCP server for
+   * an initialization request.
+   */
+
+  const contentType =
+    String(
+      req.headers[
+        "content-type"
+      ] || ""
+    ).toLowerCase();
+
+  const method =
+    String(
+      req.method || ""
+    ).toUpperCase();
+
+  /*
+   * GET without an existing session is not
+   * a valid way to initialize a stateful MCP
+   * session.
+   */
+
+  if (
+    method === "GET"
+  ) {
+
+    sendJson(
+      res,
+      400,
+      {
+        jsonrpc:
+          "2.0",
+
+        error: {
+          code:
+            -32000,
+
+          message:
+            "MCP session ID required"
+        },
+
+        id:
+          null
+      }
+    );
+
+    return;
+  }
+
+  /*
+   * A POST without a session is allowed only
+   * for initialization.
+   *
+   * We deliberately let the MCP transport
+   * validate the JSON-RPC initialize request.
+   */
+
+  if (
+    method !== "POST"
+  ) {
+
+    sendJson(
+      res,
+      405,
+      {
+        error:
+          "Method Not Allowed"
+      }
+    );
+
+    return;
+  }
+
+  /*
+   * MCP requests must be JSON.
+   */
+
+  if (
+    !contentType.includes(
+      "application/json"
+    )
+  ) {
+
+    sendJson(
+      res,
+      415,
+      {
+        error:
+          "Content-Type must be application/json"
+      }
+    );
+
+    return;
+  }
+
+  const transport =
+    createTransport();
+
+  const server =
+    createMcpServer();
+
+  /*
+   * Connect exactly once.
+   */
+
+  await server.connect(
+    transport
   );
 
-  res.end(
-    JSON.stringify({
-      jsonrpc:
-        "2.0",
+  /*
+   * Transport handles the request.
+   *
+   * No manual body parsing.
+   */
 
-      error: {
-        code:
-          -32001,
-
-        message:
-          "MCP session not found"
-      },
-
-      id:
-        null
-    })
+  await transport.handleRequest(
+    req,
+    res
   );
 }
 
 
-/*
-========================================================
-HTTP SERVER
-========================================================
-*/
+/* ============================================================
+ * HTTP SERVER
+ * ============================================================
+ */
 
 const httpServer =
   http.createServer(
     async (req, res) => {
 
-      try {
+      setCors(res);
 
-        /*
-        --------------------------------------------------
-        CORS
-        --------------------------------------------------
-        */
+      /*
+       * CORS preflight.
+       */
 
-        res.setHeader(
-          "Access-Control-Allow-Origin",
-          "*"
+      if (
+        req.method ===
+        "OPTIONS"
+      ) {
+
+        res.statusCode =
+          204;
+
+        res.end();
+
+        return;
+      }
+
+      const url =
+        new URL(
+          req.url || "/",
+          `http://${req.headers.host || "localhost"}`
         );
 
-        res.setHeader(
-          "Access-Control-Allow-Headers",
-          "Content-Type, Accept, MCP-Session-Id, Last-Event-ID"
+
+      /*
+       * ------------------------------------------------------
+       * ROOT
+       * ------------------------------------------------------
+       */
+
+      if (
+        url.pathname === "/"
+      ) {
+
+        sendJson(
+          res,
+          200,
+          {
+            ok: true,
+
+            service:
+              SERVICE_NAME,
+
+            version:
+              APP_VERSION,
+
+            mcp:
+              "/mcp",
+
+            health:
+              "/health",
+
+            sessions:
+              sessions.size
+          }
         );
 
-        res.setHeader(
-          "Access-Control-Expose-Headers",
-          "MCP-Session-Id"
+        return;
+      }
+
+
+      /*
+       * ------------------------------------------------------
+       * HEALTH
+       * ------------------------------------------------------
+       */
+
+      if (
+        url.pathname ===
+        "/health"
+      ) {
+
+        sendJson(
+          res,
+          200,
+          {
+            ok: true,
+
+            service:
+              SERVICE_NAME,
+
+            version:
+              APP_VERSION,
+
+            sessions:
+              sessions.size,
+
+            universe_loaded:
+              Boolean(
+                universeCache
+              ),
+
+            universe_count:
+              universeCache
+                ? universeCache.length
+                : 0
+          }
         );
 
-
-        /*
-        --------------------------------------------------
-        OPTIONS
-        --------------------------------------------------
-        */
-
-        if (
-          req.method === "OPTIONS"
-        ) {
-
-          res.writeHead(
-            204
-          );
-
-          res.end();
-
-          return;
-        }
+        return;
+      }
 
 
-        /*
-        --------------------------------------------------
-        HEALTH
-        --------------------------------------------------
-        */
+      /*
+       * ------------------------------------------------------
+       * MCP
+       * ------------------------------------------------------
+       */
 
-        if (
-          req.url === "/" ||
-          req.url === "/health"
-        ) {
+      if (
+        url.pathname === "/mcp"
+      ) {
 
-          res.writeHead(
-            200,
-            {
-              "Content-Type":
-                "application/json"
-            }
-          );
-
-          res.end(
-            JSON.stringify({
-
-              ok: true,
-
-              service:
-                "yahoo-scan-mcp",
-
-              version:
-                APP_VERSION,
-
-              sessions:
-                sessions.size
-
-            })
-          );
-
-          return;
-        }
-
-
-        /*
-        --------------------------------------------------
-        MCP
-        --------------------------------------------------
-        */
-
-        if (
-          req.url === "/mcp"
-        ) {
+        try {
 
           await handleMcp(
             req,
             res
           );
 
-          return;
-        }
+        } catch (error) {
 
+          logError(
+            "MCP request error:",
+            error
+          );
 
-        /*
-        --------------------------------------------------
-        404
-        --------------------------------------------------
-        */
+          if (
+            !res.headersSent
+          ) {
 
-        res.writeHead(
-          404,
-          {
-            "Content-Type":
-              "application/json"
+            sendJson(
+              res,
+              500,
+              {
+                jsonrpc:
+                  "2.0",
+
+                error: {
+                  code:
+                    -32603,
+
+                  message:
+                    error?.message ||
+                    "Internal MCP error"
+                },
+
+                id:
+                  null
+              }
+            );
+
+          } else {
+
+            try {
+              res.end();
+            } catch {}
           }
-        );
-
-        res.end(
-          JSON.stringify({
-
-            ok: false,
-
-            error:
-              "Not found"
-
-          })
-        );
-
-      } catch (error) {
-
-        log(
-          "HTTP error:",
-          error
-        );
-
-        if (
-          !res.headersSent
-        ) {
-
-          res.writeHead(
-            500,
-            {
-              "Content-Type":
-                "application/json"
-            }
-          );
-
-          res.end(
-            JSON.stringify({
-
-              ok: false,
-
-              error:
-                error?.message ||
-                String(error)
-
-            })
-          );
         }
+
+        return;
       }
+
+
+      /*
+       * ------------------------------------------------------
+       * 404
+       * ------------------------------------------------------
+       */
+
+      sendJson(
+        res,
+        404,
+        {
+          ok: false,
+
+          error:
+            "Not found"
+        }
+      );
     }
   );
 
 
-/*
-========================================================
-START
-========================================================
-*/
+/* ============================================================
+ * SERVER ERROR
+ * ============================================================
+ */
+
+httpServer.on(
+  "error",
+  error => {
+
+    logError(
+      "HTTP server error:",
+      error
+    );
+  }
+);
+
+
+/* ============================================================
+ * START
+ * ============================================================
+ */
 
 httpServer.listen(
   PORT,
   "0.0.0.0",
   () => {
+
+    log(
+      `MCP server started v${APP_VERSION}`
+    );
 
     log(
       `HTTP server listening on ${PORT}`
@@ -1935,9 +2594,66 @@ httpServer.listen(
     log(
       `Health endpoint: /health`
     );
-
-    log(
-      `MCP server started v${APP_VERSION}`
-    );
   }
+);
+
+
+/* ============================================================
+ * GRACEFUL SHUTDOWN
+ * ============================================================
+ */
+
+async function shutdown(
+  signal
+) {
+
+  log(
+    `Received ${signal}, shutting down...`
+  );
+
+  for (
+    const [
+      sessionId,
+      session
+    ] of sessions
+  ) {
+
+    try {
+
+      await session
+        .transport
+        .close();
+
+    } catch (error) {
+
+      logError(
+        `Error closing session ${sessionId}:`,
+        error
+      );
+    }
+  }
+
+  sessions.clear();
+
+  httpServer.close(
+    () => {
+
+      log(
+        "HTTP server closed."
+      );
+
+      process.exit(0);
+    }
+  );
+}
+
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
 );
