@@ -1,56 +1,69 @@
 /*
 ============================================================
  Yahoo Scan MCP
- Version 1.8.0
+ Version 2.0.0
 ============================================================
+
+OBJECTIF
+--------
+Scanner temps réel NASDAQ / ordinary stocks / <$5
+
 Architecture :
 
 S0
-- Universe NASDAQ / ordinary stocks
-- Price < $5
+- Universe NASDAQ
+- Ordinary stocks uniquement
+- ETF / warrants / rights / units / preferred exclus
 - Historique 15m
-- J-1 / J-2 FILTER EXCLUSIVELY HERE
-- RVOL15M historical baseline
-- Materialized S0
+- J-1 / J-2
+- Liquidité historique
+- RVOL15M baseline
+- Vol5 baseline
+- Vol60 baseline
+- Materialisation S0
 
 S1
 - Intraday 5m
-- Dynamic as-of
+- Snapshot dynamique
 - VWAP
 - RVOL15M
-- Accel5M
-- HOD / HOD distance
-- STRICT BLOCKING FILTER
-- NO J-1 / J-2 FILTER
-- Anti-leak validation
-- Materialized S1
+- Vol5
+- Delta60
+- HOD
+- Accel5M informatif
+- Ranking DV
 
 SF
-- Works ONLY from validated S1
-- Revalidates configured intraday thresholds
-- Strict blocking filter
-- Winner Gate
+- RVOL15M >= 1.50
+- Vol5/reference >= 0.20
+- Delta60 <= +10%
+- Price vs VWAP >= -1%
+- Delta 15:55 -> 15:59 >= 0%
+- Lots de 20
+- Ranking DV décroissant
 
-Transport
-- Streamable HTTP
-- Stateless
-- 11 MCP tools
+IMPORTANT
+---------
+Accel5M N'EST PAS un filtre bloquant.
+Le seuil 20% appartient au Vol5 ratio,
+pas à Accel5M.
+
 ============================================================
 */
 
 import express from "express";
 import fs from "fs";
 import path from "path";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-
 
 /* =========================================================
    CONFIG
 ========================================================= */
 
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "2.0.0";
 
 const PORT =
   Number(process.env.PORT || 8080);
@@ -62,476 +75,318 @@ const RETRY_DELAY_MS = 600;
 
 const S0_RANGE = "1mo";
 const S0_INTERVAL = "15m";
-
-const S1_RANGE = "1d";
 const S1_INTERVAL = "5m";
 
-/*
-------------------------------------------------------------
-STRATEGY THRESHOLDS
-------------------------------------------------------------
-
-IMPORTANT:
-Do not modify these without a strategy re-validation.
-
-J-1 / J-2:
-maximum absolute session performance = 5%
-
-S1:
-Price vs VWAP >= -1%
-RVOL15M >= 1.30
-Accel5M >= 20%
-
-SF:
-defaults remain identical to the tested architecture.
-------------------------------------------------------------
-*/
+const MARKET_TZ = "America/New_York";
 
 const MAX_J1_J2_PCT = 5;
 
-const S1_MIN_PRICE_VS_VWAP_PCT = -1;
-const S1_MIN_RVOL15M = 1.30;
-const S1_MIN_ACCEL5M = 20;
+const LOCKED = {
+  rvol15Min: 1.50,
 
-const MIN_S0_HISTORICAL_SESSIONS = 5;
-const MIN_S0_VALID_VOLUME_BARS = 20;
-const MIN_RVOL_BASELINE_SESSIONS = 5;
-const MIN_S1_COMPLETED_BARS = 4;
+  /*
+   * IMPORTANT:
+   * 20% = Vol5 ratio minimum.
+   * NOT Accel5M.
+   */
+  vol5MinRatio: 0.20,
 
-const CACHE_DIR =
-  process.env.DATA_DIR ||
-  process.cwd();
+  delta60MaxPct: 10,
 
-const UNIVERSE_FILE =
-  path.join(
-    CACHE_DIR,
-    "universe_s0.txt"
-  );
+  priceVsVwapMinPct: -1,
 
-const S0_CACHE_FILE =
-  path.join(
-    CACHE_DIR,
-    "s0_materialized.json"
-  );
+  delta1555to1559MinPct: 0,
 
-const S1_CACHE_FILE =
-  path.join(
-    CACHE_DIR,
-    "s1_materialized.json"
-  );
+  lotSize: 20
+};
 
+const NON_BLOCKING = {
+  accel5m: true
+};
 
 /* =========================================================
-   GLOBAL STATE
+   PATHS
+========================================================= */
+
+const ROOT = process.cwd();
+
+const UNIVERSE_FILE =
+  process.env.UNIVERSE_FILE ||
+  path.join(ROOT, "universe_s0.txt");
+
+const S0_CACHE_FILE =
+  path.join(ROOT, "s0_materialized.json");
+
+const S1_CACHE_FILE =
+  path.join(ROOT, "s1_materialized.json");
+
+/* =========================================================
+   EXPRESS
+========================================================= */
+
+const app = express();
+
+app.use(
+  express.json({
+    limit: "2mb"
+  })
+);
+
+/* =========================================================
+   STATE
 ========================================================= */
 
 const scanState = {
+  started_at: null,
+  completed_at: null,
+  asof: null,
 
-  version:
-    APP_VERSION,
+  s0_count: 0,
+  s1_count: 0,
+  sf_count: 0,
 
-  asof:
-    null,
+  elapsed_ms: null,
 
-  elapsed_ms:
-    0,
-
-  running:
-    false,
-
-  stage:
-    null,
-
-  universe_requested:
-    0,
-
-  s0_count:
-    0,
-
-  s1_count:
-    0,
-
-  sf_count:
-    0,
-
-  s0:
-    [],
-
-  s1:
-    [],
-
-  sf:
-    [],
-
-  winner:
-    null,
-
-  yahoo_errors:
-    0,
-
-  last_error:
-    null
-
+  status: "idle"
 };
 
-
 /* =========================================================
-   UTILS
+   BASIC UTILS
 ========================================================= */
-
-function nowIso() {
-
-  return new Date()
-    .toISOString();
-
-}
-
 
 function sleep(ms) {
-
-  return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        ms
-      )
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
   );
-
 }
 
+function chunk(arr, size) {
+  const out = [];
 
-function isFiniteNumber(value) {
+  for (
+    let i = 0;
+    i < arr.length;
+    i += size
+  ) {
+    out.push(arr.slice(i, i + size));
+  }
 
-  return (
-    typeof value === "number" &&
-    Number.isFinite(value)
-  );
-
+  return out;
 }
-
 
 function median(values) {
+  const a = values
+    .filter(Number.isFinite)
+    .sort((x, y) => x - y);
 
-  const arr =
-    values
-      .filter(
-        value =>
-          Number.isFinite(value)
-      )
-      .sort(
-        (a, b) =>
-          a - b
-      );
-
-  if (!arr.length) {
+  if (!a.length) {
     return null;
   }
 
-  const middle =
-    Math.floor(
-      arr.length / 2
-    );
+  const mid =
+    Math.floor(a.length / 2);
 
-  return (
-    arr.length % 2
-      ? arr[middle]
-      : (
-          arr[middle - 1] +
-          arr[middle]
-        ) / 2
-  );
+  if (a.length % 2) {
+    return a[mid];
+  }
 
+  return (a[mid - 1] + a[mid]) / 2;
 }
 
-
-function normalizeSymbols(symbols) {
-
-  return [
-    ...new Set(
-      (
-        Array.isArray(symbols)
-          ? symbols
-          : []
-      )
-        .map(
-          s =>
-            String(s)
-              .trim()
-              .toUpperCase()
-        )
-        .filter(Boolean)
-        .filter(
-          s =>
-            /^[A-Z0-9.\-]+$/
-              .test(s)
-        )
-    )
-  ];
-
-}
-
-
-/* =========================================================
-   NEW YORK TIME
-========================================================= */
-
-function nyParts(ts) {
-
-  const date =
-    new Date(ts);
-
+function pctChange(from, to) {
   if (
-    !Number.isFinite(
-      date.getTime()
-    )
+    !Number.isFinite(from) ||
+    !Number.isFinite(to) ||
+    from === 0
   ) {
     return null;
   }
+
+  return ((to / from) - 1) * 100;
+}
+
+function finite(value) {
+  return Number.isFinite(value);
+}
+
+function round(value, digits = 4) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const p = 10 ** digits;
+
+  return Math.round(value * p) / p;
+}
+
+/* =========================================================
+   TIMEZONE
+========================================================= */
+
+function getNYParts(timestamp) {
+  const dtf = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone: MARKET_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23"
+    }
+  );
 
   const parts =
-    new Intl.DateTimeFormat(
-      "en-US",
-      {
-        timeZone:
-          "America/New_York",
-
-        year:
-          "numeric",
-
-        month:
-          "2-digit",
-
-        day:
-          "2-digit",
-
-        hour:
-          "2-digit",
-
-        minute:
-          "2-digit",
-
-        second:
-          "2-digit",
-
-        hourCycle:
-          "h23"
-      }
-    )
-      .formatToParts(date);
-
-  const result = {};
-
-  for (const part of parts) {
-
-    if (
-      part.type !==
-      "literal"
-    ) {
-
-      result[part.type] =
-        part.value;
-
-    }
-
-  }
-
-  return result;
-
-}
-
-
-function nyDateKey(ts) {
-
-  const p =
-    nyParts(ts);
-
-  return p
-    ? `${p.year}-${p.month}-${p.day}`
-    : null;
-
-}
-
-
-function nyTimeKey(ts) {
-
-  const p =
-    nyParts(ts);
-
-  if (!p) {
-    return null;
-  }
-
-  const hour =
-    Number(p.hour);
-
-  const minute =
-    Number(p.minute);
-
-  if (
-    hour < 9 ||
-    (
-      hour === 9 &&
-      minute < 30
-    )
-  ) {
-    return null;
-  }
-
-  if (
-    hour > 16 ||
-    (
-      hour === 16 &&
-      minute > 0
-    )
-  ) {
-    return null;
-  }
-
-  return (
-    `${p.hour}:${p.minute}`
-  );
-
-}
-
-
-function nyMinutes(ts) {
-
-  const p =
-    nyParts(ts);
-
-  if (!p) {
-    return null;
-  }
-
-  return (
-    Number(p.hour) * 60 +
-    Number(p.minute)
-  );
-
-}
-
-
-function isRegularSessionBar(ts) {
-
-  const minutes =
-    nyMinutes(ts);
-
-  return (
-    minutes !== null &&
-    minutes >= 570 &&
-    minutes <= 960
-  );
-
-}
-
-
-/* =========================================================
-   ORDINARY STOCK FILTER
-========================================================= */
-
-function isOrdinaryStock(
-  symbol,
-  item
-) {
-
-  if (
-    !symbol ||
-    typeof symbol !== "string"
-  ) {
-    return false;
-  }
-
-  const meta =
-    item?.response?.[0]?.meta ||
-    item?.meta ||
-    {};
-
-  const quoteType =
-    String(
-      meta.quoteType || ""
-    )
-      .toUpperCase();
-
-  const exchange =
-    String(
-      meta.exchangeName || ""
-    )
-      .toUpperCase();
-
-  const fullExchange =
-    String(
-      meta.fullExchangeName || ""
-    )
-      .toUpperCase();
-
-  if (
-    quoteType &&
-    quoteType !== "EQUITY"
-  ) {
-    return false;
-  }
-
-  const nasdaq =
-    exchange === "NMS" ||
-    exchange === "NGM" ||
-    exchange === "NCM" ||
-    fullExchange.includes(
-      "NASDAQ"
+    dtf.formatToParts(
+      new Date(timestamp)
     );
 
-  return nasdaq;
+  const out = {};
 
+  for (const p of parts) {
+    if (p.type !== "literal") {
+      out[p.type] = Number(p.value);
+    }
+  }
+
+  return out;
 }
 
+function etClock(timestamp) {
+  const p = getNYParts(timestamp);
+
+  return (
+    String(p.hour).padStart(2, "0") +
+    ":" +
+    String(p.minute).padStart(2, "0")
+  );
+}
+
+function etDate(timestamp) {
+  const p = getNYParts(timestamp);
+
+  return (
+    `${p.year}-${String(p.month).padStart(2, "0")}-` +
+    `${String(p.day).padStart(2, "0")}`
+  );
+}
+
+function etTimestamp(
+  date,
+  hour,
+  minute,
+  second = 0
+) {
+  /*
+   * Convertit une heure ET en timestamp UTC.
+   * Recherche itérative robuste autour des changements DST.
+   */
+
+  let guess =
+    Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate(),
+      hour,
+      minute,
+      second
+    );
+
+  for (let i = 0; i < 5; i++) {
+    const p = getNYParts(guess);
+
+    const current =
+      Date.UTC(
+        p.year,
+        p.month - 1,
+        p.day,
+        p.hour,
+        p.minute,
+        p.second
+      );
+
+    const target =
+      Date.UTC(
+        date.getUTCFullYear(),
+        date.getUTCMonth(),
+        date.getUTCDate(),
+        hour,
+        minute,
+        second
+      );
+
+    const diff =
+      target - current;
+
+    if (diff === 0) {
+      break;
+    }
+
+    guess += diff;
+  }
+
+  return guess;
+}
+
+/* =========================================================
+   MARKET SESSION
+========================================================= */
+
+function isRegularSessionBar(timestamp) {
+  const p =
+    getNYParts(timestamp);
+
+  const minutes =
+    p.hour * 60 + p.minute;
+
+  /*
+   * 09:30 <= start < 16:00
+   */
+  return (
+    minutes >= 570 &&
+    minutes < 960
+  );
+}
+
+function floor15Clock(timestamp) {
+  const p =
+    getNYParts(timestamp);
+
+  const m =
+    Math.floor(p.minute / 15) * 15;
+
+  return (
+    String(p.hour).padStart(2, "0") +
+    ":" +
+    String(m).padStart(2, "0")
+  );
+}
+
+function floor5Clock(timestamp) {
+  const p =
+    getNYParts(timestamp);
+
+  const m =
+    Math.floor(p.minute / 5) * 5;
+
+  return (
+    String(p.hour).padStart(2, "0") +
+    ":" +
+    String(m).padStart(2, "0")
+  );
+}
 
 /* =========================================================
    YAHOO CHART
 ========================================================= */
 
-async function fetchWithTimeout(
-  url
-) {
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      REQUEST_TIMEOUT_MS
-    );
-
-  try {
-
-    return await fetch(
-      url,
-      {
-        signal:
-          controller.signal,
-
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 Yahoo-Scan-MCP"
-        }
-      }
-    );
-
-  } finally {
-
-    clearTimeout(timer);
-
-  }
-
-}
-
-
-async function yahooChart(
+async function fetchYahooChart(
   symbol,
-  range,
-  interval
+  interval,
+  range
 ) {
-
   const url =
     "https://query1.finance.yahoo.com/v8/finance/chart/" +
     encodeURIComponent(symbol) +
@@ -540,247 +395,113 @@ async function yahooChart(
     "&includePrePost=false" +
     "&events=div%2Csplits";
 
-  let lastError =
-    null;
+  let lastError = null;
 
   for (
     let attempt = 1;
     attempt <= RETRIES;
     attempt++
   ) {
+    const controller =
+      new AbortController();
+
+    const timer =
+      setTimeout(
+        () =>
+          controller.abort(),
+        REQUEST_TIMEOUT_MS
+      );
 
     try {
-
       const response =
-        await fetchWithTimeout(
-          url
+        await fetch(
+          url,
+          {
+            signal:
+              controller.signal,
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0"
+            }
+          }
         );
 
       if (!response.ok) {
-
         throw new Error(
           `Yahoo HTTP ${response.status}`
         );
-
       }
 
       const json =
         await response.json();
 
-      if (
-        !json?.chart?.result?.length
-      ) {
+      const result =
+        json?.chart?.result?.[0];
 
+      if (!result) {
         throw new Error(
-          "Yahoo Chart result absent"
+          "Yahoo chart result missing"
         );
-
       }
 
-      return {
+      clearTimeout(timer);
 
+      return normalizeYahooChart(
         symbol,
-
-        response:
-          json.chart.result
-
-      };
-
+        result
+      );
     } catch (error) {
+      clearTimeout(timer);
 
-      lastError =
-        error;
+      lastError = error;
 
       if (
         attempt < RETRIES
       ) {
-
         await sleep(
           RETRY_DELAY_MS *
           attempt
         );
-
       }
-
     }
-
   }
 
-  throw (
-    lastError ||
-    new Error(
-      "Yahoo Chart failed"
-    )
+  throw new Error(
+    `${symbol}: ${
+      lastError?.message ||
+      "Yahoo request failed"
+    }`
   );
-
 }
 
-
 /* =========================================================
-   BATCH DATA LOADER
+   NORMALIZE YAHOO
 ========================================================= */
 
-async function yahooChartBatch(
-  symbols,
-  range,
-  interval
+function normalizeYahooChart(
+  symbol,
+  result
 ) {
-
-  const results = {};
-
-  let errors = 0;
-
-  let cursor = 0;
-
-  async function worker() {
-
-    while (true) {
-
-      const index =
-        cursor++;
-
-      if (
-        index >=
-        symbols.length
-      ) {
-        return;
-      }
-
-      const symbol =
-        symbols[index];
-
-      try {
-
-        results[symbol] =
-          await yahooChart(
-            symbol,
-            range,
-            interval
-          );
-
-      } catch (error) {
-
-        errors++;
-
-        results[symbol] = {
-
-          symbol,
-
-          error:
-            String(
-              error?.message ||
-              error
-            ),
-
-          response:
-            []
-
-        };
-
-      }
-
-    }
-
-  }
-
-  const workers =
-    Math.min(
-      DATA_CONCURRENCY,
-      symbols.length
-    );
-
-  if (
-    workers > 0
-  ) {
-
-    await Promise.all(
-      Array.from(
-        {
-          length:
-            workers
-        },
-        () =>
-          worker()
-      )
-    );
-
-  }
-
-  return {
-    results,
-    errors
-  };
-
-}
-
-
-/* =========================================================
-   BAR EXTRACTION
-========================================================= */
-
-function extractBars(item) {
-
-  const response =
-    Array.isArray(
-      item?.response
-    )
-      ? item.response[0]
-      : (
-          item?.response ||
-          item
-        );
-
-  if (!response) {
-    return [];
-  }
-
   const timestamps =
-    Array.isArray(
-      response.timestamp
-    )
-      ? response.timestamp
-      : [];
+    result.timestamp || [];
 
   const quote =
-    response
-      ?.indicators
-      ?.quote?.[0] ||
-    {};
-
-  const closes =
-    Array.isArray(
-      quote.close
-    )
-      ? quote.close
-      : [];
+    result.indicators?.quote?.[0] || {};
 
   const opens =
-    Array.isArray(
-      quote.open
-    )
-      ? quote.open
-      : [];
+    quote.open || [];
 
   const highs =
-    Array.isArray(
-      quote.high
-    )
-      ? quote.high
-      : [];
+    quote.high || [];
 
   const lows =
-    Array.isArray(
-      quote.low
-    )
-      ? quote.low
-      : [];
+    quote.low || [];
+
+  const closes =
+    quote.close || [];
 
   const volumes =
-    Array.isArray(
-      quote.volume
-    )
-      ? quote.volume
-      : [];
+    quote.volume || [];
 
   const bars = [];
 
@@ -789,107 +510,180 @@ function extractBars(item) {
     i < timestamps.length;
     i++
   ) {
-
-    const timestamp =
-      Number(
-        timestamps[i]
-      );
-
-    if (
-      !Number.isFinite(
-        timestamp
-      )
-    ) {
-      continue;
-    }
-
-    const close =
-      Number(
-        closes[i]
-      );
-
-    if (
-      !Number.isFinite(
-        close
-      ) ||
-      close <= 0
-    ) {
-      continue;
-    }
+    const ts =
+      Number(timestamps[i]) * 1000;
 
     const open =
-      Number(
-        opens[i]
-      );
+      Number(opens[i]);
 
     const high =
-      Number(
-        highs[i]
-      );
+      Number(highs[i]);
 
     const low =
-      Number(
-        lows[i]
-      );
+      Number(lows[i]);
+
+    const close =
+      Number(closes[i]);
 
     const volume =
-      Number(
-        volumes[i]
-      );
+      Number(volumes[i]);
+
+    if (
+      !Number.isFinite(ts) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      continue;
+    }
 
     bars.push({
-
-      ts:
-        timestamp * 1000,
-
-      open:
-        Number.isFinite(open)
-          ? open
-          : null,
-
-      high:
-        Number.isFinite(high)
-          ? high
-          : null,
-
-      low:
-        Number.isFinite(low)
-          ? low
-          : null,
-
+      ts,
+      open,
+      high,
+      low,
       close,
-
       volume:
-        Number.isFinite(volume) &&
-        volume >= 0
+        Number.isFinite(volume)
           ? volume
-          : null
-
+          : 0
     });
-
   }
 
-  return bars.sort(
-    (a, b) =>
-      a.ts - b.ts
-  );
-
+  return {
+    symbol,
+    meta: result.meta || {},
+    bars
+  };
 }
 
-
 /* =========================================================
-   SESSION HELPERS
+   UNIVERSE
 ========================================================= */
 
-function getSessionBars(
+function readUniverse() {
+  if (
+    !fs.existsSync(
+      UNIVERSE_FILE
+    )
+  ) {
+    return [];
+  }
+
+  const raw =
+    fs.readFileSync(
+      UNIVERSE_FILE,
+      "utf8"
+    );
+
+  const symbols =
+    raw
+      .split(/\r?\n/)
+      .map(x =>
+        x.trim().toUpperCase()
+      )
+      .filter(Boolean)
+      .filter(
+        x =>
+          !x.startsWith("#")
+      );
+
+  return [
+    ...new Set(symbols)
+  ];
+}
+
+/* =========================================================
+   ORDINARY STOCK
+========================================================= */
+
+function isOrdinaryStock(meta) {
+  const quoteType =
+    String(
+      meta?.quoteType ||
+      ""
+    ).toUpperCase();
+
+  const exchange =
+    String(
+      meta?.exchangeName ||
+      meta?.fullExchangeName ||
+      ""
+    ).toUpperCase();
+
+  /*
+   * Si Yahoo fournit explicitement
+   * un quoteType incompatible,
+   * rejet.
+   */
+
+  const forbiddenTypes =
+    new Set([
+      "ETF",
+      "MUTUALFUND",
+      "INDEX",
+      "OPTION",
+      "FUTURE",
+      "CRYPTOCURRENCY",
+      "WARRANT",
+      "RIGHT",
+      "UNIT",
+      "PREFERRED_STOCK"
+    ]);
+
+  if (
+    quoteType &&
+    forbiddenTypes.has(
+      quoteType
+    )
+  ) {
+    return false;
+  }
+
+  /*
+   * Si quoteType explicite et non equity,
+   * rejet.
+   */
+
+  if (
+    quoteType &&
+    quoteType !== "EQUITY"
+  ) {
+    return false;
+  }
+
+  /*
+   * Le fichier universe_s0.txt
+   * est déjà filtré NASDAQ.
+   *
+   * Si Yahoo ne renvoie pas exchangeName,
+   * on ne rejette pas automatiquement :
+   * l'univers matérialisé reste la source
+   * structurelle S0.
+   */
+
+  if (
+    exchange &&
+    !exchange.includes("NASDAQ")
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/* =========================================================
+   SESSION GROUPING
+========================================================= */
+
+function groupBySession(
   bars
 ) {
-
-  const sessions =
+  const map =
     new Map();
 
   for (const bar of bars) {
-
     if (
       !isRegularSessionBar(
         bar.ts
@@ -899,2221 +693,2186 @@ function getSessionBars(
     }
 
     const date =
-      nyDateKey(
-        bar.ts
-      );
+      etDate(bar.ts);
 
-    if (!date) {
-      continue;
-    }
-
-    if (
-      !sessions.has(date)
-    ) {
-
-      sessions.set(
+    if (!map.has(date)) {
+      map.set(
         date,
         []
       );
-
     }
 
-    sessions
+    map
       .get(date)
       .push(bar);
-
   }
 
-  return sessions;
-
+  return map;
 }
 
-
-function getCurrentSessionBars(
-  bars,
-  asofMs = Date.now()
+function sortedSessionDates(
+  bars
 ) {
-
-  const sessions =
-    getSessionBars(
+  return [
+    ...groupBySession(
       bars
-        .filter(
-          bar =>
-            bar.ts <=
-            asofMs + 1000
-        )
-    );
-
-  const dates =
-    [
-      ...sessions.keys()
-    ]
-      .sort();
-
-  return dates.length
-    ? (
-        sessions.get(
-          dates[
-            dates.length - 1
-          ]
-        ) || []
-      )
-    : [];
-
+    ).keys()
+  ].sort();
 }
 
+/* =========================================================
+   SESSION PERFORMANCE
+========================================================= */
 
 function sessionPerformance(
   bars
 ) {
-
-  if (
-    !bars ||
-    bars.length < 2
-  ) {
+  if (!bars?.length) {
     return null;
   }
 
-  const first =
-    bars.find(
-      b =>
-        isFiniteNumber(
-          b.open
-        ) &&
-        b.open > 0
+  const ordered =
+    [...bars].sort(
+      (a, b) =>
+        a.ts - b.ts
     );
 
+  const first =
+    ordered[0];
+
   const last =
-    [...bars]
-      .reverse()
-      .find(
-        b =>
-          isFiniteNumber(
-            b.close
-          )
-      );
+    ordered[
+      ordered.length - 1
+    ];
 
   if (
-    !first ||
-    !last
+    !finite(first.open) ||
+    !finite(last.close) ||
+    first.open <= 0
   ) {
     return null;
   }
 
   return (
-    (
-      last.close /
+    (last.close /
       first.open -
-      1
-    ) * 100
+      1) *
+    100
   );
-
 }
 
-
 /* =========================================================
-   RVOL BASELINE
+   S0 15M BASELINE
 ========================================================= */
 
-function buildRvol15mBaseline(
-  completedSessions
+function build15mReferences(
+  bars
 ) {
-
-  const slotValues =
-    new Map();
-
-  for (
-    const session of
-    completedSessions
-  ) {
-
-    const slotVolumes =
-      new Map();
-
-    for (
-      const bar of
-      session
-    ) {
-
-      const key =
-        nyTimeKey(
-          bar.ts
-        );
-
-      const volume =
-        Number(
-          bar.volume
-        );
-
-      if (
-        !key ||
-        !Number.isFinite(
-          volume
-        ) ||
-        volume <= 0
-      ) {
-        continue;
-      }
-
-      slotVolumes.set(
-        key,
-        (
-          slotVolumes.get(key) ||
-          0
-        ) + volume
-      );
-
-    }
-
-    for (
-      const [
-        key,
-        volume
-      ] of slotVolumes
-    ) {
-
-      if (
-        !slotValues.has(key)
-      ) {
-
-        slotValues.set(
-          key,
-          []
-        );
-
-      }
-
-      slotValues
-        .get(key)
-        .push(volume);
-
-    }
-
-  }
-
-  const baseline = {};
-
-  for (
-    const [
-      key,
-      values
-    ] of slotValues
-  ) {
-
-    const valid =
-      values.filter(
-        value =>
-          Number.isFinite(
-            value
-          ) &&
-          value > 0
-      );
-
-    if (
-      valid.length >=
-      MIN_RVOL_BASELINE_SESSIONS
-    ) {
-
-      baseline[key] =
-        median(valid);
-
-    }
-
-  }
-
-  return baseline;
-
-}
-
-
-/* =========================================================
-   S0 J-1 / J-2 FILTER
-========================================================= */
-
-function passesS0HistoricalFilter(
-  j1Pct,
-  j2Pct
-) {
-
-  if (
-    !Number.isFinite(j1Pct) ||
-    !Number.isFinite(j2Pct)
-  ) {
-    return false;
-  }
-
-  if (
-    Math.abs(j1Pct) >
-    MAX_J1_J2_PCT
-  ) {
-    return false;
-  }
-
-  if (
-    Math.abs(j2Pct) >
-    MAX_J1_J2_PCT
-  ) {
-    return false;
-  }
-
-  return true;
-
-}
-
-
-/* =========================================================
-   S0
-========================================================= */
-
-function calculateS0(
-  symbol,
-  item
-) {
-
-  if (
-    !isOrdinaryStock(
-      symbol,
-      item
-    )
-  ) {
-    return null;
-  }
-
-  const bars =
-    extractBars(
-      item
-    );
-
-  if (
-    bars.length <
-    MIN_S0_VALID_VOLUME_BARS
-  ) {
-    return null;
-  }
-
   const sessions =
-    getSessionBars(
+    groupBySession(
       bars
     );
 
   const dates =
-    [
-      ...sessions.keys()
-    ]
+    [...sessions.keys()]
       .sort();
 
-  if (
-    dates.length <
-    MIN_S0_HISTORICAL_SESSIONS + 1
-  ) {
-    return null;
-  }
-
-  const currentDate =
-    dates[
-      dates.length - 1
-    ];
-
-  const currentSession =
-    sessions.get(
-      currentDate
-    ) || [];
-
-  const completedSessions =
-    dates
-      .slice(0, -1)
-      .map(
-        date =>
-          sessions.get(date)
-      )
-      .filter(Boolean);
-
-  if (
-    completedSessions.length <
-    MIN_S0_HISTORICAL_SESSIONS
-  ) {
-    return null;
-  }
-
-  const previous =
-    completedSessions[
-      completedSessions.length - 1
-    ];
-
-  const previous2 =
-    completedSessions[
-      completedSessions.length - 2
-    ];
-
-  if (
-    !previous ||
-    !previous2
-  ) {
-    return null;
-  }
-
-  const currentLast =
-    [...currentSession]
-      .reverse()
-      .find(
-        bar =>
-          isFiniteNumber(
-            bar.close
-          )
-      );
-
-  if (!currentLast) {
-    return null;
-  }
-
-  const price =
-    currentLast.close;
-
-  if (
-    !(price > 0 && price < 5)
-  ) {
-    return null;
-  }
-
-  const validVolumeBars =
-    bars.filter(
-      bar =>
-        Number.isFinite(
-          bar.volume
-        ) &&
-        bar.volume > 0
-    );
-
-  if (
-    validVolumeBars.length <
-    MIN_S0_VALID_VOLUME_BARS
-  ) {
-    return null;
-  }
-
-  const j1Pct =
-    sessionPerformance(
-      previous
-    );
-
-  const j2Pct =
-    sessionPerformance(
-      previous2
-    );
-
   /*
-  ----------------------------------------------------------
-  IMPORTANT:
-  J-1 / J-2 are filtered HERE.
-  They do NOT belong to S1.
-  ----------------------------------------------------------
-  */
+   * Exclure la session la plus récente,
+   * considérée comme session courante.
+   */
 
-  if (
-    !passesS0HistoricalFilter(
-      j1Pct,
-      j2Pct
-    )
-  ) {
-    return null;
-  }
-
-  const rvol15mBaseline =
-    buildRvol15mBaseline(
-      completedSessions
+  const historicalDates =
+    dates.slice(
+      0,
+      -1
     );
 
-  if (
-    Object.keys(
-      rvol15mBaseline
-    ).length < 10
+  const slotVolumes =
+    new Map();
+
+  for (
+    const date of historicalDates
   ) {
-    return null;
+    const day =
+      sessions.get(
+        date
+      ) || [];
+
+    for (const bar of day) {
+      const slot =
+        floor15Clock(
+          bar.ts
+        );
+
+      if (
+        !slotVolumes.has(
+          slot
+        )
+      ) {
+        slotVolumes.set(
+          slot,
+          []
+        );
+      }
+
+      slotVolumes
+        .get(slot)
+        .push(bar.volume);
+    }
+  }
+
+  const baseline =
+    {};
+
+  for (
+    const [
+      slot,
+      values
+    ] of slotVolumes
+  ) {
+    baseline[slot] =
+      median(values);
   }
 
   return {
-
-    symbol,
-
-    price,
-
-    j1_pct:
-      j1Pct,
-
-    j2_pct:
-      j2Pct,
-
-    historical_sessions:
-      completedSessions.length,
-
-    current_session_bars:
-      currentSession.length,
-
-    valid_volume_bars:
-      validVolumeBars.length,
-
-    rvol15m_baseline:
-      rvol15mBaseline,
-
-    rvol_baseline_sessions:
-      completedSessions.length,
-
-    prepared_at:
-      nowIso()
-
+    dates,
+    historicalDates,
+    baseline
   };
-
 }
 
+/* =========================================================
+   5M HISTORICAL REFERENCES
+========================================================= */
+
+function build5mReferences(
+  bars
+) {
+  const sessions =
+    groupBySession(
+      bars
+    );
+
+  const dates =
+    [...sessions.keys()]
+      .sort();
+
+  const historicalDates =
+    dates.slice(
+      0,
+      -1
+    );
+
+  const vol5 =
+    new Map();
+
+  const vol60 =
+    new Map();
+
+  /*
+   * Vol5
+   * ----
+   * Médiane du volume 5m
+   * par heure de marché.
+   */
+
+  for (
+    const date of historicalDates
+  ) {
+    const day =
+      sessions.get(
+        date
+      ) || [];
+
+    for (const bar of day) {
+      const slot =
+        floor5Clock(
+          bar.ts
+        );
+
+      if (
+        !vol5.has(slot)
+      ) {
+        vol5.set(
+          slot,
+          []
+        );
+      }
+
+      vol5
+        .get(slot)
+        .push(bar.volume);
+    }
+  }
+
+  /*
+   * Vol60
+   * -----
+   * Volume glissant 60 minutes
+   * puis baseline par slot.
+   */
+
+  for (
+    const date of historicalDates
+  ) {
+    const day =
+      (
+        sessions.get(
+          date
+        ) || []
+      ).sort(
+        (a, b) =>
+          a.ts - b.ts
+      );
+
+    for (
+      let i = 0;
+      i < day.length;
+      i++
+    ) {
+      const current =
+        day[i];
+
+      const start =
+        current.ts -
+        55 * 60 * 1000;
+
+      let sum = 0;
+
+      for (
+        let j = i;
+        j >= 0;
+        j--
+      ) {
+        if (
+          day[j].ts <
+          start
+        ) {
+          break;
+        }
+
+        sum +=
+          Number(
+            day[j].volume ||
+            0
+          );
+      }
+
+      const slot =
+        floor5Clock(
+          current.ts
+        );
+
+      if (
+        !vol60.has(slot)
+      ) {
+        vol60.set(
+          slot,
+          []
+        );
+      }
+
+      vol60
+        .get(slot)
+        .push(sum);
+    }
+  }
+
+  const vol5Baseline =
+    {};
+
+  const vol60Baseline =
+    {};
+
+  for (
+    const [
+      slot,
+      values
+    ] of vol5
+  ) {
+    vol5Baseline[slot] =
+      median(values);
+  }
+
+  for (
+    const [
+      slot,
+      values
+    ] of vol60
+  ) {
+    vol60Baseline[slot] =
+      median(values);
+  }
+
+  return {
+    vol5: vol5Baseline,
+    vol60: vol60Baseline
+  };
+}
 
 /* =========================================================
-   S1 METRICS
+   J-1 / J-2
+========================================================= */
+
+function getJ1J2(
+  bars
+) {
+  const sessions =
+    groupBySession(
+      bars
+    );
+
+  const dates =
+    [...sessions.keys()]
+      .sort();
+
+  const historicalDates =
+    dates.slice(
+      0,
+      -1
+    );
+
+  if (
+    historicalDates.length <
+    2
+  ) {
+    return {
+      j1: null,
+      j2: null
+    };
+  }
+
+  const j1Date =
+    historicalDates[
+      historicalDates.length - 1
+    ];
+
+  const j2Date =
+    historicalDates[
+      historicalDates.length - 2
+    ];
+
+  const j1 =
+    sessionPerformance(
+      sessions.get(
+        j1Date
+      )
+    );
+
+  const j2 =
+    sessionPerformance(
+      sessions.get(
+        j2Date
+      )
+    );
+
+  return {
+    j1,
+    j2
+  };
+}
+
+/* =========================================================
+   S0 PROCESS
+========================================================= */
+
+async function processS0Symbol(
+  symbol
+) {
+  try {
+    const chart =
+      await fetchYahooChart(
+        symbol,
+        S0_INTERVAL,
+        S0_RANGE
+      );
+
+    const bars =
+      chart.bars
+        .filter(
+          b =>
+            isRegularSessionBar(
+              b.ts
+            )
+        )
+        .sort(
+          (a, b) =>
+            a.ts - b.ts
+        );
+
+    if (
+      !bars.length
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NO_HISTORY"
+      };
+    }
+
+    if (
+      !isOrdinaryStock(
+        chart.meta
+      )
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NOT_ORDINARY_STOCK"
+      };
+    }
+
+    const dates =
+      sortedSessionDates(
+        bars
+      );
+
+    if (
+      dates.length < 6
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "INSUFFICIENT_HISTORY"
+      };
+    }
+
+    const latestDate =
+      dates[
+        dates.length - 1
+      ];
+
+    const latestDay =
+      groupBySession(
+        bars
+      ).get(
+        latestDate
+      ) || [];
+
+    const lastBar =
+      latestDay[
+        latestDay.length - 1
+      ];
+
+    if (
+      !lastBar ||
+      !finite(lastBar.close)
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NO_CURRENT_PRICE"
+      };
+    }
+
+    /*
+     * Prix S0 <$5
+     */
+
+    if (
+      lastBar.close >= 5
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "PRICE_GE_5"
+      };
+    }
+
+    const {
+      j1,
+      j2
+    } =
+      getJ1J2(
+        bars
+      );
+
+    /*
+     * Qualité historique :
+     * J-1 / J-2 ne doivent pas déjà
+     * être des explosions > +5%.
+     */
+
+    if (
+      (finite(j1) &&
+        Math.abs(j1) >
+          MAX_J1_J2_PCT) ||
+      (finite(j2) &&
+        Math.abs(j2) >
+          MAX_J1_J2_PCT)
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "J1_J2_EXCESSIVE",
+        j1,
+        j2
+      };
+    }
+
+    const refs15 =
+      build15mReferences(
+        bars
+      );
+
+    const refs5 =
+      build5mReferences(
+        bars
+      );
+
+    const slot =
+      floor15Clock(
+        lastBar.ts
+      );
+
+    const rvolReference =
+      refs15.baseline[
+        slot
+      ];
+
+    const vol5Reference =
+      refs5.vol5[
+        "15:55"
+      ];
+
+    const vol60Reference =
+      refs5.vol60[
+        "15:55"
+      ];
+
+    if (
+      !finite(rvolReference) ||
+      rvolReference <= 0
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NO_RVOL_BASELINE"
+      };
+    }
+
+    /*
+     * Minimum historique de volume.
+     */
+
+    const historicalVolumes =
+      bars
+        .map(
+          b =>
+            Number(
+              b.volume || 0
+            )
+        )
+        .filter(
+          Number.isFinite
+        );
+
+    const medianVolume =
+      median(
+        historicalVolumes
+      );
+
+    if (
+      !finite(medianVolume) ||
+      medianVolume <= 0
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NO_LIQUIDITY_BASELINE"
+      };
+    }
+
+    return {
+      ok: true,
+      symbol,
+
+      price:
+        round(
+          lastBar.close,
+          4
+        ),
+
+      asof:
+        lastBar.ts,
+
+      j1:
+        round(j1, 4),
+
+      j2:
+        round(j2, 4),
+
+      rvol15_reference:
+        round(
+          rvolReference,
+          4
+        ),
+
+      vol5_reference:
+        finite(
+          vol5Reference
+        )
+          ? round(
+              vol5Reference,
+              2
+            )
+          : null,
+
+      vol60_reference:
+        finite(
+          vol60Reference
+        )
+          ? round(
+              vol60Reference,
+              2
+            )
+          : null,
+
+      median_volume:
+        round(
+          medianVolume,
+          2
+        ),
+
+      latest_session:
+        latestDate
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      symbol,
+      reason:
+        "FETCH_ERROR",
+      error:
+        error?.message ||
+        String(error)
+    };
+  }
+}
+
+/* =========================================================
+   CONCURRENT MAP
+========================================================= */
+
+async function mapConcurrent(
+  items,
+  worker,
+  concurrency = DATA_CONCURRENCY
+) {
+  const results =
+    new Array(
+      items.length
+    );
+
+  let cursor = 0;
+
+  async function runner() {
+    while (true) {
+      const index =
+        cursor++;
+
+      if (
+        index >=
+        items.length
+      ) {
+        return;
+      }
+
+      results[index] =
+        await worker(
+          items[index],
+          index
+        );
+    }
+  }
+
+  const workers =
+    Math.min(
+      concurrency,
+      items.length
+    );
+
+  await Promise.all(
+    Array.from(
+      {
+        length: workers
+      },
+      () => runner()
+    )
+  );
+
+  return results;
+}
+
+/* =========================================================
+   S0 PREPARE
+========================================================= */
+
+async function runS0(
+  symbols
+) {
+  const started =
+    Date.now();
+
+  const raw =
+    await mapConcurrent(
+      symbols,
+      processS0Symbol
+    );
+
+  const survivors =
+    raw.filter(
+      x => x?.ok
+    );
+
+  const result = {
+    stage: "S0",
+
+    asof:
+      Date.now(),
+
+    universe_requested:
+      symbols.length,
+
+    count:
+      survivors.length,
+
+    rejected:
+      raw.length -
+      survivors.length,
+
+    candidates:
+      survivors,
+
+    elapsed_ms:
+      Date.now() -
+      started
+  };
+
+  try {
+    fs.writeFileSync(
+      S0_CACHE_FILE,
+      JSON.stringify(
+        result,
+        null,
+        2
+      )
+    );
+  } catch {}
+
+  scanState.s0_count =
+    survivors.length;
+
+  return result;
+}
+
+/* =========================================================
+   LOAD S0 CACHE
+========================================================= */
+
+function loadS0Cache() {
+  try {
+    if (
+      !fs.existsSync(
+        S0_CACHE_FILE
+      )
+    ) {
+      return null;
+    }
+
+    return JSON.parse(
+      fs.readFileSync(
+        S0_CACHE_FILE,
+        "utf8"
+      )
+    );
+  } catch {
+    return null;
+  }
+}
+
+/* =========================================================
+   COMPLETED BARS
+========================================================= */
+
+function completedBarsAt(
+  bars,
+  asofMs
+) {
+  /*
+   * Yahoo timestamps représentent
+   * le début de la bougie.
+   *
+   * Une bougie 15:50 est complète
+   * à 15:55.
+   */
+
+  return bars.filter(
+    bar =>
+      bar.ts +
+        5 * 60 * 1000 <=
+      asofMs
+  );
+}
+
+/* =========================================================
+   VWAP
 ========================================================= */
 
 function calculateVWAP(
   bars
 ) {
-
   let pv = 0;
   let volume = 0;
 
-  for (
-    const bar of bars
-  ) {
+  for (const bar of bars) {
+    const v =
+      Number(
+        bar.volume || 0
+      );
 
     if (
-      !Number.isFinite(
-        bar.volume
-      ) ||
-      bar.volume <= 0
+      !finite(v) ||
+      v <= 0
     ) {
       continue;
     }
 
     const typical =
       (
-        (
-          Number.isFinite(
-            bar.high
-          )
-            ? bar.high
-            : bar.close
-        ) +
-        (
-          Number.isFinite(
-            bar.low
-          )
-            ? bar.low
-            : bar.close
-        ) +
+        bar.high +
+        bar.low +
         bar.close
       ) / 3;
 
     pv +=
-      typical *
-      bar.volume;
+      typical * v;
 
-    volume +=
-      bar.volume;
-
+    volume += v;
   }
 
-  return volume > 0
-    ? pv / volume
-    : null;
+  if (
+    volume <= 0
+  ) {
+    return null;
+  }
 
+  return pv / volume;
 }
 
+/* =========================================================
+   HOD
+========================================================= */
 
-function calculateS1(
-  symbol,
-  item,
-  s0Record,
+function calculateHOD(
+  bars
+) {
+  if (
+    !bars.length
+  ) {
+    return null;
+  }
+
+  return Math.max(
+    ...bars.map(
+      b => b.high
+    )
+  );
+}
+
+/* =========================================================
+   60M VOLUME
+========================================================= */
+
+function volume60m(
+  bars,
   asofMs
 ) {
+  const cutoff =
+    asofMs -
+    60 * 60 * 1000;
 
-  if (!s0Record) {
-    return null;
+  return bars
+    .filter(
+      b =>
+        b.ts >= cutoff &&
+        b.ts <= asofMs
+    )
+    .reduce(
+      (sum, b) =>
+        sum +
+        Number(
+          b.volume || 0
+        ),
+      0
+    );
+}
+
+/* =========================================================
+   15M VOLUME
+========================================================= */
+
+function volume15m(
+  bars
+) {
+  if (
+    !bars.length
+  ) {
+    return 0;
   }
 
-  const bars =
-    extractBars(
-      item
+  return bars
+    .slice(-3)
+    .reduce(
+      (sum, b) =>
+        sum +
+        Number(
+          b.volume || 0
+        ),
+      0
     );
+}
 
-  /*
-  ----------------------------------------------------------
-  FUTURE DATA PROTECTION
-  ----------------------------------------------------------
-  Never use a candle after the requested/current as-of.
-  ----------------------------------------------------------
-  */
+/* =========================================================
+   ACCEL5M
+========================================================= */
 
-  const eligibleBars =
-    bars.filter(
-      bar =>
-        bar.ts <=
-        asofMs + 1000
-    );
-
-  const currentSession =
-    getCurrentSessionBars(
-      eligibleBars,
-      asofMs
-    );
-
-  /*
-  Yahoo 5m candle:
-  A candle ending after as-of must not be used.
-  ----------------------------------------------------------
-  */
-
-  const completed =
-    currentSession.filter(
-      bar =>
-        bar.ts +
-        5 * 60 * 1000
-        <=
-        asofMs + 1000
-    );
-
+function calculateAccel5m(
+  bars
+) {
   if (
-    completed.length <
-    MIN_S1_COMPLETED_BARS
+    bars.length < 2
   ) {
     return null;
   }
 
-  const valid =
-    completed.filter(
-      bar =>
-        Number.isFinite(
-          bar.volume
-        ) &&
-        bar.volume > 0
-    );
-
-  if (
-    valid.length <
-    MIN_S1_COMPLETED_BARS
-  ) {
-    return null;
-  }
-
-  const last =
-    valid[
-      valid.length - 1
+  const previous =
+    bars[
+      bars.length - 2
     ];
 
-  const last5 =
-    valid.slice(-1);
+  const current =
+    bars[
+      bars.length - 1
+    ];
 
-  const last10 =
-    valid.slice(-2);
+  if (
+    !finite(
+      previous.volume
+    ) ||
+    !finite(
+      current.volume
+    ) ||
+    previous.volume <= 0
+  ) {
+    return null;
+  }
 
-  const last15 =
-    valid.slice(-3);
-
-  const volume5m =
-    last5.reduce(
-      (sum, bar) =>
-        sum + bar.volume,
-      0
-    );
-
-  const volume10m =
-    last10.reduce(
-      (sum, bar) =>
-        sum + bar.volume,
-      0
-    );
-
-  const volume15m =
-    last15.reduce(
-      (sum, bar) =>
-        sum + bar.volume,
-      0
-    );
-
-  const slotKey =
-    nyTimeKey(
-      last.ts
-    );
-
-  const baseline =
-    s0Record
-      .rvol15m_baseline
-      ?.[slotKey];
-
-  const rvol15m =
-    Number.isFinite(
-      baseline
-    ) &&
-    baseline > 0
-      ? volume15m / baseline
-      : null;
-
-  const previous5 =
-    valid.length >= 2
-      ? valid[
-          valid.length - 2
-        ].volume
-      : null;
-
-  const accel5m =
-    Number.isFinite(
-      previous5
-    ) &&
-    previous5 > 0
-      ? (
-          last.volume /
-          previous5 -
-          1
-        ) * 100
-      : null;
-
-  const vwap =
-    calculateVWAP(
-      valid
-    );
-
-  const price =
-    last.close;
-
-  const priceVsVWAP =
-    Number.isFinite(
-      vwap
-    ) &&
-    vwap > 0
-      ? (
-          price /
-          vwap -
-          1
-        ) * 100
-      : null;
-
-  const hod =
-    Math.max(
-      ...valid.map(
-        bar =>
-          Number.isFinite(
-            bar.high
-          )
-            ? bar.high
-            : bar.close
-      )
-    );
-
-  const hodDistance =
-    Number.isFinite(
-      hod
-    ) &&
-    hod > 0
-      ? (
-          price /
-          hod -
-          1
-        ) * 100
-      : null;
-
-  const previousClose =
-    valid.length >= 2
-      ? valid[
-          valid.length - 2
-        ].close
-      : null;
-
-  const change5m =
-    Number.isFinite(
-      previousClose
-    ) &&
-    previousClose > 0
-      ? (
-          price /
-          previousClose -
-          1
-        ) * 100
-      : null;
-
-  const tenAgo =
-    valid.length >= 3
-      ? valid[
-          valid.length - 3
-        ].close
-      : null;
-
-  const change10m =
-    Number.isFinite(
-      tenAgo
-    ) &&
-    tenAgo > 0
-      ? (
-          price /
-          tenAgo -
-          1
-        ) * 100
-      : null;
-
-  /*
-  ----------------------------------------------------------
-  IMPORTANT:
-  No J-1 / J-2 filtering here.
-  They have already been filtered by S0.
-  ----------------------------------------------------------
-  */
-
-  return {
-
-    symbol,
-
-    price,
-
-    ts:
-      last.ts,
-
-    asof:
-      new Date(
-        asofMs
-      ).toISOString(),
-
-    session_date:
-      nyDateKey(
-        last.ts
-      ),
-
-    volume5m,
-
-    volume10m,
-
-    volume15m,
-
-    rvol15m,
-
-    accel5m,
-
-    vwap,
-
-    price_vs_vwap_pct:
-      priceVsVWAP,
-
-    hod,
-
-    hod_distance_pct:
-      hodDistance,
-
-    change5m_pct:
-      change5m,
-
-    change10m_pct:
-      change10m
-
-  };
-
+  return (
+    (
+      current.volume /
+      previous.volume -
+      1
+    ) *
+    100
+  );
 }
 
-
 /* =========================================================
-   S1 STRICT FILTER
+   DELTA 60
 ========================================================= */
 
-function passesS1Filters(
-  record
+function calculateDelta60(
+  bars
 ) {
-
-  if (!record) {
-    return false;
+  if (
+    bars.length < 13
+  ) {
+    return null;
   }
 
-  /*
-  ----------------------------------------------------------
-  1. PRICE VS VWAP
-  ----------------------------------------------------------
-  */
+  const current =
+    bars[
+      bars.length - 1
+    ];
+
+  const sixtyAgo =
+    bars[
+      bars.length - 13
+    ];
 
   if (
-    !Number.isFinite(
-      record.price_vs_vwap_pct
-    )
+    !finite(
+      current.close
+    ) ||
+    !finite(
+      sixtyAgo.close
+    ) ||
+    sixtyAgo.close <= 0
   ) {
-    return false;
+    return null;
   }
 
-  if (
-    record.price_vs_vwap_pct <
-    S1_MIN_PRICE_VS_VWAP_PCT
-  ) {
-    return false;
-  }
-
-  /*
-  ----------------------------------------------------------
-  2. RVOL15M
-  ----------------------------------------------------------
-  */
-
-  if (
-    !Number.isFinite(
-      record.rvol15m
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    record.rvol15m <
-    S1_MIN_RVOL15M
-  ) {
-    return false;
-  }
-
-  /*
-  ----------------------------------------------------------
-  3. ACCEL5M
-  ----------------------------------------------------------
-  */
-
-  if (
-    !Number.isFinite(
-      record.accel5m
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    record.accel5m <
-    S1_MIN_ACCEL5M
-  ) {
-    return false;
-  }
-
-  return true;
-
+  return pctChange(
+    sixtyAgo.close,
+    current.close
+  );
 }
 
-
 /* =========================================================
-   S1 ANTI-LEAK VALIDATION
+   S1 SYMBOL
 ========================================================= */
 
-function validateS1NoLeak(
-  records
+async function processS1Symbol(
+  candidate,
+  asofMs
 ) {
+  const symbol =
+    candidate.symbol;
 
-  for (
-    const record of records
-  ) {
-
-    if (
-      !passesS1Filters(
-        record
-      )
-    ) {
-
-      throw new Error(
-        `S1 FILTER LEAK DETECTED: ${record.symbol}`
+  try {
+    const chart =
+      await fetchYahooChart(
+        symbol,
+        S1_INTERVAL,
+        "1d"
       );
 
+    const allBars =
+      chart.bars
+        .filter(
+          b =>
+            isRegularSessionBar(
+              b.ts
+            )
+        )
+        .sort(
+          (a, b) =>
+            a.ts - b.ts
+        );
+
+    const bars =
+      completedBarsAt(
+        allBars,
+        asofMs
+      );
+
+    if (
+      !bars.length
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "NO_COMPLETED_BARS"
+      };
     }
 
+    /*
+     * 15m = 3 x 5m complétées
+     */
+
+    if (
+      bars.length < 13
+    ) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          "INSUFFICIENT_INTRADAY"
+      };
+    }
+
+    const current =
+      bars[
+        bars.length - 1
+      ];
+
+    const price =
+      current.close;
+
+    const vwap =
+      calculateVWAP(
+        bars
+      );
+
+    const hod =
+      calculateHOD(
+        bars
+      );
+
+    const vol15 =
+      volume15m(
+        bars
+      );
+
+    const accel5m =
+      calculateAccel5m(
+        bars
+      );
+
+    const delta60 =
+      calculateDelta60(
+        bars
+      );
+
+    const priceVsVWAP =
+      finite(vwap)
+        ? (
+            (
+              price /
+              vwap
+            ) - 1
+          ) * 100
+        : null;
+
+    const hodDistance =
+      finite(hod) &&
+      hod > 0
+        ? (
+            (
+              price /
+              hod
+            ) - 1
+          ) * 100
+        : null;
+
+    /*
+     * RVOL15M
+     *
+     * Même slot horaire,
+     * fenêtre de 15 minutes.
+     */
+
+    const slot =
+      floor15Clock(
+        current.ts
+      );
+
+    const historicalRVOL =
+      candidate
+        .rvol15_reference;
+
+    const rvol15 =
+      finite(
+        historicalRVOL
+      ) &&
+      historicalRVOL > 0
+        ? vol15 /
+          historicalRVOL
+        : null;
+
+    const vol60 =
+      volume60m(
+        bars,
+        current.ts +
+          5 * 60 * 1000
+      );
+
+    const vol5Reference =
+      candidate
+        .vol5_reference;
+
+    const vol60Reference =
+      candidate
+        .vol60_reference;
+
+    const vol5Ratio =
+      finite(
+        vol5Reference
+      ) &&
+      vol5Reference > 0
+        ? current.volume /
+          vol5Reference
+        : null;
+
+    const vol60Ratio =
+      finite(
+        vol60Reference
+      ) &&
+      vol60Reference > 0
+        ? vol60 /
+          vol60Reference
+        : null;
+
+    /*
+     * DV
+     *
+     * Ranking composite.
+     * Les valeurs de ranking ne modifient
+     * pas les filtres SF verrouillés.
+     */
+
+    const dv =
+      (
+        (finite(rvol15)
+          ? rvol15
+          : 0) *
+        0.40
+      ) +
+      (
+        (finite(priceVsVWAP)
+          ? Math.max(
+              priceVsVWAP,
+              -10
+            )
+          : 0) *
+        0.20
+      ) +
+      (
+        (finite(delta60)
+          ? Math.max(
+              Math.min(
+                delta60,
+                10
+              ),
+              -10
+            )
+          : 0) *
+        0.20
+      ) +
+      (
+        (finite(hodDistance)
+          ? Math.max(
+              hodDistance,
+              -20
+            )
+          : -20) *
+        0.20
+      );
+
+    return {
+      ok: true,
+
+      symbol,
+
+      asof:
+        current.ts +
+        5 * 60 * 1000,
+
+      price:
+        round(
+          price,
+          4
+        ),
+
+      vwap:
+        round(
+          vwap,
+          4
+        ),
+
+      price_vs_vwap_pct:
+        round(
+          priceVsVWAP,
+          4
+        ),
+
+      hod:
+        round(
+          hod,
+          4
+        ),
+
+      hod_distance_pct:
+        round(
+          hodDistance,
+          4
+        ),
+
+      vol5:
+        Number(
+          current.volume || 0
+        ),
+
+      vol15:
+        round(
+          vol15,
+          2
+        ),
+
+      vol60:
+        round(
+          vol60,
+          2
+        ),
+
+      rvol15:
+        round(
+          rvol15,
+          4
+        ),
+
+      vol5_reference:
+        round(
+          vol5Reference,
+          2
+        ),
+
+      vol5_ratio:
+        round(
+          vol5Ratio,
+          4
+        ),
+
+      vol60_reference:
+        round(
+          vol60Reference,
+          2
+        ),
+
+      vol60_ratio:
+        round(
+          vol60Ratio,
+          4
+        ),
+
+      delta60_pct:
+        round(
+          delta60,
+          4
+        ),
+
+      accel5m_pct:
+        round(
+          accel5m,
+          4
+        ),
+
+      j1:
+        candidate.j1,
+
+      j2:
+        candidate.j2,
+
+      dv:
+        round(
+          dv,
+          4
+        ),
+
+      /*
+       * IMPORTANT:
+       * Accel5M uniquement informatif.
+       */
+
+      accel5m_blocking:
+        false,
+
+      rvol_slot:
+        slot
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      symbol,
+      reason:
+        "FETCH_ERROR",
+      error:
+        error?.message ||
+        String(error)
+    };
   }
-
-  return true;
-
 }
-
 
 /* =========================================================
-   RANKING
+   S1 SCAN
 ========================================================= */
 
-function rankS1(
-  records
+async function runS1(
+  candidates,
+  asofMs
 ) {
+  const started =
+    Date.now();
 
-  return [
-    ...records
-  ]
-    .sort(
-      (a, b) => {
-
-        const ar =
-          Number.isFinite(
-            a.rvol15m
-          )
-            ? a.rvol15m
-            : -Infinity;
-
-        const br =
-          Number.isFinite(
-            b.rvol15m
-          )
-            ? b.rvol15m
-            : -Infinity;
-
-        if (
-          br !== ar
-        ) {
-          return br - ar;
-        }
-
-        const aa =
-          Number.isFinite(
-            a.accel5m
-          )
-            ? a.accel5m
-            : -Infinity;
-
-        const ba =
-          Number.isFinite(
-            b.accel5m
-          )
-            ? b.accel5m
-            : -Infinity;
-
-        if (
-          ba !== aa
-        ) {
-          return ba - aa;
-        }
-
-        const av =
-          Number.isFinite(
-            a.price_vs_vwap_pct
-          )
-            ? a.price_vs_vwap_pct
-            : -Infinity;
-
-        const bv =
-          Number.isFinite(
-            b.price_vs_vwap_pct
-          )
-            ? b.price_vs_vwap_pct
-            : -Infinity;
-
-        if (
-          bv !== av
-        ) {
-          return bv - av;
-        }
-
-        const ah =
-          Number.isFinite(
-            a.hod_distance_pct
-          )
-            ? a.hod_distance_pct
-            : -Infinity;
-
-        const bh =
-          Number.isFinite(
-            b.hod_distance_pct
-          )
-            ? b.hod_distance_pct
-            : -Infinity;
-
-        return bh - ah;
-
-      }
+  const raw =
+    await mapConcurrent(
+      candidates,
+      candidate =>
+        processS1Symbol(
+          candidate,
+          asofMs
+        )
     );
 
+  const valid =
+    raw.filter(
+      x => x?.ok
+    );
+
+  /*
+   * Ranking DV décroissant.
+   */
+
+  valid.sort(
+    (a, b) =>
+      (
+        b.dv ?? -Infinity
+      ) -
+      (
+        a.dv ?? -Infinity
+      )
+  );
+
+  const result = {
+    stage: "S1",
+
+    asof:
+      asofMs,
+
+    count:
+      valid.length,
+
+    candidates:
+      valid,
+
+    rejected:
+      raw.length -
+      valid.length,
+
+    elapsed_ms:
+      Date.now() -
+      started
+  };
+
+  try {
+    fs.writeFileSync(
+      S1_CACHE_FILE,
+      JSON.stringify(
+        result,
+        null,
+        2
+      )
+    );
+  } catch {}
+
+  scanState.s1_count =
+    valid.length;
+
+  return result;
 }
 
+/* =========================================================
+   SF CURRENT 15:55 -> 15:59
+========================================================= */
+
+async function runSF(
+  candidates,
+  asofMs
+) {
+  const started =
+    Date.now();
+
+  const results = [];
+
+  for (
+    const candidate of candidates
+  ) {
+    try {
+      const chart =
+        await fetchYahooChart(
+          candidate.symbol,
+          S1_INTERVAL,
+          "1d"
+        );
+
+      const bars =
+        chart.bars
+          .filter(
+            b =>
+              isRegularSessionBar(
+                b.ts
+              )
+          )
+          .sort(
+            (a, b) =>
+              a.ts - b.ts
+          );
+
+      /*
+       * Cherche la bougie 15:55
+       * correspondant au snapshot SF.
+       *
+       * À 15:59, elle est encore
+       * en formation.
+       */
+
+      const sfBars =
+        bars.filter(
+          bar => {
+            const p =
+              getNYParts(
+                bar.ts
+              );
+
+            return (
+              p.hour === 15 &&
+              p.minute === 55
+            );
+          }
+        );
+
+      const sfBar =
+        sfBars[
+          sfBars.length - 1
+        ];
+
+      if (
+        !sfBar
+      ) {
+        continue;
+      }
+
+      const barEnd =
+        sfBar.ts +
+        5 * 60 * 1000;
+
+      /*
+       * On exige que l'as-of soit
+       * dans la fenêtre 15:55-16:00.
+       */
+
+      if (
+        asofMs < sfBar.ts ||
+        asofMs > barEnd
+      ) {
+        continue;
+      }
+
+      /*
+       * Pour le prix SF,
+       * Yahoo Chart peut fournir une
+       * bougie partielle.
+       */
+
+      const partialBars =
+        bars.filter(
+          b =>
+            b.ts <=
+            asofMs
+        );
+
+      if (
+        !partialBars.length
+      ) {
+        continue;
+      }
+
+      const current =
+        partialBars[
+          partialBars.length - 1
+        ];
+
+      const price =
+        current.close;
+
+      const vwap =
+        calculateVWAP(
+          partialBars
+        );
+
+      const hod =
+        calculateHOD(
+          partialBars
+        );
+
+      const priceVsVWAP =
+        finite(vwap)
+          ? (
+              (
+                price /
+                vwap
+              ) - 1
+            ) * 100
+          : null;
+
+      const hodDistance =
+        finite(hod) &&
+        hod > 0
+          ? (
+              (
+                price /
+                hod
+              ) - 1
+            ) * 100
+          : null;
+
+      /*
+       * RVOL15M :
+       * volume des 3 dernières bougies
+       * 5m disponibles.
+       */
+
+      const last3 =
+        partialBars.slice(
+          -3
+        );
+
+      const vol15 =
+        last3.reduce(
+          (sum, bar) =>
+            sum +
+            Number(
+              bar.volume || 0
+            ),
+          0
+        );
+
+      const rvol15Reference =
+        candidate
+          .rvol15_reference;
+
+      const rvol15 =
+        finite(
+          rvol15Reference
+        ) &&
+        rvol15Reference > 0
+          ? vol15 /
+            rvol15Reference
+          : null;
+
+      /*
+       * Vol5 :
+       *
+       * IMPORTANT :
+       * Le seuil verrouillé est
+       *
+       *   Vol5 / référence >= 0.20
+       *
+       * et NON Accel5M >= 20%.
+       */
+
+      const refVol5 =
+        candidate
+          .vol5_reference;
+
+      /*
+       * Ajustement de fenêtre partielle :
+       *
+       * La référence historique représente
+       * la bougie 5m complète.
+       *
+       * Le facteur 0.8 est conservé ici
+       * pour comparer une fenêtre 15:55->15:59
+       * partiellement écoulée.
+       */
+
+      const refVol5Adjusted =
+        finite(refVol5)
+          ? refVol5 * 0.8
+          : null;
+
+      const vol5 =
+        Number(
+          sfBar.volume || 0
+        );
+
+      const vol5Ratio =
+        finite(
+          refVol5Adjusted
+        ) &&
+        refVol5Adjusted > 0
+          ? vol5 /
+            refVol5Adjusted
+          : null;
+
+      /*
+       * Delta 60
+       */
+
+      const oneHourCutoff =
+        asofMs -
+        60 * 60 * 1000;
+
+      const previousBars =
+        partialBars.filter(
+          b =>
+            b.ts <=
+            oneHourCutoff
+        );
+
+      const previous =
+        previousBars[
+          previousBars.length - 1
+        ];
+
+      const delta60 =
+        previous &&
+        previous.close > 0
+          ? pctChange(
+              previous.close,
+              price
+            )
+          : null;
+
+      /*
+       * Delta 15:55 -> 15:59
+       */
+
+      const reference1555 =
+        sfBar.open;
+
+      const delta1555to1559 =
+        reference1555 > 0
+          ? pctChange(
+              reference1555,
+              price
+            )
+          : null;
+
+      /*
+       * Accel5M :
+       * informatif uniquement.
+       */
+
+      const accel5m =
+        calculateAccel5m(
+          partialBars
+        );
+
+      /*
+       * FILTRES SF VERROUILLÉS
+       */
+
+      const checks = {
+        rvol15:
+          finite(rvol15) &&
+          rvol15 >=
+            LOCKED.rvol15Min,
+
+        vol5:
+          finite(vol5Ratio) &&
+          vol5Ratio >=
+            LOCKED.vol5MinRatio,
+
+        delta60:
+          finite(delta60) &&
+          delta60 <=
+            LOCKED.delta60MaxPct,
+
+        price_vs_vwap:
+          finite(priceVsVWAP) &&
+          priceVsVWAP >=
+            LOCKED.priceVsVwapMinPct,
+
+        delta1555to1559:
+          finite(
+            delta1555to1559
+          ) &&
+          delta1555to1559 >=
+            LOCKED.delta1555to1559MinPct
+      };
+
+      const pass =
+        Object.values(
+          checks
+        ).every(Boolean);
+
+      results.push({
+        symbol:
+          candidate.symbol,
+
+        asof:
+          asofMs,
+
+        price:
+          round(
+            price,
+            4
+          ),
+
+        vwap:
+          round(
+            vwap,
+            4
+          ),
+
+        price_vs_vwap_pct:
+          round(
+            priceVsVWAP,
+            4
+          ),
+
+        hod:
+          round(
+            hod,
+            4
+          ),
+
+        hod_distance_pct:
+          round(
+            hodDistance,
+            4
+          ),
+
+        rvol15:
+          round(
+            rvol15,
+            4
+          ),
+
+        vol5:
+          vol5,
+
+        vol5_reference:
+          round(
+            refVol5,
+            2
+          ),
+
+        vol5_reference_adjusted:
+          round(
+            refVol5Adjusted,
+            2
+          ),
+
+        vol5_ratio:
+          round(
+            vol5Ratio,
+            4
+          ),
+
+        delta60_pct:
+          round(
+            delta60,
+            4
+          ),
+
+        delta1555to1559_pct:
+          round(
+            delta1555to1559,
+            4
+          ),
+
+        accel5m_pct:
+          round(
+            accel5m,
+            4
+          ),
+
+        accel5m_blocking:
+          false,
+
+        checks,
+
+        pass
+      });
+    } catch (error) {
+      results.push({
+        symbol:
+          candidate.symbol,
+
+        pass: false,
+
+        error:
+          error?.message ||
+          String(error)
+      });
+    }
+  }
+
+  /*
+   * Ranking DV :
+   * uniquement parmi les candidats
+   * qui passent SF.
+   */
+
+  const winners =
+    results
+      .filter(
+        x => x.pass
+      )
+      .sort(
+        (a, b) =>
+          (
+            candidates.find(
+              c =>
+                c.symbol ===
+                a.symbol
+            )?.dv ??
+            -Infinity
+          ) -
+          (
+            candidates.find(
+              c =>
+                c.symbol ===
+                b.symbol
+            )?.dv ??
+            -Infinity
+          )
+      );
+
+  return {
+    stage: "SF",
+
+    asof:
+      asofMs,
+
+    count:
+      winners.length,
+
+    winners,
+
+    evaluated:
+      results,
+
+    locked_params:
+      LOCKED,
+
+    elapsed_ms:
+      Date.now() -
+      started
+  };
+}
 
 /* =========================================================
    WINNER GATE
 ========================================================= */
 
-function winnerGate(
-  records,
-  options = {}
+async function runWinnerGate(
+  winners,
+  asofMs
 ) {
-
-  const minPriceVsVWAP =
-    Number.isFinite(
-      options.minPriceVsVWAP
-    )
-      ? options.minPriceVsVWAP
-      : S1_MIN_PRICE_VS_VWAP_PCT;
-
-  const minAccel5M =
-    Number.isFinite(
-      options.minAccel5M
-    )
-      ? options.minAccel5M
-      : S1_MIN_ACCEL5M;
-
-  const minRvol15M =
-    Number.isFinite(
-      options.minVol15M
-    )
-      ? options.minVol15M
-      : S1_MIN_RVOL15M;
-
-  for (
-    const record of records
-  ) {
-
-    if (
-      !Number.isFinite(
-        record.price_vs_vwap_pct
-      ) ||
-      record.price_vs_vwap_pct <
-      minPriceVsVWAP
-    ) {
-      continue;
-    }
-
-    if (
-      !Number.isFinite(
-        record.accel5m
-      ) ||
-      record.accel5m <
-      minAccel5M
-    ) {
-      continue;
-    }
-
-    if (
-      !Number.isFinite(
-        record.rvol15m
-      ) ||
-      record.rvol15m <
-      minRvol15M
-    ) {
-      continue;
-    }
-
-    return record;
-
-  }
-
-  return null;
-
-}
-
-
-/* =========================================================
-   CACHE
-========================================================= */
-
-function writeJson(
-  file,
-  data
-) {
-
-  fs.writeFileSync(
-    file,
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-    "utf8"
-  );
-
-}
-
-
-function readJson(
-  file
-) {
-
   if (
-    !fs.existsSync(
-      file
-    )
+    !winners?.length
   ) {
-    return null;
-  }
-
-  try {
-
-    return JSON.parse(
-      fs.readFileSync(
-        file,
-        "utf8"
-      )
-    );
-
-  } catch {
-
-    return null;
-
-  }
-
-}
-
-
-function currentNYDate() {
-
-  const parts =
-    new Intl.DateTimeFormat(
-      "en-US",
-      {
-        timeZone:
-          "America/New_York",
-
-        year:
-          "numeric",
-
-        month:
-          "2-digit",
-
-        day:
-          "2-digit"
-      }
-    )
-      .formatToParts(
-        new Date()
-      );
-
-  const obj = {};
-
-  for (
-    const p of parts
-  ) {
-
-    if (
-      p.type !==
-      "literal"
-    ) {
-
-      obj[p.type] =
-        p.value;
-
-    }
-
-  }
-
-  return (
-    `${obj.year}-${obj.month}-${obj.day}`
-  );
-
-}
-
-
-function validCache(
-  cache
-) {
-
-  return Boolean(
-    cache &&
-    cache.version ===
-      APP_VERSION &&
-    cache.market_date ===
-      currentNYDate()
-  );
-
-}
-
-
-/* =========================================================
-   UNIVERSE
-========================================================= */
-
-function readUniverse(
-  limit = null
-) {
-
-  if (
-    !fs.existsSync(
-      UNIVERSE_FILE
-    )
-  ) {
-
-    throw new Error(
-      `Missing ${UNIVERSE_FILE}`
-    );
-
-  }
-
-  let symbols =
-    fs.readFileSync(
-      UNIVERSE_FILE,
-      "utf8"
-    )
-      .split(/\r?\n/)
-      .map(
-        line =>
-          line
-            .trim()
-            .toUpperCase()
-      )
-      .filter(Boolean)
-      .filter(
-        symbol =>
-          /^[A-Z0-9.\-]+$/
-            .test(symbol)
-      );
-
-  symbols =
-    [
-      ...new Set(symbols)
-    ];
-
-  if (
-    Number.isInteger(limit) &&
-    limit > 0
-  ) {
-
-    symbols =
-      symbols.slice(
-        0,
-        limit
-      );
-
-  }
-
-  return symbols;
-
-}
-
-
-/* =========================================================
-   SCAN S0
-========================================================= */
-
-async function runS0(
-  symbols
-) {
-
-  if (
-    scanState.running
-  ) {
-
-    throw new Error(
-      "Scan already running"
-    );
-
-  }
-
-  const universe =
-    normalizeSymbols(
-      symbols
-    );
-
-  scanState.running =
-    true;
-
-  scanState.stage =
-    "S0";
-
-  scanState.asof =
-    nowIso();
-
-  scanState.last_error =
-    null;
-
-  const started =
-    Date.now();
-
-  try {
-
-    const {
-      results,
-      errors
-    } =
-      await yahooChartBatch(
-        universe,
-        S0_RANGE,
-        S0_INTERVAL
-      );
-
-    const s0 = [];
-
-    for (
-      const symbol of universe
-    ) {
-
-      const record =
-        calculateS0(
-          symbol,
-          results[symbol]
-        );
-
-      if (record) {
-        s0.push(record);
-      }
-
-    }
-
-    scanState.universe_requested =
-      universe.length;
-
-    scanState.s0 =
-      s0;
-
-    scanState.s0_count =
-      s0.length;
-
-    scanState.yahoo_errors =
-      errors;
-
-    scanState.elapsed_ms =
-      Date.now() -
-      started;
-
-    writeJson(
-      S0_CACHE_FILE,
-      {
-        version:
-          APP_VERSION,
-
-        market_date:
-          currentNYDate(),
-
-        source:
-          "Yahoo Chart OHLCV",
-
-        created_at:
-          nowIso(),
-
-        s0
-      }
-    );
-
     return {
-
-      ok:
-        true,
-
-      stage:
-        "S0",
-
-      asof:
-        scanState.asof,
-
-      elapsed_ms:
-        scanState.elapsed_ms,
-
-      universe_requested:
-        universe.length,
-
-      s0_count:
-        s0.length,
-
-      s0,
-
-      yahoo_errors:
-        errors
-
+      pass: false,
+      reason:
+        "NO_SF_WINNER"
     };
-
-  } catch (error) {
-
-    scanState.last_error =
-      String(
-        error?.message ||
-        error
-      );
-
-    throw error;
-
-  } finally {
-
-    scanState.running =
-      false;
-
-    scanState.stage =
-      null;
-
   }
-
-}
-
-
-/* =========================================================
-   SCAN S1
-========================================================= */
-
-async function runS1(
-  symbols
-) {
-
-  if (
-    scanState.running
-  ) {
-
-    throw new Error(
-      "Scan already running"
-    );
-
-  }
-
-  const s0Cache =
-    readJson(
-      S0_CACHE_FILE
-    );
-
-  if (
-    !validCache(
-      s0Cache
-    )
-  ) {
-
-    throw new Error(
-      "Valid S0 cache required"
-    );
-
-  }
-
-  const requested =
-    normalizeSymbols(
-      symbols
-    );
-
-  const s0Map =
-    new Map(
-      (
-        s0Cache.s0 ||
-        []
-      )
-        .map(
-          record =>
-            [
-              record.symbol,
-              record
-            ]
-        )
-    );
-
-  const filtered =
-    requested.filter(
-      symbol =>
-        s0Map.has(
-          symbol
-        )
-    );
-
-  scanState.running =
-    true;
-
-  scanState.stage =
-    "S1";
-
-  scanState.asof =
-    nowIso();
-
-  scanState.last_error =
-    null;
-
-  const started =
-    Date.now();
 
   /*
-  ----------------------------------------------------------
-  IMPORTANT:
-  Capture the S1 as-of BEFORE downloading data.
-  This prevents different symbols from being evaluated
-  against different "now" values.
-  ----------------------------------------------------------
-  */
-
-  const s1AsOfMs =
-    Date.now();
-
-  try {
-
-    const {
-      results,
-      errors
-    } =
-      await yahooChartBatch(
-        filtered,
-        S1_RANGE,
-        S1_INTERVAL
-      );
-
-    const s1 = [];
-
-    let rejected =
-      0;
-
-    for (
-      const symbol of filtered
-    ) {
-
-      const record =
-        calculateS1(
-          symbol,
-          results[symbol],
-          s0Map.get(symbol),
-          s1AsOfMs
-        );
-
-      if (
-        record &&
-        passesS1Filters(
-          record
-        )
-      ) {
-
-        s1.push(record);
-
-      } else {
-
-        rejected++;
-
-      }
-
-    }
-
-    const ranked =
-      rankS1(
-        s1
-      );
-
-    /*
-    ----------------------------------------------------------
-    FINAL SAFETY CHECK
-    ----------------------------------------------------------
-    If even one invalid record reaches this point,
-    the entire S1 scan fails instead of returning bad data.
-    ----------------------------------------------------------
-    */
-
-    validateS1NoLeak(
-      ranked
-    );
-
-    scanState.s1 =
-      ranked;
-
-    scanState.s1_count =
-      ranked.length;
-
-    scanState.yahoo_errors =
-      errors;
-
-    scanState.elapsed_ms =
-      Date.now() -
-      started;
-
-    writeJson(
-      S1_CACHE_FILE,
-      {
-        version:
-          APP_VERSION,
-
-        market_date:
-          currentNYDate(),
-
-        source:
-          "Yahoo Chart OHLCV",
-
-        created_at:
-          nowIso(),
-
-        asof:
-          new Date(
-            s1AsOfMs
-          ).toISOString(),
-
-        input_count:
-          filtered.length,
-
-        rejected_count:
-          rejected,
-
-        s1:
-          ranked
-      }
-    );
-
-    return {
-
-      ok:
-        true,
-
-      stage:
-        "S1",
-
-      asof:
-        new Date(
-          s1AsOfMs
-        ).toISOString(),
-
-      elapsed_ms:
-        scanState.elapsed_ms,
-
-      universe_requested:
-        filtered.length,
-
-      s1_input_count:
-        filtered.length,
-
-      s1_rejected_count:
-        rejected,
-
-      s1_count:
-        ranked.length,
-
-      s1:
-        ranked,
-
-      yahoo_errors:
-        errors
-
-    };
-
-  } catch (error) {
-
-    scanState.last_error =
-      String(
-        error?.message ||
-        error
-      );
-
-    throw error;
-
-  } finally {
-
-    scanState.running =
-      false;
-
-    scanState.stage =
-      null;
-
-  }
-
-}
-
-
-/* =========================================================
-   SF
-========================================================= */
-
-async function runSF(
-  symbols = null,
-  options = {}
-) {
-
-  const cache =
-    readJson(
-      S1_CACHE_FILE
-    );
-
-  if (
-    !validCache(
-      cache
-    )
-  ) {
-
-    throw new Error(
-      "Valid S1 cache required"
-    );
-
-  }
-
-  let records =
-    Array.isArray(
-      cache.s1
-    )
-      ? cache.s1
-      : [];
-
-  /*
-  ----------------------------------------------------------
-  SAFETY:
-  SF refuses any contaminated S1 cache.
-  ----------------------------------------------------------
-  */
-
-  validateS1NoLeak(
-    records
-  );
-
-  if (
-    Array.isArray(symbols) &&
-    symbols.length
-  ) {
-
-    const wanted =
-      new Set(
-        normalizeSymbols(
-          symbols
-        )
-      );
-
-    records =
-      records.filter(
-        record =>
-          wanted.has(
-            record.symbol
-          )
-      );
-
-  }
-
-  const minPriceVsVWAP =
-    Number.isFinite(
-      options.minPriceVsVWAP
-    )
-      ? options.minPriceVsVWAP
-      : S1_MIN_PRICE_VS_VWAP_PCT;
-
-  const minAccel5M =
-    Number.isFinite(
-      options.minAccel5M
-    )
-      ? options.minAccel5M
-      : S1_MIN_ACCEL5M;
-
-  const minRvol15M =
-    Number.isFinite(
-      options.minVol15M
-    )
-      ? options.minVol15M
-      : S1_MIN_RVOL15M;
-
-  /*
-  ----------------------------------------------------------
-  SF STRICT FILTER
-  ----------------------------------------------------------
-  */
-
-  const sfFiltered =
-    records.filter(
-      record => {
-
-        if (
-          !Number.isFinite(
-            record.price_vs_vwap_pct
-          ) ||
-          record.price_vs_vwap_pct <
-          minPriceVsVWAP
-        ) {
-          return false;
-        }
-
-        if (
-          !Number.isFinite(
-            record.accel5m
-          ) ||
-          record.accel5m <
-          minAccel5M
-        ) {
-          return false;
-        }
-
-        if (
-          !Number.isFinite(
-            record.rvol15m
-          ) ||
-          record.rvol15m <
-          minRvol15M
-        ) {
-          return false;
-        }
-
-        return true;
-
-      }
-    );
-
-  /*
-  ----------------------------------------------------------
-  SF SAFETY CHECK
-  ----------------------------------------------------------
-  */
-
-  validateS1NoLeak(
-    sfFiltered
-  );
-
-  const ranked =
-    rankS1(
-      sfFiltered
-    );
+   * Premier candidat après ranking.
+   *
+   * IMPORTANT :
+   * Le Winner Gate doit s'arrêter
+   * au premier winner.
+   */
 
   const winner =
-    winnerGate(
-      ranked,
-      {
-        minPriceVsVWAP,
+    winners[0];
 
-        minAccel5M,
+  /*
+   * Contrôle de fraîcheur minimal.
+   *
+   * Le serveur Chart ne fournit pas
+   * un vrai tick WebSocket ici.
+   */
 
-        minVol15M:
-          minRvol15M
-      }
+  const candidateAsof =
+    Number(
+      winner.asof ||
+      asofMs
     );
 
-  scanState.sf =
-    ranked;
+  const ageMs =
+    Math.max(
+      0,
+      asofMs -
+      candidateAsof
+    );
 
-  scanState.sf_count =
-    ranked.length;
+  /*
+   * Tolérance :
+   * 2 minutes + 5m.
+   */
 
-  scanState.winner =
-    winner;
+  const MAX_TICK_AGE_MS =
+    120000 +
+    5 * 60 * 1000;
 
-  scanState.stage =
-    "SF";
-
-  scanState.asof =
-    nowIso();
+  const fresh =
+    ageMs <=
+    MAX_TICK_AGE_MS;
 
   return {
+    pass:
+      fresh,
 
-    ok:
-      true,
+    stop:
+      fresh,
 
-    stage:
-      "SF",
-
-    asof:
-      scanState.asof,
-
-    input_count:
-      records.length,
-
-    sf_count:
-      ranked.length,
-
-    sf:
-      ranked,
+    reason:
+      fresh
+        ? "FIRST_WINNER"
+        : "STALE_DATA",
 
     winner,
 
-    filters: {
-
-      minPriceVsVWAP,
-
-      minAccel5M,
-
-      minRVOL15M:
-        minRvol15M
-
-    }
-
+    age_ms:
+      ageMs
   };
-
 }
 
-
 /* =========================================================
-   S0 + S1
-========================================================= */
-
-async function runS0S1(
-  symbols
-) {
-
-  const universe =
-    normalizeSymbols(
-      symbols
-    );
-
-  const s0Result =
-    await runS0(
-      universe
-    );
-
-  const s0Symbols =
-    s0Result.s0
-      .map(
-        record =>
-          record.symbol
-      );
-
-  if (
-    !s0Symbols.length
-  ) {
-
-    return {
-
-      ok:
-        true,
-
-      stage:
-        "S0_S1",
-
-      asof:
-        nowIso(),
-
-      elapsed_ms:
-        s0Result.elapsed_ms,
-
-      universe_requested:
-        universe.length,
-
-      s0_count:
-        0,
-
-      s1_count:
-        0,
-
-      s0:
-        [],
-
-      s1:
-        [],
-
-      yahoo_errors:
-        s0Result.yahoo_errors
-
-    };
-
-  }
-
-  const s1Result =
-    await runS1(
-      s0Symbols
-    );
-
-  return {
-
-    ok:
-      true,
-
-    stage:
-      "S0_S1",
-
-    asof:
-      nowIso(),
-
-    elapsed_ms:
-      s0Result.elapsed_ms +
-      s1Result.elapsed_ms,
-
-    universe_requested:
-      universe.length,
-
-    s0_count:
-      s0Result.s0_count,
-
-    s1_count:
-      s1Result.s1_count,
-
-    s0:
-      s0Result.s0,
-
-    s1:
-      s1Result.s1,
-
-    yahoo_errors:
-      (
-        s0Result.yahoo_errors ||
-        0
-      ) +
-      (
-        s1Result.yahoo_errors ||
-        0
-      )
-
-  };
-
-}
-
-
-/* =========================================================
-   MCP RESULT HELPER
-========================================================= */
-
-function textResult(
-  payload
-) {
-
-  return {
-
-    content: [
-
-      {
-
-        type:
-          "text",
-
-        text:
-          JSON.stringify(
-            payload,
-            null,
-            2
-          )
-
-      }
-
-    ]
-
-  };
-
-}
-
-
-/* =========================================================
-   MCP SERVER
+   MCP SERVER FACTORY
 ========================================================= */
 
 function createMcpServer() {
-
   const server =
-    new McpServer(
-      {
-        name:
-          "yahoo-scan-mcp",
+    new McpServer({
+      name:
+        "yahoo-scan-mcp",
 
-        version:
-          APP_VERSION
-      }
-    );
+      version:
+        APP_VERSION
+    });
 
-
-  /* -------------------------------------------------------
-     1. ping
-  ------------------------------------------------------- */
+  /* =======================================================
+     PING
+  ======================================================= */
 
   server.tool(
     "ping",
+    "Health check",
     {},
-    async () =>
-      textResult(
+    async () => ({
+      content: [
         {
-          ok:
-            true,
-
-          pong:
-            true,
-
-          version:
-            APP_VERSION,
-
-          time:
-            nowIso()
+          type: "text",
+          text:
+            JSON.stringify({
+              ok: true,
+              service:
+                "yahoo-scan-mcp",
+              version:
+                APP_VERSION,
+              timestamp:
+                new Date().toISOString()
+            })
         }
-      )
+      ]
+    })
   );
 
-
-  /* -------------------------------------------------------
-     2. get_status
-  ------------------------------------------------------- */
+  /* =======================================================
+     STATUS
+  ======================================================= */
 
   server.tool(
     "get_status",
+    "Return scanner status",
     {},
-    async () =>
-      textResult(
+    async () => ({
+      content: [
         {
-          ok:
-            true,
-
-          version:
-            APP_VERSION,
-
-          state:
-            scanState
+          type: "text",
+          text:
+            JSON.stringify({
+              ok: true,
+              version:
+                APP_VERSION,
+              scanState,
+              locked:
+                LOCKED,
+              universe_file:
+                UNIVERSE_FILE
+            })
         }
-      )
+      ]
+    })
   );
 
-
-  /* -------------------------------------------------------
-     3. diagnose_filesystem
-  ------------------------------------------------------- */
+  /* =======================================================
+     DIAGNOSE FILESYSTEM
+  ======================================================= */
 
   server.tool(
     "diagnose_filesystem",
+    "Diagnose local scanner files",
     {},
-    async () => {
-
-      const files = [
-
-        UNIVERSE_FILE,
-
-        S0_CACHE_FILE,
-
-        S1_CACHE_FILE
-
-      ];
-
-      const output =
-        files.map(
-          file => ({
-
-            file,
-
-            exists:
-              fs.existsSync(
-                file
-              ),
-
-            size:
-              fs.existsSync(
-                file
-              )
-                ? fs.statSync(
-                    file
-                  ).size
-                : 0
-
-          })
-        );
-
-      return textResult(
+    async () => ({
+      content: [
         {
-          ok:
-            true,
+          type: "text",
+          text:
+            JSON.stringify({
+              ok: true,
 
-          cwd:
-            process.cwd(),
+              cwd:
+                ROOT,
 
-          files:
-            output
+              universe_file:
+                UNIVERSE_FILE,
+
+              universe_exists:
+                fs.existsSync(
+                  UNIVERSE_FILE
+                ),
+
+              universe_count:
+                readUniverse().length,
+
+              s0_cache_exists:
+                fs.existsSync(
+                  S0_CACHE_FILE
+                ),
+
+              s1_cache_exists:
+                fs.existsSync(
+                  S1_CACHE_FILE
+                )
+            })
         }
-      );
-
-    }
+      ]
+    })
   );
 
-
-  /* -------------------------------------------------------
-     4. get_universe
-  ------------------------------------------------------- */
+  /* =======================================================
+     UNIVERSE
+  ======================================================= */
 
   server.tool(
     "get_universe",
-    {
-      limit:
-        z.number()
-          .int()
-          .positive()
-          .optional()
-    },
-    async ({
-      limit
-    }) => {
-
+    "Return materialized NASDAQ <$5 universe",
+    {},
+    async () => {
       const symbols =
-        readUniverse(
-          limit
-        );
+        readUniverse();
 
-      return textResult(
-        {
-          ok:
-            true,
-
-          count:
-            symbols.length,
-
-          symbols
-        }
-      );
-
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+                count:
+                  symbols.length,
+                universe_file:
+                  UNIVERSE_FILE,
+                symbols
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     5. yahoo_spark_test
-  ------------------------------------------------------- */
+  /* =======================================================
+     YAHOO SPARK TEST
+  ======================================================= */
 
   server.tool(
     "yahoo_spark_test",
+    "Test Yahoo Chart OHLCV",
     {
-
-      symbol:
-        z.string(),
+      symbols:
+        z
+          .array(z.string())
+          .optional(),
 
       range:
         z.string()
@@ -3122,522 +2881,553 @@ function createMcpServer() {
       interval:
         z.string()
           .optional()
-
     },
-
     async ({
-      symbol,
-      range = "5d",
-      interval = "5m"
+      symbols,
+      range,
+      interval
     }) => {
+      const list =
+        symbols?.length
+          ? symbols
+          : [
+              "AAPL",
+              "MSFT",
+              "NVDA",
+              "AMD",
+              "INTC"
+            ];
 
-      const normalized =
-        symbol
-          .trim()
-          .toUpperCase();
+      const output =
+        [];
 
-      const started =
-        Date.now();
+      for (
+        const symbol of list
+      ) {
+        try {
+          const data =
+            await fetchYahooChart(
+              symbol,
+              interval ||
+                "5m",
+              range ||
+                "1d"
+            );
 
-      try {
-
-        const result =
-          await yahooChart(
-            normalized,
-            range,
-            interval
-          );
-
-        const bars =
-          extractBars(
-            result
-          );
-
-        const raw =
-          result
-            ?.response?.[0] ||
-          {};
-
-        const quote =
-          raw
-            ?.indicators
-            ?.quote?.[0] ||
-          {};
-
-        return textResult(
-          {
-
-            ok:
-              true,
-
-            source:
-              "Yahoo Chart OHLCV",
-
-            symbol:
-              normalized,
-
-            range,
-
-            interval,
-
-            elapsed_ms:
-              Date.now() -
-              started,
-
-            result_count:
-              Array.isArray(
-                result.response
-              )
-                ? result.response.length
-                : 0,
-
-            response_keys:
-              Object.keys(
-                raw
-              ),
-
-            quote_keys:
-              Object.keys(
-                quote
-              ),
-
-            timestamp_count:
-              Array.isArray(
-                raw.timestamp
-              )
-                ? raw.timestamp.length
-                : 0,
-
-            extracted_bar_count:
-              bars.length,
-
-            valid_volume_count:
-              bars.filter(
-                b =>
-                  Number.isFinite(
-                    b.volume
-                  ) &&
-                  b.volume > 0
-              ).length,
-
-            sample:
-              bars.slice(-5),
-
-            yahoo_errors:
-              0
-
-          }
-        );
-
-      } catch (error) {
-
-        return textResult(
-          {
-
-            ok:
-              false,
-
-            source:
-              "Yahoo Chart OHLCV",
-
-            symbol:
-              normalized,
-
+          output.push({
+            symbol,
+            ok: true,
+            bars:
+              data.bars.length,
+            last:
+              data.bars[
+                data.bars.length - 1
+              ] || null,
+            meta:
+              data.meta
+          });
+        } catch (error) {
+          output.push({
+            symbol,
+            ok: false,
             error:
-              String(
-                error?.message ||
-                error
-              ),
-
-            elapsed_ms:
-              Date.now() -
-              started
-
-          }
-        );
-
+              error?.message ||
+              String(error)
+          });
+        }
       }
 
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+                results:
+                  output
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     6. yahoo_ws_test
-
-     IMPORTANT:
-     No import of yahoo-ws.js.
-  ------------------------------------------------------- */
+  /* =======================================================
+     WS COMPATIBILITY TEST
+  ======================================================= */
 
   server.tool(
     "yahoo_ws_test",
+    "Compatibility test for Yahoo realtime layer",
     {
       symbols:
-        z.array(
-          z.string()
-        )
+        z
+          .array(z.string())
+          .optional()
     },
-
     async ({
       symbols
     }) => {
+      /*
+       * Le scanner v2.0 utilise Yahoo Chart
+       * pour la donnée OHLCV principale.
+       *
+       * On garde ce tool pour compatibilité
+       * avec les versions précédentes.
+       */
 
-      const normalized =
-        normalizeSymbols(
-          symbols
-        );
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
 
-      return textResult(
-        {
+                websocket:
+                  "not required by v2.0.0 core scan",
 
-          ok:
-            true,
+                symbols:
+                  symbols ||
+                  [
+                    "AAPL",
+                    "MSFT",
+                    "NVDA",
+                    "AMD",
+                    "INTC"
+                  ],
 
-          status:
-            "isolated",
-
-          symbols:
-            normalized,
-
-          note:
-            "Yahoo Chart OHLCV is used by S0/S1. WebSocket is not required for server startup."
-
-        }
-      );
-
+                note:
+                  "Core S0/S1/SF uses Yahoo Chart OHLCV."
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     7. yahoo_s0_prepare
-  ------------------------------------------------------- */
+  /* =======================================================
+     S0 PREPARE
+  ======================================================= */
 
   server.tool(
     "yahoo_s0_prepare",
+    "Build materialized S0 universe",
     {
-
       symbols:
-        z.array(
-          z.string()
-        )
-        .optional(),
-
-      limit:
-        z.number()
-          .int()
-          .positive()
+        z
+          .array(z.string())
           .optional()
-
     },
-
     async ({
-      symbols,
-      limit
+      symbols
     }) => {
+      const list =
+        symbols?.length
+          ? [
+              ...new Set(
+                symbols.map(
+                  x =>
+                    x
+                      .trim()
+                      .toUpperCase()
+                )
+              )
+            ]
+          : readUniverse();
 
-      const universe =
-        Array.isArray(
-          symbols
-        )
-          ? normalizeSymbols(
-              symbols
-            )
-          : readUniverse(
-              limit
-            );
-
-      return textResult(
+      const result =
         await runS0(
-          universe
-        )
-      );
+          list
+        );
 
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+                ...result
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     8. yahoo_s1_scan
-  ------------------------------------------------------- */
+  /* =======================================================
+     S1 SCAN
+  ======================================================= */
 
   server.tool(
     "yahoo_s1_scan",
+    "Run S1 on materialized S0",
     {
+      asof:
+        z.string()
+          .optional(),
 
       symbols:
-        z.array(
-          z.string()
-        )
-        .optional(),
-
-      limit:
-        z.number()
-          .int()
-          .positive()
+        z
+          .array(z.string())
           .optional()
-
     },
-
     async ({
-      symbols,
-      limit
+      asof,
+      symbols
     }) => {
-
-      let universe;
+      let s0 =
+        loadS0Cache();
 
       if (
-        Array.isArray(
-          symbols
-        )
+        symbols?.length
       ) {
-
-        universe =
-          normalizeSymbols(
-            symbols
-          );
-
-      } else {
-
-        const s0Cache =
-          readJson(
-            S0_CACHE_FILE
-          );
-
-        if (
-          !validCache(
-            s0Cache
-          )
-        ) {
-
-          throw new Error(
-            "Valid S0 cache required"
-          );
-
-        }
-
-        universe =
-          (
-            s0Cache.s0 ||
-            []
-          )
-            .map(
-              record =>
-                record.symbol
-            );
-
-        if (
-          Number.isInteger(
-            limit
-          ) &&
-          limit > 0
-        ) {
-
-          universe =
-            universe.slice(
-              0,
-              limit
-            );
-
-        }
-
+        s0 = {
+          candidates:
+            symbols.map(
+              symbol => ({
+                symbol:
+                  symbol
+                    .trim()
+                    .toUpperCase()
+              })
+            )
+        };
       }
 
-      return textResult(
-        await runS1(
-          universe
-        )
-      );
+      if (
+        !s0?.candidates?.length
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                JSON.stringify({
+                  ok: false,
+                  error:
+                    "S0 cache empty"
+                })
+            }
+          ]
+        };
+      }
 
+      const asofMs =
+        asof
+          ? Date.parse(asof)
+          : Date.now();
+
+      const result =
+        await runS1(
+          s0.candidates,
+          asofMs
+        );
+
+      scanState.asof =
+        asofMs;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+                ...result
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     9. yahoo_s0_s1_scan
-  ------------------------------------------------------- */
+  /* =======================================================
+     COMPLETE S0 -> S1
+  ======================================================= */
 
   server.tool(
     "yahoo_s0_s1_scan",
+    "Run complete S0 then S1 scan",
     {
+      asof:
+        z.string()
+          .optional(),
 
       symbols:
-        z.array(
-          z.string()
-        )
-        .optional(),
-
-      limit:
-        z.number()
-          .int()
-          .positive()
+        z
+          .array(z.string())
           .optional()
-
     },
-
     async ({
-      symbols,
-      limit
+      asof,
+      symbols
     }) => {
+      const started =
+        Date.now();
 
-      const universe =
-        Array.isArray(
-          symbols
-        )
-          ? normalizeSymbols(
-              symbols
-            )
-          : readUniverse(
-              limit
-            );
+      scanState.started_at =
+        new Date().toISOString();
 
-      return textResult(
-        await runS0S1(
-          universe
-        )
-      );
+      scanState.status =
+        "running";
 
+      const list =
+        symbols?.length
+          ? [
+              ...new Set(
+                symbols.map(
+                  x =>
+                    x
+                      .trim()
+                      .toUpperCase()
+                )
+              )
+            ]
+          : readUniverse();
+
+      const s0 =
+        await runS0(
+          list
+        );
+
+      const asofMs =
+        asof
+          ? Date.parse(asof)
+          : Date.now();
+
+      const s1 =
+        await runS1(
+          s0.candidates,
+          asofMs
+        );
+
+      scanState.asof =
+        asofMs;
+
+      scanState.elapsed_ms =
+        Date.now() -
+        started;
+
+      scanState.completed_at =
+        new Date().toISOString();
+
+      scanState.status =
+        "completed";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+
+                stage:
+                  "S0_S1",
+
+                asof:
+                  asofMs,
+
+                elapsed_ms:
+                  scanState.elapsed_ms,
+
+                universe_requested:
+                  list.length,
+
+                s0_count:
+                  s0.count,
+
+                s1_count:
+                  s1.count,
+
+                s0:
+                  s0.candidates,
+
+                s1:
+                  s1.candidates
+              })
+          }
+        ]
+      };
     }
   );
 
-
-  /* -------------------------------------------------------
-     10. yahoo_sf_scan
-  ------------------------------------------------------- */
+  /* =======================================================
+     SF
+  ======================================================= */
 
   server.tool(
     "yahoo_sf_scan",
+    "Run locked SF filters",
     {
+      asof:
+        z.string()
+          .optional(),
 
       symbols:
-        z.array(
-          z.string()
-        )
-        .optional(),
-
-      minPriceVsVWAP:
-        z.number()
-          .optional(),
-
-      minAccel5M:
-        z.number()
-          .optional(),
-
-      minVol15M:
-        z.number()
+        z
+          .array(z.string())
           .optional()
-
     },
-
     async ({
-      symbols,
-      minPriceVsVWAP,
-      minAccel5M,
-      minVol15M
+      asof,
+      symbols
     }) => {
+      let s1;
 
-      return textResult(
+      if (
+        symbols?.length
+      ) {
+        s1 = {
+          candidates:
+            symbols.map(
+              symbol => ({
+                symbol:
+                  symbol
+                    .trim()
+                    .toUpperCase()
+              })
+            )
+        };
+      } else {
+        try {
+          s1 =
+            JSON.parse(
+              fs.readFileSync(
+                S1_CACHE_FILE,
+                "utf8"
+              )
+            );
+        } catch {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  JSON.stringify({
+                    ok: false,
+                    error:
+                      "S1 cache empty"
+                  })
+              }
+            ]
+          };
+        }
+      }
+
+      if (
+        !s1?.candidates?.length
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                JSON.stringify({
+                  ok: false,
+                  error:
+                    "No S1 candidates"
+                })
+            }
+          ]
+        };
+      }
+
+      const asofMs =
+        asof
+          ? Date.parse(asof)
+          : Date.now();
+
+      const result =
         await runSF(
-          symbols,
+          s1.candidates,
+          asofMs
+        );
+
+      scanState.sf_count =
+        result.count;
+
+      return {
+        content: [
           {
-
-            minPriceVsVWAP,
-
-            minAccel5M,
-
-            minVol15M
-
+            type: "text",
+            text:
+              JSON.stringify({
+                ok: true,
+                ...result
+              })
           }
-        )
-      );
-
+        ]
+      };
     }
   );
 
+  /* =======================================================
+     LOCKED PARAMS
+  ======================================================= */
 
-  /* -------------------------------------------------------
-     11. get_scan_state
-  ------------------------------------------------------- */
+  server.tool(
+    "get_locked_params",
+    "Return historically locked scanner parameters",
+    {},
+    async () => ({
+      content: [
+        {
+          type: "text",
+          text:
+            JSON.stringify({
+              ok: true,
+
+              locked:
+                LOCKED,
+
+              non_blocking:
+                NON_BLOCKING,
+
+              notes: [
+                "RVOL15M minimum = 1.50",
+                "Vol5 ratio minimum = 0.20",
+                "Delta60 maximum = +10%",
+                "Price vs VWAP minimum = -1%",
+                "Delta 15:55 -> 15:59 minimum = 0%",
+                "Lot size = 20",
+                "Ranking = DV descending",
+                "First Winner Gate PASS = STOP",
+                "Accel5M is NOT a blocking filter"
+              ]
+            })
+        }
+      ]
+    })
+  );
+
+  /* =======================================================
+     SCAN STATE
+  ======================================================= */
 
   server.tool(
     "get_scan_state",
+    "Return current scan state",
     {},
-    async () =>
-      textResult(
+    async () => ({
+      content: [
         {
-
-          ok:
-            true,
-
-          state:
-            scanState
-
+          type: "text",
+          text:
+            JSON.stringify({
+              ok: true,
+              scanState
+            })
         }
-      )
+      ]
+    })
   );
 
-
   return server;
-
 }
-
-
-/* =========================================================
-   EXPRESS
-========================================================= */
-
-const app =
-  express();
-
-app.disable(
-  "x-powered-by"
-);
-
-app.use(
-  express.json(
-    {
-      limit:
-        "10mb"
-    }
-  )
-);
-
-
-/* =========================================================
-   ROOT
-========================================================= */
-
-app.get(
-  "/",
-  (_req, res) => {
-
-    res.json(
-      {
-
-        ok:
-          true,
-
-        service:
-          "yahoo-scan-mcp",
-
-        version:
-          APP_VERSION,
-
-        transport:
-          "streamable-http",
-
-        endpoint:
-          "/mcp",
-
-        time:
-          nowIso()
-
-      }
-    );
-
-  }
-);
-
 
 /* =========================================================
    HEALTH
@@ -3646,68 +3436,55 @@ app.get(
 app.get(
   "/health",
   (_req, res) => {
+    res.json({
+      ok: true,
 
-    res.json(
-      {
+      service:
+        "yahoo-scan-mcp",
 
-        ok:
-          true,
+      version:
+        APP_VERSION,
 
-        service:
-          "yahoo-scan-mcp",
+      timestamp:
+        new Date().toISOString(),
 
-        version:
-          APP_VERSION,
-
-        transport:
-          "streamable-http",
-
-        time:
-          nowIso()
-
-      }
-
-    );
-
+      universe:
+        readUniverse().length
+    });
   }
 );
 
-
 /* =========================================================
-   MCP POST
+   MCP HTTP
 ========================================================= */
 
 app.post(
   "/mcp",
-
-  async (
-    req,
-    res
-  ) => {
-
-    let server =
-      null;
-
-    let transport =
-      null;
-
+  async (req, res) => {
     try {
-
-      server =
+      const server =
         createMcpServer();
 
-      transport =
+      const transport =
         new StreamableHTTPServerTransport(
           {
-
             sessionIdGenerator:
-              undefined,
-
-            enableJsonResponse:
-              true
-
+              undefined
           }
         );
+
+      res.on(
+        "close",
+        () => {
+          transport.close().catch(
+            () => {}
+          );
+
+          server.close().catch(
+            () => {}
+          );
+        }
+      );
 
       await server.connect(
         transport
@@ -3718,9 +3495,7 @@ app.post(
         res,
         req.body
       );
-
     } catch (error) {
-
       console.error(
         "[MCP ERROR]",
         error
@@ -3729,61 +3504,16 @@ app.post(
       if (
         !res.headersSent
       ) {
-
-        res
-          .status(500)
-          .json(
-            {
-
-              ok:
-                false,
-
-              error:
-                String(
-                  error?.message ||
-                  error
-                )
-
-            }
-          );
-
+        res.status(500).json({
+          ok: false,
+          error:
+            error?.message ||
+            String(error)
+        });
       }
-
-    } finally {
-
-      try {
-
-        if (
-          transport &&
-          typeof transport.close ===
-            "function"
-        ) {
-
-          await transport.close();
-
-        }
-
-      } catch {}
-
-      try {
-
-        if (
-          server &&
-          typeof server.close ===
-            "function"
-        ) {
-
-          await server.close();
-
-        }
-
-      } catch {}
-
     }
-
   }
 );
-
 
 /* =========================================================
    MCP GET
@@ -3792,24 +3522,14 @@ app.post(
 app.get(
   "/mcp",
   (_req, res) => {
+    res.status(405).json({
+      ok: false,
 
-    res
-      .status(405)
-      .json(
-        {
-
-          ok:
-            false,
-
-          error:
-            "GET /mcp is not supported in stateless mode. Use POST."
-
-        }
-      );
-
+      error:
+        "MCP endpoint requires POST"
+    });
   }
 );
-
 
 /* =========================================================
    MCP DELETE
@@ -3818,49 +3538,41 @@ app.get(
 app.delete(
   "/mcp",
   (_req, res) => {
+    res.status(405).json({
+      ok: false,
 
-    res
-      .status(405)
-      .json(
-        {
-
-          ok:
-            false,
-
-          error:
-            "DELETE /mcp is not supported in stateless mode."
-
-        }
-      );
-
+      error:
+        "Stateless MCP transport"
+    });
   }
 );
-
 
 /* =========================================================
-   404
+   ROOT
 ========================================================= */
 
-app.use(
+app.get(
+  "/",
   (_req, res) => {
+    res.json({
+      ok: true,
 
-    res
-      .status(404)
-      .json(
-        {
+      service:
+        "yahoo-scan-mcp",
 
-          ok:
-            false,
+      version:
+        APP_VERSION,
 
-          error:
-            "Not found"
+      endpoints: {
+        health:
+          "/health",
 
-        }
-      );
-
+        mcp:
+          "/mcp"
+      }
+    });
   }
 );
-
 
 /* =========================================================
    START
@@ -3870,9 +3582,8 @@ app.listen(
   PORT,
   "0.0.0.0",
   () => {
-
     console.log(
-      `[yahoo-scan-mcp] v${APP_VERSION} started`
+      `[yahoo-scan-mcp] MCP server started v${APP_VERSION}`
     );
 
     console.log(
@@ -3880,16 +3591,11 @@ app.listen(
     );
 
     console.log(
-      `[yahoo-scan-mcp] MCP endpoint: /mcp`
+      `[yahoo-scan-mcp] Universe file: ${UNIVERSE_FILE}`
     );
 
     console.log(
-      `[yahoo-scan-mcp] Data source: Yahoo Chart OHLCV`
+      `[yahoo-scan-mcp] Universe symbols: ${readUniverse().length}`
     );
-
-    console.log(
-      `[yahoo-scan-mcp] Universe: ${UNIVERSE_FILE}`
-    );
-
   }
 );
