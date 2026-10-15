@@ -42,7 +42,6 @@ const MAX_WS_RECEIPT_AGE_MS = 120000;
 
 // Do not change these thresholds without an explicit strategy decision.
 const LOCKED = Object.freeze({
-  maxPrice: 5.00,
   maxAbsJ1Pct: 5.00,
   maxAbsJ2Pct: 5.00,
   s1Rvol15Min: 1.30,
@@ -358,25 +357,6 @@ function sessionPerformance(bars) {
   if (!first || !last || first.open <= 0 || last.close <= 0 || last.ts < first.ts) return null;
   return pctChange(first.open, last.close);
 }
-function classifyInstrument(meta, symbol) {
-  const quoteType = String(meta?.quoteType || "").toUpperCase().trim();
-  const exchangeRaw = String(meta?.exchangeName || meta?.fullExchangeName || meta?.exchange || "").toUpperCase().trim();
-  const exchange = exchangeRaw.replace(/[^A-Z]/g, "");
-  const name = `${meta?.shortName || ""} ${meta?.longName || ""}`.toUpperCase().trim();
-  const forbiddenTypes = new Set(["ETF", "MUTUALFUND", "INDEX", "OPTION", "FUTURE", "CRYPTOCURRENCY", "WARRANT", "RIGHT", "UNIT", "PREFERRED_STOCK", "MONEYMARKET"]);
-  if (quoteType && (forbiddenTypes.has(quoteType) || quoteType !== "EQUITY")) return "non_ordinary";
-  if (/\b(?:WARRANTS?|RIGHTS?|UNITS?|PREFERRED(?:\s+STOCK|\s+SHARES?)?|PREFERENCE SHARES?|DEPOSITARY SHARES?|EXCHANGE[- ]TRADED FUND|ETF)\b/.test(name)) return "non_ordinary";
-  // Do not infer security type from ticker suffixes alone: legitimate equities can end in U, W, R, etc.
-  const nasdaqCodes = new Set(["NMS", "NGM", "NCM", "NAS", "NASDAQ", "NASDAQGS", "NASDAQGM", "NASDAQCM"]);
-  const nasdaqExchange = exchange.includes("NASDAQ") || nasdaqCodes.has(exchange);
-  // Missing type/exchange metadata is ambiguous, not positive evidence of a common stock.
-  if (!quoteType || !exchangeRaw) return "ambiguous";
-  if (!nasdaqExchange) return "non_ordinary";
-  return "ordinary";
-}
-function isOrdinaryStock(meta, symbol) {
-  return classifyInstrument(meta, symbol) === "ordinary";
-}
 function isCompletedSession(bars) {
   return finite(sessionPerformance(bars));
 }
@@ -487,15 +467,8 @@ async function mapConcurrent(items, worker, concurrency = DATA_CONCURRENCY) {
 
 async function processS0Symbol(symbol, asofMs, prefetchedChart = null) {
   try {
-    let chart = prefetchedChart || await fetchYahooChart(symbol, S0_INTERVAL, S0_RANGE);
-    let classification = classifyInstrument(chart.meta, symbol);
-    // Spark often omits chart metadata; retry that symbol against Chart before treating it as ambiguous.
-    if (classification === "ambiguous" && prefetchedChart) {
-      const chartFallback = await fetchYahooChart(symbol, S0_INTERVAL, S0_RANGE);
-      const fallbackClassification = classifyInstrument(chartFallback.meta, symbol);
-      if (fallbackClassification !== "ambiguous") { chart = chartFallback; classification = fallbackClassification; }
-    }
-    if (classification !== "ordinary") return { ok: false, symbol, reason: classification === "ambiguous" ? "AMBIGUOUS_INSTRUMENT_METADATA" : "NOT_ORDINARY_STOCK", quote_type: chart.meta?.quoteType || null, exchange: chart.meta?.exchangeName || chart.meta?.fullExchangeName || chart.meta?.exchange || null };
+    // S0 trusts the supplied universe file. Exchange, instrument type, and price are not selection filters.
+    const chart = prefetchedChart || await fetchYahooChart(symbol, S0_INTERVAL, S0_RANGE);
     const regular = chart.bars.filter(b => isRegularSessionBar(b.ts));
     const completed = completedBarsAt(regular, asofMs);
     if (!completed.length) return { ok: false, symbol, reason: "NO_COMPLETED_HISTORY" };
@@ -508,8 +481,6 @@ async function processS0Symbol(symbol, asofMs, prefetchedChart = null) {
     const latestDate = dates.at(-1);
     const lastBar = (sessions.get(latestDate) || []).at(-1);
     if (!lastBar || !finite(lastBar.close)) return { ok: false, symbol, reason: "NO_CURRENT_PRICE" };
-    // Source universe is curated below $5, but this live/history check guards stale source files.
-    if (lastBar.close >= LOCKED.maxPrice) return { ok: false, symbol, reason: "PRICE_GE_5", price: lastBar.close };
     const { j1, j2, j1Date, j2Date } = getJ1J2(sessions, historicalDates);
     if (!finite(j1) || !finite(j2)) return { ok: false, symbol, reason: "NO_J1_J2" };
     if (Math.abs(j1) > LOCKED.maxAbsJ1Pct || Math.abs(j2) > LOCKED.maxAbsJ2Pct) return { ok: false, symbol, reason: "J1_J2_EXCESSIVE", j1, j2, j1Date, j2Date };
@@ -651,7 +622,6 @@ function calculateDollarVolume(price, rollingVolume15m) {
 }
 function evaluateS1Checks({ price, priceVsVWAP, rvol15, vol5Ratio }) {
   return {
-    price_under_5: finite(price) && price < LOCKED.maxPrice,
     price_vs_vwap: finite(priceVsVWAP) && priceVsVWAP >= LOCKED.s1PriceVsVwapMinPct,
     rvol15: finite(rvol15) && rvol15 >= LOCKED.s1Rvol15Min,
     vol5_ratio: finite(vol5Ratio) && vol5Ratio >= LOCKED.s1Vol5MinRatio
@@ -663,8 +633,7 @@ function evaluateSFChecks({ price, rvol15, vol5Ratio, delta60, priceVsVWAP, delt
     vol5_ratio: finite(vol5Ratio) && vol5Ratio >= LOCKED.vol5MinRatio,
     delta60: finite(delta60) && delta60 <= LOCKED.delta60MaxPct,
     price_vs_vwap: finite(priceVsVWAP) && priceVsVWAP >= LOCKED.priceVsVwapMinPct,
-    delta1555toAsOf: finite(delta1555toAsOf) && delta1555toAsOf >= LOCKED.delta1555to1559MinPct,
-    price_under_5: finite(price) && price < LOCKED.maxPrice
+    delta1555toAsOf: finite(delta1555toAsOf) && delta1555toAsOf >= LOCKED.delta1555to1559MinPct
   };
 }
 function getSlotReference(candidate, key, slot) {
@@ -700,7 +669,6 @@ async function processS1Symbol(candidate, asofMs) {
     if (bars.length < 13) return { ok: false, symbol, reason: "INSUFFICIENT_INTRADAY" };
     const current = bars.at(-1);
     if (asofMs - (current.ts + 5 * 60_000) > 10 * 60_000) return { ok: false, symbol, reason: "STALE_5M_BAR" };
-    if (current.close >= LOCKED.maxPrice) return { ok: false, symbol, reason: "PRICE_GE_5", price: current.close };
     const slot = floor5Clock(current.ts);
     const liveGrid = buildSessionGrid(etDate(current.ts), bars);
     const slotIndex = getSessionSlotIndex(current.ts);
@@ -877,7 +845,6 @@ async function runWinnerGate(sfCandidate, asofMs) {
   // Recheck price-sensitive locked gates against the latest tick immediately before declaring a winner.
   const p = fresh.tick.price;
   const recheck = {
-    price_under_5: p < LOCKED.maxPrice,
     price_vs_vwap: finite(sfCandidate.vwap) && sfCandidate.vwap > 0 && pctChange(sfCandidate.vwap, p) >= LOCKED.priceVsVwapMinPct,
     delta60: finite(sfCandidate.delta60_reference_price) && sfCandidate.delta60_reference_price > 0 && pctChange(sfCandidate.delta60_reference_price, p) <= LOCKED.delta60MaxPct,
     delta1555toAsOf: finite(sfCandidate.target_bar_open) && sfCandidate.target_bar_open > 0 && pctChange(sfCandidate.target_bar_open, p) >= LOCKED.delta1555to1559MinPct
@@ -934,14 +901,14 @@ function runDeterministicSelfTests() {
   check("locked_VWAP_minimum", LOCKED.priceVsVwapMinPct === -1 && LOCKED.s1PriceVsVwapMinPct === -1, { s1: LOCKED.s1PriceVsVwapMinPct, sf: LOCKED.priceVsVwapMinPct });
   check("locked_Delta60_maximum", LOCKED.delta60MaxPct === 10, LOCKED.delta60MaxPct);
   check("locked_lot_size", LOCKED.lotSize === 20 && SF_LOT_SIZE === 20, SF_LOT_SIZE);
-  check("locked_S0_price_and_J1J2", LOCKED.maxPrice === 5 && LOCKED.maxAbsJ1Pct === 5 && LOCKED.maxAbsJ2Pct === 5, { maxPrice: LOCKED.maxPrice, J1: LOCKED.maxAbsJ1Pct, J2: LOCKED.maxAbsJ2Pct });
-  const s1BoundaryChecks = evaluateS1Checks({ price: 4.99, priceVsVWAP: -1, rvol15: 1.30, vol5Ratio: 0.20 });
-  check("S1_exact_locked_boundaries_pass", Object.values(s1BoundaryChecks).every(Boolean), s1BoundaryChecks);
-  const s1FailChecks = evaluateS1Checks({ price: 4.99, priceVsVWAP: -1.01, rvol15: 1.29, vol5Ratio: 0.19 });
+  check("locked_S0_J1J2_only", LOCKED.maxAbsJ1Pct === 5 && LOCKED.maxAbsJ2Pct === 5 && !Object.hasOwn(LOCKED, "maxPrice"), { J1: LOCKED.maxAbsJ1Pct, J2: LOCKED.maxAbsJ2Pct, maxPrice_filter_removed: !Object.hasOwn(LOCKED, "maxPrice") });
+  const s1BoundaryChecks = evaluateS1Checks({ price: 25.00, priceVsVWAP: -1, rvol15: 1.30, vol5Ratio: 0.20 });
+  check("S1_exact_locked_boundaries_pass_without_price_cap", Object.values(s1BoundaryChecks).every(Boolean) && !Object.hasOwn(s1BoundaryChecks, "price_under_5"), s1BoundaryChecks);
+  const s1FailChecks = evaluateS1Checks({ price: 25.00, priceVsVWAP: -1.01, rvol15: 1.29, vol5Ratio: 0.19 });
   check("S1_below_locked_boundaries_rejected", Object.values(s1FailChecks).some(v => !v), s1FailChecks);
-  const sfBoundaryChecks = evaluateSFChecks({ price: 4.99, rvol15: 1.50, vol5Ratio: 0.20, delta60: 10, priceVsVWAP: -1, delta1555toAsOf: 0 });
-  check("SF_exact_locked_boundaries_pass", Object.values(sfBoundaryChecks).every(Boolean), sfBoundaryChecks);
-  const sfFailChecks = evaluateSFChecks({ price: 4.99, rvol15: 1.50, vol5Ratio: 0.20, delta60: 10.01, priceVsVWAP: -1, delta1555toAsOf: 0 });
+  const sfBoundaryChecks = evaluateSFChecks({ price: 25.00, rvol15: 1.50, vol5Ratio: 0.20, delta60: 10, priceVsVWAP: -1, delta1555toAsOf: 0 });
+  check("SF_exact_locked_boundaries_pass_without_price_cap", Object.values(sfBoundaryChecks).every(Boolean) && !Object.hasOwn(sfBoundaryChecks, "price_under_5"), sfBoundaryChecks);
+  const sfFailChecks = evaluateSFChecks({ price: 25.00, rvol15: 1.50, vol5Ratio: 0.20, delta60: 10.01, priceVsVWAP: -1, delta1555toAsOf: 0 });
   check("SF_Delta60_above_plus10_rejected", !sfFailChecks.delta60, sfFailChecks);
   check("Accel5M_does_not_change_S1_checks", JSON.stringify(evaluateS1Checks({ price: 4.99, priceVsVWAP: -1, rvol15: 1.30, vol5Ratio: 0.20 })) === JSON.stringify(s1BoundaryChecks), "Accel5M is not an input to blocking checks");
   const bars3 = [0, 1, 2].map(i => ({ ts: 1000000 + i * 300000, volume: i + 1 }));
@@ -981,12 +948,9 @@ function runDeterministicSelfTests() {
   check("asof_timezone_less_string_is_ET", validateAsOf("2026-10-02T15:55:00") === Date.parse("2026-10-02T19:55:00Z"), new Date(validateAsOf("2026-10-02T15:55:00")).toISOString());
   check("asof_explicit_UTC_remains_UTC", validateAsOf("2026-10-02T15:55:00Z") === Date.parse("2026-10-02T15:55:00Z"), "explicit Z honored");
   check("Accel5M_nonblocking", NON_BLOCKING.accel5m === true, NON_BLOCKING.accel5m);
-  check("ordinary_stock_EQUITY_NMS", isOrdinaryStock({ quoteType: "EQUITY", exchangeName: "NMS", shortName: "Sample Inc." }, "SAMP"), "regular NASDAQ equity allowed");
-  check("reject_ETF_metadata", !isOrdinaryStock({ quoteType: "ETF", exchangeName: "NMS", shortName: "Sample Fund" }, "SAMP"), "ETF rejected");
-  check("reject_warrant_name", !isOrdinaryStock({ quoteType: "EQUITY", exchangeName: "NMS", shortName: "Sample Inc. Warrant" }, "SAMPW"), "warrant rejected by name");
-  check("ticker_suffix_alone_not_rejected", isOrdinaryStock({ quoteType: "EQUITY", exchangeName: "NMS", shortName: "Sample U Inc." }, "SAMPU"), "U suffix alone is not proof of a unit");
-  check("reject_unit_name", !isOrdinaryStock({ quoteType: "EQUITY", exchangeName: "NMS", shortName: "Sample Acquisition Units" }, "SAMPU"), "unit rejected by metadata name");
-  check("ambiguous_missing_quote_type_rejected", classifyInstrument({ exchangeName: "NMS", shortName: "Sample Inc." }, "SAMP") === "ambiguous", "missing quote type is not assumed ordinary");
+  check("no_instrument_metadata_filter", !String(processS0Symbol).includes("classifyInstrument") && !String(processS0Symbol).includes("AMBIGUOUS_INSTRUMENT_METADATA"), "S0 does not classify or reject instrument metadata");
+  check("no_exchange_filter_in_S0", !String(processS0Symbol).includes("NASDAQ") && !String(processS0Symbol).includes("exchangeName"), "S0 does not filter by exchange");
+  check("no_price_cap_in_S0_S1_SF", !Object.hasOwn(LOCKED, "maxPrice") && !String(processS0Symbol).includes("PRICE_GE_5") && !String(processS1Symbol).includes("PRICE_GE_5") && !String(evaluateS1Checks).includes("price_under_5") && !String(evaluateSFChecks).includes("price_under_5") && !String(runWinnerGate).includes("price_under_5"), "no <5 price gate remains in scan stages");
   check("J1J2_requires_open_and_close_slots", sessionPerformance([{ ts: Date.parse("2026-01-05T14:35:00Z"), open: 1, close: 1.1 }, { ts: Date.parse("2026-01-05T20:55:00Z"), open: 1.1, close: 1.2 }]) === null, "session missing 09:30 slot is incomplete");
   check("DV_is_price_times_Vol15", calculateDollarVolume(2.5, 100) === 250, calculateDollarVolume(2.5, 100));
   check("DV_rejects_invalid_inputs", calculateDollarVolume(0, 100) === null && calculateDollarVolume(2.5, -1) === null, "invalid price/volume rejected");
@@ -1004,7 +968,7 @@ function createMcpServer() {
     try { universeCount = readUniverse().length; } catch (e) { universeError = e.message; }
     return mcpText({ ok: !universeError, cwd: ROOT, universe_file: UNIVERSE_FILE, universe_exists: fs.existsSync(UNIVERSE_FILE), universe_count: universeCount, universe_error: universeError, s0_cache_exists: fs.existsSync(S0_CACHE_FILE), s1_cache_exists: fs.existsSync(S1_CACHE_FILE), websocket: yahooWS?.status?.() || { connected: false } });
   });
-  server.tool("get_universe", "Return materialized NASDAQ <$5 universe", {}, async () => {
+  server.tool("get_universe", "Return symbols from the supplied universe file without exchange, instrument-type, or price filtering", {}, async () => {
     try { const symbols = readUniverse(); return mcpText({ ok: true, count: symbols.length, universe_file: UNIVERSE_FILE, symbols }); }
     catch (e) { return mcpText({ ok: false, error: e.message }); }
   });
